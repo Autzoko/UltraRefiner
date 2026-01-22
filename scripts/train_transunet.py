@@ -1,8 +1,16 @@
 """
 Phase 1: Train TransUNet independently on breast ultrasound datasets.
 
+Supports two modes:
+1. Train on a single dataset with K-fold cross-validation
+2. Train on combined datasets with K-fold cross-validation
+
 Usage:
-    python scripts/train_transunet.py --data_root ./data --datasets BUSI BUSBRA
+    # Single dataset training
+    python scripts/train_transunet.py --data_root ./dataset/processed --dataset BUSI --fold 0
+
+    # Combined dataset training
+    python scripts/train_transunet.py --data_root ./dataset/processed --datasets BUSI BUSBRA --fold 0
 """
 import argparse
 import logging
@@ -21,7 +29,14 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models.transunet import VisionTransformer, CONFIGS
-from data import get_combined_dataloader, RandomGenerator
+from data import (
+    get_kfold_dataloaders,
+    get_combined_kfold_dataloaders,
+    get_test_dataloader,
+    get_combined_test_dataloader,
+    RandomGenerator,
+    SUPPORTED_DATASETS
+)
 from utils import DiceLoss, MetricTracker
 
 
@@ -29,11 +44,18 @@ def get_args():
     parser = argparse.ArgumentParser(description='Train TransUNet on breast ultrasound data')
 
     # Data arguments
-    parser.add_argument('--data_root', type=str, required=True,
-                        help='Root directory containing datasets')
-    parser.add_argument('--datasets', type=str, nargs='+',
-                        default=['BUSI', 'BUSBRA', 'BUS', 'BUS_UC', 'BUS_UCLM'],
-                        help='Dataset names to use for training')
+    parser.add_argument('--data_root', type=str, default='./dataset/processed',
+                        help='Root directory containing preprocessed datasets')
+    parser.add_argument('--dataset', type=str, default=None,
+                        help='Single dataset name to train on (for per-dataset training)')
+    parser.add_argument('--datasets', type=str, nargs='+', default=None,
+                        help='Dataset names to use for combined training')
+
+    # K-fold cross-validation arguments
+    parser.add_argument('--fold', type=int, default=0,
+                        help='Fold index for K-fold cross-validation (0 to n_splits-1)')
+    parser.add_argument('--n_splits', type=int, default=5,
+                        help='Number of folds for K-fold cross-validation')
 
     # Model arguments
     parser.add_argument('--vit_name', type=str, default='R50-ViT-B_16',
@@ -63,11 +85,11 @@ def get_args():
     # Output arguments
     parser.add_argument('--output_dir', type=str, default='./checkpoints/transunet',
                         help='Output directory for checkpoints')
-    parser.add_argument('--exp_name', type=str, default='transunet_bus',
-                        help='Experiment name')
+    parser.add_argument('--exp_name', type=str, default=None,
+                        help='Experiment name (auto-generated if not provided)')
 
     # Other arguments
-    parser.add_argument('--seed', type=int, default=1234,
+    parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
     parser.add_argument('--gpu', type=int, default=0,
                         help='GPU device ID')
@@ -166,6 +188,21 @@ def validate(model, dataloader, ce_loss, dice_loss, device):
 def main():
     args = get_args()
 
+    # Validate arguments
+    if args.dataset is None and args.datasets is None:
+        args.datasets = SUPPORTED_DATASETS
+        print(f"No dataset specified, using all datasets: {args.datasets}")
+    elif args.dataset is not None and args.datasets is not None:
+        print("Warning: Both --dataset and --datasets provided, using --dataset (single dataset mode)")
+        args.datasets = None
+
+    # Auto-generate experiment name
+    if args.exp_name is None:
+        if args.dataset:
+            args.exp_name = f'{args.dataset}_fold{args.fold}'
+        else:
+            args.exp_name = f'combined_fold{args.fold}'
+
     # Set seed
     set_seed(args.seed)
 
@@ -187,40 +224,37 @@ def main():
     logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
     logging.info(f'Arguments: {args}')
 
-    # Create dataloaders
-    train_transform = RandomGenerator(
-        output_size=[args.img_size, args.img_size],
-        random_rotate=True,
-        random_flip=True
-    )
-    val_transform = RandomGenerator(
-        output_size=[args.img_size, args.img_size],
-        random_rotate=False,
-        random_flip=False
-    )
+    # Create dataloaders with K-fold cross-validation
+    if args.dataset:
+        # Single dataset training
+        train_loader, val_loader = get_kfold_dataloaders(
+            data_root=args.data_root,
+            dataset_name=args.dataset,
+            fold_idx=args.fold,
+            n_splits=args.n_splits,
+            batch_size=args.batch_size,
+            img_size=args.img_size,
+            num_workers=args.num_workers,
+            for_sam=False,
+            seed=args.seed
+        )
+        logging.info(f'Training on single dataset: {args.dataset}')
+    else:
+        # Combined dataset training
+        train_loader, val_loader = get_combined_kfold_dataloaders(
+            data_root=args.data_root,
+            dataset_names=args.datasets,
+            fold_idx=args.fold,
+            n_splits=args.n_splits,
+            batch_size=args.batch_size,
+            img_size=args.img_size,
+            num_workers=args.num_workers,
+            for_sam=False,
+            seed=args.seed
+        )
+        logging.info(f'Training on combined datasets: {args.datasets}')
 
-    train_loader = get_combined_dataloader(
-        data_root=args.data_root,
-        dataset_names=args.datasets,
-        split='train',
-        batch_size=args.batch_size,
-        img_size=args.img_size,
-        num_workers=args.num_workers,
-        transform=train_transform,
-        for_sam=False
-    )
-
-    val_loader = get_combined_dataloader(
-        data_root=args.data_root,
-        dataset_names=args.datasets,
-        split='val',
-        batch_size=args.batch_size,
-        img_size=args.img_size,
-        num_workers=args.num_workers,
-        transform=val_transform,
-        for_sam=False
-    )
-
+    logging.info(f'Fold {args.fold}/{args.n_splits}')
     logging.info(f'Train samples: {len(train_loader.dataset)}')
     logging.info(f'Val samples: {len(val_loader.dataset)}')
 
@@ -299,7 +333,16 @@ def main():
             'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'best_dice': best_dice,
-            'config': config,
+            'config': {
+                'vit_name': args.vit_name,
+                'img_size': args.img_size,
+                'num_classes': args.num_classes,
+                'n_skip': args.n_skip,
+                'fold': args.fold,
+                'n_splits': args.n_splits,
+                'dataset': args.dataset,
+                'datasets': args.datasets,
+            },
         }
 
         torch.save(checkpoint, os.path.join(snapshot_path, 'latest.pth'))

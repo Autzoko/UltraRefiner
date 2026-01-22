@@ -5,8 +5,13 @@ This script finetunes SAM's prompt encoder and mask decoder while keeping
 the image encoder frozen. The training uses ground truth masks to generate
 prompts, simulating the coarse masks that will come from TransUNet.
 
+Uses K-fold cross-validation within the training set for validation.
+
 Usage:
-    python scripts/finetune_sam.py --data_root ./data --medsam_checkpoint ./medsam_vit_b.pth
+    python scripts/finetune_sam.py \
+        --data_root ./dataset/processed \
+        --medsam_checkpoint ./pretrained/medsam_vit_b.pth \
+        --fold 0
 """
 import argparse
 import logging
@@ -26,7 +31,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models.sam import sam_model_registry, build_sam_for_training
 from models.sam_refiner import DifferentiableSAMRefiner
-from data import get_combined_dataloader, SAMRandomGenerator
+from data import (
+    get_combined_kfold_dataloaders,
+    SAMRandomGenerator,
+    SUPPORTED_DATASETS
+)
 from utils import BCEDiceLoss, SAMLoss, MetricTracker
 
 
@@ -34,11 +43,16 @@ def get_args():
     parser = argparse.ArgumentParser(description='Finetune SAM on breast ultrasound data')
 
     # Data arguments
-    parser.add_argument('--data_root', type=str, required=True,
-                        help='Root directory containing datasets')
-    parser.add_argument('--datasets', type=str, nargs='+',
-                        default=['BUSI', 'BUSBRA', 'BUS', 'BUS_UC', 'BUS_UCLM'],
-                        help='Dataset names to use for training')
+    parser.add_argument('--data_root', type=str, default='./dataset/processed',
+                        help='Root directory containing preprocessed datasets')
+    parser.add_argument('--datasets', type=str, nargs='+', default=None,
+                        help='Dataset names to use for training (default: all)')
+
+    # K-fold cross-validation arguments
+    parser.add_argument('--fold', type=int, default=0,
+                        help='Fold index for K-fold cross-validation (0 to n_splits-1)')
+    parser.add_argument('--n_splits', type=int, default=5,
+                        help='Number of folds for K-fold cross-validation')
 
     # Model arguments
     parser.add_argument('--sam_model_type', type=str, default='vit_b',
@@ -76,11 +90,11 @@ def get_args():
     # Output arguments
     parser.add_argument('--output_dir', type=str, default='./checkpoints/sam_finetuned',
                         help='Output directory for checkpoints')
-    parser.add_argument('--exp_name', type=str, default='sam_finetune_bus',
-                        help='Experiment name')
+    parser.add_argument('--exp_name', type=str, default=None,
+                        help='Experiment name (auto-generated if not provided)')
 
     # Other arguments
-    parser.add_argument('--seed', type=int, default=1234,
+    parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
     parser.add_argument('--gpu', type=int, default=0,
                         help='GPU device ID')
@@ -248,6 +262,14 @@ def validate(model, sam_refiner, dataloader, criterion, device, args):
 def main():
     args = get_args()
 
+    # Set default datasets
+    if args.datasets is None:
+        args.datasets = SUPPORTED_DATASETS
+
+    # Auto-generate experiment name
+    if args.exp_name is None:
+        args.exp_name = f'sam_finetune_fold{args.fold}'
+
     # Set seed
     set_seed(args.seed)
 
@@ -269,38 +291,20 @@ def main():
     logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
     logging.info(f'Arguments: {args}')
 
-    # Create dataloaders
-    train_transform = SAMRandomGenerator(
-        output_size=1024,
-        random_rotate=True,
-        random_flip=True
-    )
-    val_transform = SAMRandomGenerator(
-        output_size=1024,
-        random_rotate=False,
-        random_flip=False
-    )
-
-    train_loader = get_combined_dataloader(
+    # Create dataloaders with K-fold cross-validation
+    train_loader, val_loader = get_combined_kfold_dataloaders(
         data_root=args.data_root,
         dataset_names=args.datasets,
-        split='train',
+        fold_idx=args.fold,
+        n_splits=args.n_splits,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        transform=train_transform,
-        for_sam=True
+        for_sam=True,
+        seed=args.seed
     )
 
-    val_loader = get_combined_dataloader(
-        data_root=args.data_root,
-        dataset_names=args.datasets,
-        split='val',
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        transform=val_transform,
-        for_sam=True
-    )
-
+    logging.info(f'Training on datasets: {args.datasets}')
+    logging.info(f'Fold {args.fold}/{args.n_splits}')
     logging.info(f'Train samples: {len(train_loader.dataset)}')
     logging.info(f'Val samples: {len(val_loader.dataset)}')
 
@@ -392,6 +396,12 @@ def main():
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict(),
             'best_dice': best_dice,
+            'config': {
+                'sam_model_type': args.sam_model_type,
+                'fold': args.fold,
+                'n_splits': args.n_splits,
+                'datasets': args.datasets,
+            },
         }
 
         torch.save(checkpoint, os.path.join(snapshot_path, 'latest.pth'))

@@ -4,11 +4,14 @@ Phase 3: End-to-end training of TransUNet + SAMRefiner.
 This script trains the complete UltraRefiner pipeline with gradients flowing
 from the SAM refinement back to TransUNet. Both models are jointly optimized.
 
+Uses K-fold cross-validation within the training set for validation.
+
 Usage:
     python scripts/train_e2e.py \
-        --data_root ./data \
+        --data_root ./dataset/processed \
         --transunet_checkpoint ./checkpoints/transunet/best.pth \
-        --sam_checkpoint ./checkpoints/sam_finetuned/best.pth
+        --sam_checkpoint ./checkpoints/sam_finetuned/best.pth \
+        --fold 0
 """
 import argparse
 import logging
@@ -27,7 +30,11 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models import build_ultra_refiner, CONFIGS
-from data import get_combined_dataloader, RandomGenerator
+from data import (
+    get_combined_kfold_dataloaders,
+    RandomGenerator,
+    SUPPORTED_DATASETS
+)
 from utils import DiceLoss, BCEDiceLoss, MetricTracker
 
 
@@ -35,11 +42,16 @@ def get_args():
     parser = argparse.ArgumentParser(description='End-to-end training of UltraRefiner')
 
     # Data arguments
-    parser.add_argument('--data_root', type=str, required=True,
-                        help='Root directory containing datasets')
-    parser.add_argument('--datasets', type=str, nargs='+',
-                        default=['BUSI', 'BUSBRA', 'BUS', 'BUS_UC', 'BUS_UCLM'],
-                        help='Dataset names to use for training')
+    parser.add_argument('--data_root', type=str, default='./dataset/processed',
+                        help='Root directory containing preprocessed datasets')
+    parser.add_argument('--datasets', type=str, nargs='+', default=None,
+                        help='Dataset names to use for training (default: all)')
+
+    # K-fold cross-validation arguments
+    parser.add_argument('--fold', type=int, default=0,
+                        help='Fold index for K-fold cross-validation (0 to n_splits-1)')
+    parser.add_argument('--n_splits', type=int, default=5,
+                        help='Number of folds for K-fold cross-validation')
 
     # Model arguments
     parser.add_argument('--vit_name', type=str, default='R50-ViT-B_16',
@@ -86,11 +98,11 @@ def get_args():
     # Output arguments
     parser.add_argument('--output_dir', type=str, default='./checkpoints/ultra_refiner',
                         help='Output directory for checkpoints')
-    parser.add_argument('--exp_name', type=str, default='ultra_refiner_e2e',
-                        help='Experiment name')
+    parser.add_argument('--exp_name', type=str, default=None,
+                        help='Experiment name (auto-generated if not provided)')
 
     # Other arguments
-    parser.add_argument('--seed', type=int, default=1234,
+    parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
     parser.add_argument('--gpu', type=int, default=0,
                         help='GPU device ID')
@@ -274,6 +286,14 @@ def validate(model, dataloader, criterion, device):
 def main():
     args = get_args()
 
+    # Set default datasets
+    if args.datasets is None:
+        args.datasets = SUPPORTED_DATASETS
+
+    # Auto-generate experiment name
+    if args.exp_name is None:
+        args.exp_name = f'ultra_refiner_e2e_fold{args.fold}'
+
     # Set seed
     set_seed(args.seed)
 
@@ -295,40 +315,21 @@ def main():
     logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
     logging.info(f'Arguments: {args}')
 
-    # Create dataloaders
-    train_transform = RandomGenerator(
-        output_size=[args.img_size, args.img_size],
-        random_rotate=True,
-        random_flip=True
-    )
-    val_transform = RandomGenerator(
-        output_size=[args.img_size, args.img_size],
-        random_rotate=False,
-        random_flip=False
-    )
-
-    train_loader = get_combined_dataloader(
+    # Create dataloaders with K-fold cross-validation
+    train_loader, val_loader = get_combined_kfold_dataloaders(
         data_root=args.data_root,
         dataset_names=args.datasets,
-        split='train',
+        fold_idx=args.fold,
+        n_splits=args.n_splits,
         batch_size=args.batch_size,
         img_size=args.img_size,
         num_workers=args.num_workers,
-        transform=train_transform,
-        for_sam=False
+        for_sam=False,
+        seed=args.seed
     )
 
-    val_loader = get_combined_dataloader(
-        data_root=args.data_root,
-        dataset_names=args.datasets,
-        split='val',
-        batch_size=args.batch_size,
-        img_size=args.img_size,
-        num_workers=args.num_workers,
-        transform=val_transform,
-        for_sam=False
-    )
-
+    logging.info(f'Training on datasets: {args.datasets}')
+    logging.info(f'Fold {args.fold}/{args.n_splits}')
     logging.info(f'Train samples: {len(train_loader.dataset)}')
     logging.info(f'Val samples: {len(val_loader.dataset)}')
 
@@ -434,6 +435,9 @@ def main():
                 'sam_model_type': args.sam_model_type,
                 'img_size': args.img_size,
                 'num_classes': args.num_classes,
+                'fold': args.fold,
+                'n_splits': args.n_splits,
+                'datasets': args.datasets,
             }
         }
 
