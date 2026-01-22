@@ -1,0 +1,8 @@
+.claude
+
+dataset/
+.DS_Store
+
+checkpoints/
+
+__pycache__/
