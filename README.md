@@ -6,238 +6,360 @@ A unified framework for breast ultrasound segmentation that combines **TransUNet
 
 UltraRefiner implements a three-phase training pipeline:
 
-1. **Phase 1**: Train TransUNet independently on breast ultrasound datasets
-2. **Phase 2**: Finetune SAM (from MedSAM checkpoint) for mask refinement
+1. **Phase 1**: Train TransUNet independently on breast ultrasound datasets (per-dataset or combined)
+2. **Phase 2**: Finetune SAM using TransUNet predictions as prompts
 3. **Phase 3**: End-to-end training with gradients flowing from SAMRefiner to TransUNet
 
-### Architecture
+## Training Pipeline Flow Chart
 
 ```
-Input Image
-    │
-    ▼
-┌─────────────┐
-│  TransUNet  │  ← Phase 1 training
-│  (R50-ViT)  │
-└─────────────┘
-    │
-    ▼ (Soft Probability Mask)
-┌─────────────────────────────┐
-│   Differentiable Prompts    │
-│  ┌─────────┬─────┬───────┐  │
-│  │  Point  │ Box │ Mask  │  │
-│  └─────────┴─────┴───────┘  │
-└─────────────────────────────┘
-    │
-    ▼
-┌─────────────┐
-│ SAMRefiner  │  ← Phase 2 training
-│ (MedSAM)    │
-└─────────────┘
-    │
-    ▼
-Refined Mask
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                        ULTRAREFINER TRAINING PIPELINE                         ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║                                                                               ║
+║  ┌─────────────────────────────────────────────────────────────────────────┐ ║
+║  │                     PHASE 1: TransUNet Training                         │ ║
+║  │                     (Per-Dataset, 5-Fold CV)                            │ ║
+║  └─────────────────────────────────────────────────────────────────────────┘ ║
+║                                                                               ║
+║     Raw Images ──────────────────────────────────────────────────────────    ║
+║         │                                                                     ║
+║         ▼                                                                     ║
+║  ┌─────────────────┐    For each dataset (BUSI, BUSBRA, BUS, ...)            ║
+║  │  Preprocessing  │    For each fold (0, 1, 2, 3, 4)                        ║
+║  │  (224×224)      │                                                         ║
+║  └─────────────────┘                                                         ║
+║         │                                                                     ║
+║         ▼                                                                     ║
+║  ┌─────────────────────────────────────────────────────────────────┐         ║
+║  │                        TransUNet                                 │         ║
+║  │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐       │         ║
+║  │  │   ResNet50   │ ─► │   ViT-B/16   │ ─► │ CNN Decoder  │       │         ║
+║  │  │   Encoder    │    │  Transformer │    │  + Skip Conn │       │         ║
+║  │  └──────────────┘    └──────────────┘    └──────────────┘       │         ║
+║  └─────────────────────────────────────────────────────────────────┘         ║
+║         │                                                                     ║
+║         ▼                                                                     ║
+║  ┌─────────────────┐                                                         ║
+║  │   Checkpoints   │   ./checkpoints/transunet/{dataset}_fold{i}/best.pth   ║
+║  └─────────────────┘                                                         ║
+║                                                                               ║
+║                              │                                                ║
+║                              ▼                                                ║
+║  ┌─────────────────────────────────────────────────────────────────────────┐ ║
+║  │                  INFERENCE: Generate Predictions                        │ ║
+║  └─────────────────────────────────────────────────────────────────────────┘ ║
+║                                                                               ║
+║     For each fold's validation set:                                          ║
+║                                                                               ║
+║  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐          ║
+║  │  Load Best      │ ─► │  Inference on   │ ─► │  Save Coarse    │          ║
+║  │  Checkpoint     │    │  Val Set        │    │  Predictions    │          ║
+║  └─────────────────┘    └─────────────────┘    └─────────────────┘          ║
+║                                                        │                     ║
+║                                                        ▼                     ║
+║                              ┌──────────────────────────────────────┐        ║
+║                              │  ./predictions/transunet/{dataset}/  │        ║
+║                              │    fold{i}/predictions/*.npy         │        ║
+║                              │    fold{i}/visualizations/*.png      │        ║
+║                              └──────────────────────────────────────┘        ║
+║                                                                               ║
+║                              │                                                ║
+║                              ▼                                                ║
+║  ┌─────────────────────────────────────────────────────────────────────────┐ ║
+║  │                     PHASE 2: SAM Finetuning                             │ ║
+║  │               (Using Actual TransUNet Predictions)                      │ ║
+║  └─────────────────────────────────────────────────────────────────────────┘ ║
+║                                                                               ║
+║     ┌─────────────────┐         ┌─────────────────┐                         ║
+║     │  Original Image │         │  TransUNet Pred │                         ║
+║     │   (1024×1024)   │         │  (Coarse Mask)  │                         ║
+║     └────────┬────────┘         └────────┬────────┘                         ║
+║              │                           │                                   ║
+║              │     ┌─────────────────────┴─────────────────────┐            ║
+║              │     │        Differentiable Prompt Generator    │            ║
+║              │     │  ┌─────────┬──────────────┬────────────┐  │            ║
+║              │     │  │  Point  │     Box      │    Mask    │  │            ║
+║              │     │  │ (soft   │ (threshold   │  (resize   │  │            ║
+║              │     │  │ argmax) │  + minmax)   │  to 256²)  │  │            ║
+║              │     │  └─────────┴──────────────┴────────────┘  │            ║
+║              │     └─────────────────────┬─────────────────────┘            ║
+║              │                           │                                   ║
+║              ▼                           ▼                                   ║
+║  ┌─────────────────────────────────────────────────────────────────┐        ║
+║  │                          SAM (MedSAM)                            │        ║
+║  │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐       │        ║
+║  │  │    Image     │    │   Prompt     │    │     Mask     │       │        ║
+║  │  │   Encoder    │    │   Encoder    │ ─► │    Decoder   │       │        ║
+║  │  │  (FROZEN)    │    │ (trainable)  │    │  (trainable) │       │        ║
+║  │  └──────────────┘    └──────────────┘    └──────────────┘       │        ║
+║  └─────────────────────────────────────────────────────────────────┘        ║
+║         │                                                                    ║
+║         ▼                                                                    ║
+║  ┌─────────────────┐                                                        ║
+║  │  Refined Mask   │   Loss = BCE-Dice + IoU Prediction Loss                ║
+║  └─────────────────┘                                                        ║
+║         │                                                                    ║
+║         ▼                                                                    ║
+║  ┌─────────────────┐                                                        ║
+║  │   Checkpoints   │   ./checkpoints/sam_finetuned/best.pth                 ║
+║  └─────────────────┘                                                        ║
+║                                                                               ║
+║                              │                                                ║
+║                              ▼                                                ║
+║  ┌─────────────────────────────────────────────────────────────────────────┐ ║
+║  │                  PHASE 3: End-to-End Training                           │ ║
+║  │                  (Joint Optimization)                                   │ ║
+║  └─────────────────────────────────────────────────────────────────────────┘ ║
+║                                                                               ║
+║                    ┌─────────────────────────┐                              ║
+║                    │      Input Image        │                              ║
+║                    │       (224×224)         │                              ║
+║                    └───────────┬─────────────┘                              ║
+║                                │                                             ║
+║         ┌──────────────────────┴──────────────────────┐                     ║
+║         ▼                                             │                     ║
+║  ┌─────────────────┐                                  │                     ║
+║  │    TransUNet    │  ◄── Gradients flow back ───┐    │                     ║
+║  │   (trainable)   │                             │    │                     ║
+║  └────────┬────────┘                             │    │                     ║
+║           │                                      │    │                     ║
+║           ▼                                      │    │                     ║
+║  ┌─────────────────┐                             │    │                     ║
+║  │   Coarse Mask   │ ──► L_coarse (CE + Dice)    │    │                     ║
+║  │   (Soft Prob)   │          │                  │    │                     ║
+║  └────────┬────────┘          │                  │    │                     ║
+║           │                   │                  │    │                     ║
+║           ▼                   │                  │    │                     ║
+║  ┌─────────────────┐          │                  │    │                     ║
+║  │   Differentiable│          │                  │    │                     ║
+║  │     Prompts     │          │                  │    │                     ║
+║  └────────┬────────┘          │                  │    │                     ║
+║           │                   │                  │    │                     ║
+║           ▼                   │                  │    │                     ║
+║  ┌─────────────────┐          │                  │    │                     ║
+║  │   SAMRefiner    │ ◄────────│──────────────────┘    │                     ║
+║  │   (trainable)   │          │                       │                     ║
+║  └────────┬────────┘          │                       │                     ║
+║           │                   │                       │                     ║
+║           ▼                   │                       │                     ║
+║  ┌─────────────────┐          │                       │                     ║
+║  │  Refined Mask   │ ──► L_refined (BCE-Dice) ───────┘                     ║
+║  └─────────────────┘          │                                             ║
+║                               ▼                                             ║
+║                    L_total = 0.3 × L_coarse + 0.7 × L_refined              ║
+║                                                                               ║
+║                               │                                              ║
+║                               ▼                                              ║
+║                    ┌─────────────────┐                                      ║
+║                    │   Final Model   │                                      ║
+║                    │  ./checkpoints/ │                                      ║
+║                    │  ultra_refiner/ │                                      ║
+║                    └─────────────────┘                                      ║
+║                                                                               ║
+╚══════════════════════════════════════════════════════════════════════════════╝
 ```
 
-### Key Features
+## Quick Start
 
-- **Fully Differentiable Pipeline**: Enables end-to-end optimization
-- **Differentiable Prompt Generation**: Soft-argmax based point extraction, differentiable box estimation
-- **Multi-Dataset Support**: BUSI, BUSBRA, BUS, BUS_UC, BUS_UCLM
-- **MedSAM Integration**: Leverages medical image-specific SAM pretraining
-- **Modular Design**: Each component can be trained independently or jointly
+### 1. Data Preprocessing
+
+```bash
+# Preprocess all datasets (creates train/test splits, excludes blank masks)
+python scripts/preprocess_datasets.py \
+    --raw_root ./dataset/raw \
+    --output_root ./dataset/processed \
+    --test_ratio 0.2 \
+    --n_splits 5
+```
+
+### 2. Phase 1: Train TransUNet
+
+```bash
+# Train on single dataset with 5-fold CV
+python scripts/train_transunet.py \
+    --data_root ./dataset/processed \
+    --dataset BUSI \
+    --fold 0 \
+    --n_splits 5 \
+    --vit_pretrained ./pretrained/R50+ViT-B_16.npz \
+    --max_epochs 150
+
+# Repeat for all folds (0-4) and all datasets
+```
+
+### 3. Inference & Visualize TransUNet Predictions
+
+```bash
+# Generate predictions for SAM training
+python scripts/inference_transunet.py \
+    --data_root ./dataset/processed \
+    --dataset BUSI \
+    --checkpoint_root ./checkpoints/transunet \
+    --output_dir ./predictions/transunet \
+    --n_splits 5 \
+    --visualize
+```
+
+### 4. Phase 2: Finetune SAM with Predictions
+
+```bash
+# Option A: Use actual TransUNet predictions (recommended)
+python scripts/finetune_sam_with_preds.py \
+    --data_root ./dataset/processed \
+    --pred_root ./predictions/transunet \
+    --medsam_checkpoint ./pretrained/medsam_vit_b.pth \
+    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
+    --fold 0
+
+# Option B: Use simulated coarse masks from GT
+python scripts/finetune_sam.py \
+    --data_root ./dataset/processed \
+    --medsam_checkpoint ./pretrained/medsam_vit_b.pth \
+    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
+    --fold 0
+```
+
+### 5. Phase 3: End-to-End Training
+
+```bash
+python scripts/train_e2e.py \
+    --data_root ./dataset/processed \
+    --transunet_checkpoint ./checkpoints/transunet/BUSI_fold0/best.pth \
+    --sam_checkpoint ./checkpoints/sam_finetuned/best.pth \
+    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
+    --fold 0 \
+    --max_epochs 100
+```
 
 ## Project Structure
 
 ```
 UltraRefiner/
 ├── configs/
-│   ├── __init__.py
-│   └── config.py              # Configuration management
+│   └── config.py                    # Configuration management
 ├── models/
-│   ├── __init__.py
-│   ├── transunet/             # TransUNet model
-│   │   ├── vit_seg_modeling.py
-│   │   ├── vit_seg_configs.py
-│   │   └── vit_seg_modeling_resnet_skip.py
-│   ├── sam/                   # SAM model
-│   │   ├── sam.py
-│   │   ├── image_encoder.py
-│   │   ├── mask_decoder.py
-│   │   ├── prompt_encoder.py
-│   │   └── build_sam.py
-│   ├── sam_refiner.py         # Differentiable SAM Refiner
-│   └── ultra_refiner.py       # End-to-end model
+│   ├── transunet/                   # TransUNet model (submodule)
+│   ├── sam/                         # SAM model components
+│   ├── sam_refiner.py               # Differentiable SAM Refiner
+│   └── ultra_refiner.py             # End-to-end model
 ├── data/
-│   ├── __init__.py
-│   └── dataset.py             # Unified dataset loader
+│   └── dataset.py                   # Dataset loaders with K-fold CV
 ├── utils/
-│   ├── __init__.py
-│   ├── losses.py              # Loss functions
-│   └── metrics.py             # Evaluation metrics
+│   ├── losses.py                    # Loss functions (Dice, BCE, SAM Loss)
+│   └── metrics.py                   # Metrics & TrainingLogger
 ├── scripts/
-│   ├── train_transunet.py     # Phase 1 training
-│   ├── finetune_sam.py        # Phase 2 training
-│   ├── train_e2e.py           # Phase 3 training
-│   └── inference.py           # Inference script
-├── checkpoints/               # Model checkpoints
-└── requirements.txt
+│   ├── preprocess_datasets.py       # Data preprocessing
+│   ├── train_transunet.py           # Phase 1 training
+│   ├── inference_transunet.py       # Generate predictions & visualizations
+│   ├── finetune_sam.py              # Phase 2 (simulated masks)
+│   ├── finetune_sam_with_preds.py   # Phase 2 (actual predictions)
+│   └── train_e2e.py                 # Phase 3 training
+├── dataset/
+│   ├── raw/                         # Original datasets
+│   └── processed/                   # Preprocessed with splits
+├── predictions/
+│   └── transunet/                   # TransUNet predictions for SAM
+├── checkpoints/
+│   ├── transunet/                   # Phase 1 checkpoints
+│   ├── sam_finetuned/               # Phase 2 checkpoints
+│   └── ultra_refiner/               # Phase 3 checkpoints
+└── pretrained/
+    ├── R50+ViT-B_16.npz             # TransUNet pretrained weights
+    └── medsam_vit_b.pth             # MedSAM checkpoint
 ```
 
-## Installation
+## Datasets
 
-```bash
-# Clone the repository
-cd UltraRefiner
+| Dataset | Samples | Description |
+|---------|---------|-------------|
+| BUSI | 647 | Breast Ultrasound Images (benign + malignant) |
+| BUSBRA | 1,875 | Brazilian Breast Ultrasound |
+| BUS | 562 | Breast Ultrasound Dataset |
+| BUS_UC | 956 | UC Breast Ultrasound |
+| BUS_UCLM | 163 | UCLM Breast Ultrasound |
 
-# Install dependencies
-pip install -r requirements.txt
+Note: Samples with blank masks (no lesion) are automatically excluded during preprocessing.
 
-# Install FastGeodis for distance transform
-pip install FastGeodis
-```
-
-## Data Preparation
-
-Organize your datasets as follows:
-
-```
-data/
-├── BUSI/
-│   ├── benign/
-│   │   ├── benign (1).png
-│   │   ├── benign (1)_mask.png
-│   │   └── ...
-│   └── malignant/
-│       └── ...
-├── BUSBRA/
-│   ├── train/
-│   │   ├── images/
-│   │   └── masks/
-│   └── val/
-│       └── ...
-└── ... (other datasets)
-```
-
-## Training
-
-### Phase 1: Train TransUNet
-
-```bash
-python scripts/train_transunet.py \
-    --data_root ./data \
-    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
-    --vit_name R50-ViT-B_16 \
-    --vit_pretrained ./pretrained/R50+ViT-B_16.npz \
-    --img_size 224 \
-    --batch_size 24 \
-    --max_epochs 150 \
-    --output_dir ./checkpoints/transunet \
-    --exp_name transunet_bus
-```
-
-### Phase 2: Finetune SAM
-
-```bash
-python scripts/finetune_sam.py \
-    --data_root ./data \
-    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
-    --sam_model_type vit_b \
-    --medsam_checkpoint ./pretrained/medsam_vit_b.pth \
-    --batch_size 4 \
-    --max_epochs 100 \
-    --output_dir ./checkpoints/sam_finetuned \
-    --exp_name sam_finetune_bus
-```
-
-### Phase 3: End-to-End Training
-
-```bash
-python scripts/train_e2e.py \
-    --data_root ./data \
-    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
-    --transunet_checkpoint ./checkpoints/transunet/best.pth \
-    --sam_checkpoint ./checkpoints/sam_finetuned/best.pth \
-    --batch_size 8 \
-    --max_epochs 100 \
-    --transunet_lr 1e-4 \
-    --sam_lr 1e-5 \
-    --coarse_loss_weight 0.3 \
-    --refined_loss_weight 0.7 \
-    --output_dir ./checkpoints/ultra_refiner \
-    --exp_name ultra_refiner_e2e
-```
-
-## Inference
-
-```bash
-# Full pipeline inference
-python scripts/inference.py \
-    --mode full \
-    --model_checkpoint ./checkpoints/ultra_refiner/best.pth \
-    --image_path ./test_image.png \
-    --output_dir ./results
-
-# TransUNet only inference
-python scripts/inference.py \
-    --mode transunet \
-    --transunet_checkpoint ./checkpoints/transunet/best.pth \
-    --image_dir ./test_images \
-    --output_dir ./results
-```
-
-## Model Components
-
-### TransUNet
-- **Architecture**: ResNet50 + ViT-B/16 hybrid encoder with CNN decoder
-- **Input**: 224×224 grayscale images
-- **Output**: Probability maps for each class
-
-### SAMRefiner
-- **Architecture**: SAM's prompt encoder + mask decoder
-- **Input**: 1024×1024 images + differentiable prompts
-- **Prompts**:
-  - Point prompts: Soft-argmax extracted positive/negative points
-  - Box prompts: Differentiable bounding box from mask
-  - Mask prompts: Scaled and transformed coarse mask
+## Key Components
 
 ### Differentiable Prompt Generation
-The key innovation is making prompt generation differentiable:
 
-1. **Point Prompts**: Uses soft-argmax to extract the centroid as a weighted average
-2. **Box Prompts**: Extracts bounding box coordinates from thresholded mask
-3. **Mask Prompts**: Directly passes soft probability maps as mask input
+The core innovation enabling end-to-end training:
 
-## Loss Functions
+| Prompt Type | Method | Description |
+|-------------|--------|-------------|
+| **Point** | Soft-argmax | `centroid = Σ(mask × coords) / Σ(mask)` |
+| **Box** | Threshold + MinMax | Bounding box from `mask > 0.5` |
+| **Mask** | Bilinear resize | Scale to 256×256, convert to logits |
 
-- **Phase 1**: CrossEntropy + Dice Loss for multi-class segmentation
-- **Phase 2**: BCE-Dice Loss + IoU Prediction Loss for SAM training
-- **Phase 3**: Combined weighted loss:
-  ```
-  L_total = λ_coarse * L_TransUNet + λ_refined * L_SAM
-  ```
+### Loss Functions
 
-## Requirements
+- **Phase 1**: `L = 0.5 × CrossEntropy + 0.5 × Dice`
+- **Phase 2**: `L = BCE-Dice + IoU_prediction_loss`
+- **Phase 3**: `L = 0.3 × L_coarse + 0.7 × L_refined`
 
-- Python ≥ 3.8
-- PyTorch ≥ 1.10
-- CUDA ≥ 11.0 (recommended)
-- See `requirements.txt` for complete dependencies
+### Training Output
+
+Beautiful console output during training:
+
+```
+======================================================================
+                    ULTRAREFINER TRAINING
+======================================================================
+Experiment: BUSI_fold0
+Dataset:    BUSI
+Fold:       1/5
+Samples:    Train: 409 | Val: 103
+======================================================================
+
+──────────────────────────────────────────────────────────────────────
+  EPOCH 1/150
+──────────────────────────────────────────────────────────────────────
+
+  [TRAIN]
+  ├── Loss:      0.4523
+  ├── Dice:      0.7234
+  ├── IoU:       0.5812
+  └── LR:        9.94e-03
+
+  [VALIDATION] ★ BEST
+  ┌────────────────────────────────────────
+  │  Metric              Value
+  ├────────────────────────────────────────
+  │  Dice                0.7512
+  │  IoU (Jaccard)       0.6023
+  │  Precision           0.7834
+  │  Recall              0.7215
+  │  Accuracy            0.9234
+  │  Loss                0.4012
+  └────────────────────────────────────────
+```
 
 ## Pretrained Weights
 
-Download the following pretrained weights:
+1. **TransUNet ViT weights**:
+   ```bash
+   wget https://storage.googleapis.com/vit_models/imagenet21k/R50+ViT-B_16.npz -P ./pretrained/
+   ```
 
-1. **ViT weights for TransUNet**: Download from [Google Cloud](https://console.cloud.google.com/storage/browser/vit_models/imagenet21k)
 2. **MedSAM checkpoint**: Download from [MedSAM GitHub](https://github.com/bowang-lab/MedSAM)
+
+## Requirements
+
+- Python >= 3.8
+- PyTorch >= 1.10
+- CUDA >= 11.0 (recommended)
+
+```bash
+pip install -r requirements.txt
+```
 
 ## Citation
 
-If you use this code, please cite:
-
 ```bibtex
 @article{ultrarefiner2024,
-  title={UltraRefiner: End-to-End Differentiable Segmentation Refinement for Breast Ultrasound},
+  title={UltraRefiner: End-to-End Differentiable Segmentation Refinement for Medical Image Analysis},
   author={},
   journal={},
   year={2024}
@@ -246,9 +368,9 @@ If you use this code, please cite:
 
 ## References
 
-- TransUNet: [Transformers Make Strong Encoders for Medical Image Segmentation](https://arxiv.org/abs/2102.04306)
-- SAMRefiner: [SAMRefiner: A General-Purpose Mask Refiner](https://github.com/linyq2117/SAMRefiner)
-- MedSAM: [Segment Anything in Medical Images](https://github.com/bowang-lab/MedSAM)
+- [TransUNet](https://arxiv.org/abs/2102.04306): Transformers Make Strong Encoders for Medical Image Segmentation
+- [MedSAM](https://github.com/bowang-lab/MedSAM): Segment Anything in Medical Images
+- [SAM](https://segment-anything.com/): Segment Anything Model
 
 ## License
 
