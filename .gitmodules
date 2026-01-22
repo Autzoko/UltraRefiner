@@ -1,0 +1,6 @@
+[submodule "TransUNet"]
+	path = TransUNet
+	url = https://github.com/Beckschen/TransUNet.git
+[submodule "SAMRefiner"]
+	path = SAMRefiner
+	url = https://github.com/linyq2117/SAMRefiner.git
