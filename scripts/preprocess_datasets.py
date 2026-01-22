@@ -148,9 +148,9 @@ def process_busi(raw_dir: str, output_dir: str, test_ratio: float = 0.2, seed: i
     Structure:
         raw/BUSI/benign/benign (1).png, benign (1)_mask.png
         raw/BUSI/malignant/malignant (1).png, malignant (1)_mask.png
-        raw/BUSI/normal/ (excluded - no lesions)
+        raw/BUSI/normal/ (excluded - no lesions, all masks are blank)
 
-    Note: Normal cases and any samples with blank masks are excluded.
+    Note: Normal cases (entire folder) and any samples with blank masks are excluded.
     """
     print("\n" + "="*60)
     print("Processing BUSI dataset...")
@@ -160,6 +160,15 @@ def process_busi(raw_dir: str, output_dir: str, test_ratio: float = 0.2, seed: i
     create_directory_structure(output_dir, dataset_name)
 
     busi_dir = os.path.join(raw_dir, "BUSI")
+
+    # Count normal cases (entire folder excluded - all are no-lesion samples)
+    excluded_normal = 0
+    normal_dir = os.path.join(busi_dir, "normal")
+    if os.path.exists(normal_dir):
+        # Count image files (not masks) in normal folder
+        normal_files = [f for f in os.listdir(normal_dir) if f.endswith('.png') and '_mask' not in f]
+        excluded_normal = len(normal_files)
+        print(f"Excluding {excluded_normal} normal cases (no lesions) from 'normal' folder")
 
     # Collect all image-mask pairs (excluding normal - no lesions)
     pairs = []
@@ -201,14 +210,23 @@ def process_busi(raw_dir: str, output_dir: str, test_ratio: float = 0.2, seed: i
                         'name': f"{category}_{base_name.replace(' ', '_').replace('(', '').replace(')', '')}"
                     })
 
-    print(f"Found {len(pairs)} valid image-mask pairs (excluded {excluded_blank} blank masks)")
+    print(f"Found {len(pairs)} valid image-mask pairs (excluded {excluded_blank} blank masks from benign/malignant)")
 
     # Split
     train_pairs, test_pairs = train_test_split(pairs, test_ratio, seed)
     print(f"Train: {len(train_pairs)}, Test: {len(test_pairs)}")
 
+    # Total excluded = normal cases + blank masks in benign/malignant
+    total_excluded = excluded_normal + excluded_blank
+
     # Process and save
-    split_info = {'train': [], 'test': [], 'excluded_blank': excluded_blank}
+    split_info = {
+        'train': [],
+        'test': [],
+        'excluded_blank': excluded_blank,
+        'excluded_normal': excluded_normal,
+        'total_excluded': total_excluded
+    }
 
     for split_name, split_pairs in [('train', train_pairs), ('test', test_pairs)]:
         for pair in tqdm(split_pairs, desc=f"Processing {split_name}"):
@@ -247,7 +265,9 @@ def process_busi(raw_dir: str, output_dir: str, test_ratio: float = 0.2, seed: i
         json.dump(split_info, f, indent=2)
 
     print(f"BUSI processing complete. Train: {len(split_info['train'])}, Test: {len(split_info['test'])}")
-    print(f"  Excluded {excluded_blank} samples with blank masks (no lesions)")
+    print(f"  Excluded {excluded_normal} normal cases (entire 'normal' folder)")
+    print(f"  Excluded {excluded_blank} samples with blank masks from benign/malignant")
+    print(f"  Total excluded: {total_excluded}")
     return split_info
 
 
@@ -568,16 +588,22 @@ def create_combined_split_info(output_dir: str, all_splits: Dict):
     total_excluded = 0
 
     for dataset_name, split_info in all_splits.items():
-        excluded = split_info.get('excluded_blank', 0)
+        # Get excluded counts (BUSI has both excluded_normal and excluded_blank)
+        excluded_blank = split_info.get('excluded_blank', 0)
+        excluded_normal = split_info.get('excluded_normal', 0)
+        dataset_total_excluded = split_info.get('total_excluded', excluded_blank)
+
         combined['datasets'][dataset_name] = {
             'train': len(split_info['train']),
             'test': len(split_info['test']),
-            'excluded_blank': excluded
+            'excluded_blank': excluded_blank,
+            'excluded_normal': excluded_normal,
+            'total_excluded': dataset_total_excluded
         }
-        combined['excluded'][dataset_name] = excluded
+        combined['excluded'][dataset_name] = dataset_total_excluded
         total_train += len(split_info['train'])
         total_test += len(split_info['test'])
-        total_excluded += excluded
+        total_excluded += dataset_total_excluded
 
         # Add to combined lists with dataset info
         for item in split_info['train']:
@@ -595,7 +621,7 @@ def create_combined_split_info(output_dir: str, all_splits: Dict):
         'total_train': total_train,
         'total_test': total_test,
         'total': total_train + total_test,
-        'total_excluded_blank': total_excluded,
+        'total_excluded': total_excluded,
         'train_ratio': total_train / (total_train + total_test) if (total_train + total_test) > 0 else 0,
         'test_ratio': total_test / (total_train + total_test) if (total_train + total_test) > 0 else 0
     }
@@ -680,20 +706,20 @@ def main():
     print("-" * 60)
     for dataset_name, counts in combined['datasets'].items():
         total = counts['train'] + counts['test']
-        excluded = counts.get('excluded_blank', 0)
+        excluded = counts.get('total_excluded', counts.get('excluded_blank', 0))
         print(f"{dataset_name:<15} {counts['train']:>10} {counts['test']:>10} {total:>10} {excluded:>10}")
     print("-" * 60)
     stats = combined['statistics']
-    print(f"{'TOTAL':<15} {stats['total_train']:>10} {stats['total_test']:>10} {stats['total']:>10} {stats['total_excluded_blank']:>10}")
+    print(f"{'TOTAL':<15} {stats['total_train']:>10} {stats['total_test']:>10} {stats['total']:>10} {stats['total_excluded']:>10}")
     print(f"\nTrain/Test ratio: {stats['train_ratio']:.1%} / {stats['test_ratio']:.1%}")
-    print(f"Total samples excluded (blank masks): {stats['total_excluded_blank']}")
+    print(f"Total samples excluded (no lesions): {stats['total_excluded']}")
     print(f"\nSplit information saved to: {os.path.join(output_dir, 'combined_split_info.json')}")
     print("\nIMPORTANT: This fixed split should be used for ALL training phases:")
     print("  - Phase 1: TransUNet training (per dataset)")
     print("  - Phase 2: SAM finetuning (all datasets combined)")
     print("  - Phase 3: End-to-end training")
     print("\nTest set is completely held out and should ONLY be used for final evaluation!")
-    print("\nNOTE: All samples with blank masks (no lesions / normal cases) have been excluded.")
+    print("\nNOTE: All samples with blank masks (no lesions) and BUSI 'normal' folder have been excluded.")
 
 
 if __name__ == '__main__':
