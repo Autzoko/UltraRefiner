@@ -29,7 +29,8 @@ from tqdm import tqdm
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models.sam import sam_model_registry, build_sam_for_training
+from models.sam import sam_model_registry, build_sam_for_training, build_sam_with_lora
+from models.lora import get_lora_params, get_lora_state_dict, print_lora_info
 from models.sam_refiner import DifferentiableSAMRefiner
 from data import (
     get_combined_kfold_dataloaders,

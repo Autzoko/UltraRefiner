@@ -297,6 +297,56 @@ The core innovation enabling end-to-end training:
 | **Box** | Threshold + MinMax | Bounding box from `mask > 0.5` |
 | **Mask** | Bilinear resize | Scale to 256×256, convert to logits |
 
+### LoRA (Low-Rank Adaptation)
+
+UltraRefiner supports LoRA for parameter-efficient fine-tuning of SAM's image encoder:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    LoRA Architecture                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Original Weight W (frozen)     LoRA Branch (trainable)         │
+│  ┌─────────────────┐           ┌─────────┐   ┌─────────┐       │
+│  │                 │           │  A      │   │  B      │       │
+│  │   W [d × d]     │     +     │ [d × r] │ → │ [r × d] │       │
+│  │                 │           │         │   │         │       │
+│  └────────┬────────┘           └────┬────┘   └────┬────┘       │
+│           │                         │             │             │
+│           └─────────────┬───────────┴─────────────┘             │
+│                         ▼                                        │
+│                    Output = Wx + BAx × (α/r)                    │
+│                                                                  │
+│  Parameters: r << d (e.g., r=4, d=768)                          │
+│  LoRA adds only ~0.3-1M params to adapt 89M frozen weights      │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**LoRA Benefits:**
+- Adapts frozen image encoder with minimal parameters (~0.3% of original)
+- Better domain adaptation for medical images (ultrasound differs from natural images)
+- Memory efficient training
+- Can be merged back for inference
+
+**Usage:**
+```bash
+# Finetune SAM with LoRA
+python scripts/finetune_sam.py \
+    --medsam_checkpoint ./pretrained/medsam_vit_b.pth \
+    --use_lora \
+    --lora_rank 4 \
+    --lora_alpha 4.0 \
+    --fold 0
+```
+
+| LoRA Parameter | Default | Description |
+|----------------|---------|-------------|
+| `--lora_rank` | 4 | Rank of LoRA decomposition |
+| `--lora_alpha` | 4.0 | Scaling factor (typically same as rank) |
+| `--lora_dropout` | 0.0 | Dropout for LoRA layers |
+| `--lora_target_modules` | qkv | Which modules to apply LoRA (qkv, proj, mlp) |
+
 ### Loss Functions
 
 - **Phase 1**: `L = 0.5 × CrossEntropy + 0.5 × Dice`

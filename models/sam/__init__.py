@@ -15,6 +15,7 @@ from .build_sam import (
     build_sam_vit_b,
     sam_model_registry,
     build_sam_for_training,
+    build_sam_with_lora,
 )
 
 __all__ = [
@@ -28,4 +29,5 @@ __all__ = [
     'build_sam_vit_b',
     'sam_model_registry',
     'build_sam_for_training',
+    'build_sam_with_lora',
 ]

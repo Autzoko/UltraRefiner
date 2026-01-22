@@ -140,3 +140,73 @@ def build_sam_for_training(model_type='vit_b', checkpoint=None, freeze_image_enc
         param.requires_grad = True
 
     return sam
+
+
+def build_sam_with_lora(
+    model_type='vit_b',
+    checkpoint=None,
+    lora_rank=4,
+    lora_alpha=4.0,
+    lora_dropout=0.0,
+    apply_lora_to_qkv=True,
+    apply_lora_to_proj=False,
+    apply_lora_to_mlp=False,
+    freeze_prompt_encoder=False,
+):
+    """
+    Build SAM model with LoRA adapters for parameter-efficient finetuning.
+
+    This function builds SAM with LoRA layers injected into the image encoder,
+    allowing adaptation of the frozen encoder with minimal trainable parameters.
+
+    Args:
+        model_type: One of 'vit_h', 'vit_l', 'vit_b'
+        checkpoint: Path to checkpoint (e.g., MedSAM checkpoint)
+        lora_rank: Rank of LoRA decomposition (higher = more capacity)
+        lora_alpha: LoRA scaling factor (typically same as rank)
+        lora_dropout: Dropout probability for LoRA layers
+        apply_lora_to_qkv: Apply LoRA to QKV projections in attention
+        apply_lora_to_proj: Apply LoRA to output projections in attention
+        apply_lora_to_mlp: Apply LoRA to MLP layers
+        freeze_prompt_encoder: Whether to freeze the prompt encoder
+
+    Returns:
+        Tuple of (SAM model with LoRA, number of LoRA parameters)
+    """
+    from ..lora import inject_lora_to_vit_sam, print_lora_info
+
+    # Build base SAM
+    sam = sam_model_registry[model_type](checkpoint=checkpoint)
+
+    # Inject LoRA into image encoder
+    sam.image_encoder, lora_param_count = inject_lora_to_vit_sam(
+        image_encoder=sam.image_encoder,
+        rank=lora_rank,
+        alpha=lora_alpha,
+        dropout=lora_dropout,
+        apply_to_qkv=apply_lora_to_qkv,
+        apply_to_proj=apply_lora_to_proj,
+        apply_to_mlp=apply_lora_to_mlp,
+    )
+
+    print(f"Injected LoRA with rank={lora_rank}, alpha={lora_alpha}")
+    print(f"LoRA parameters: {lora_param_count:,}")
+
+    # Handle prompt encoder
+    if freeze_prompt_encoder:
+        for param in sam.prompt_encoder.parameters():
+            param.requires_grad = False
+        print("Prompt encoder frozen")
+    else:
+        for param in sam.prompt_encoder.parameters():
+            param.requires_grad = True
+        print("Prompt encoder trainable")
+
+    # Always train the mask decoder
+    for param in sam.mask_decoder.parameters():
+        param.requires_grad = True
+
+    # Print LoRA info
+    print_lora_info(sam)
+
+    return sam, lora_param_count
