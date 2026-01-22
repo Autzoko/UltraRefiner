@@ -37,7 +37,7 @@ from data import (
     RandomGenerator,
     SUPPORTED_DATASETS
 )
-from utils import DiceLoss, MetricTracker
+from utils import DiceLoss, MetricTracker, TrainingLogger
 
 
 def get_args():
@@ -114,8 +114,9 @@ def train_one_epoch(model, dataloader, optimizer, ce_loss, dice_loss, device, ep
     model.train()
     metric_tracker = MetricTracker()
     iter_num = epoch * len(dataloader)
+    current_lr = base_lr
 
-    pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
+    pbar = tqdm(dataloader, desc=f'  Train', leave=False)
     for batch_idx, batch in enumerate(pbar):
         image = batch['image'].to(device)
         label = batch['label'].to(device)
@@ -134,9 +135,9 @@ def train_one_epoch(model, dataloader, optimizer, ce_loss, dice_loss, device, ep
         optimizer.step()
 
         # Update learning rate (poly scheduler)
-        lr_ = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
+        current_lr = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
         for param_group in optimizer.param_groups:
-            param_group['lr'] = lr_
+            param_group['lr'] = current_lr
 
         # Compute metrics
         with torch.no_grad():
@@ -147,7 +148,7 @@ def train_one_epoch(model, dataloader, optimizer, ce_loss, dice_loss, device, ep
         writer.add_scalar('train/loss', loss.item(), iter_num)
         writer.add_scalar('train/loss_ce', loss_ce.item(), iter_num)
         writer.add_scalar('train/loss_dice', loss_dice.item(), iter_num)
-        writer.add_scalar('train/lr', lr_, iter_num)
+        writer.add_scalar('train/lr', current_lr, iter_num)
 
         iter_num += 1
 
@@ -156,17 +157,21 @@ def train_one_epoch(model, dataloader, optimizer, ce_loss, dice_loss, device, ep
             'dice': f'{metric_tracker.get_average()["dice"]:.4f}'
         })
 
-    return metric_tracker.get_average()
+    avg_metrics = metric_tracker.get_average()
+    avg_metrics['lr'] = current_lr
+    return avg_metrics
 
 
 def validate(model, dataloader, ce_loss, dice_loss, device):
     """Validate the model."""
     model.eval()
-    metric_tracker = MetricTracker()
+    metric_tracker = MetricTracker(
+        metrics=['dice', 'iou', 'jaccard', 'precision', 'recall', 'accuracy']
+    )
     total_loss = 0.0
 
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc='Validation'):
+        for batch in tqdm(dataloader, desc='  Valid', leave=False):
             image = batch['image'].to(device)
             label = batch['label'].to(device)
 
@@ -258,6 +263,20 @@ def main():
     logging.info(f'Train samples: {len(train_loader.dataset)}')
     logging.info(f'Val samples: {len(val_loader.dataset)}')
 
+    # Initialize beautiful logger
+    dataset_name = args.dataset if args.dataset else 'Combined'
+    logger = TrainingLogger(
+        experiment_name=args.exp_name,
+        total_epochs=args.max_epochs
+    )
+    logger.print_header(
+        dataset=dataset_name,
+        fold=args.fold,
+        n_splits=args.n_splits,
+        train_samples=len(train_loader.dataset),
+        val_samples=len(val_loader.dataset)
+    )
+
     # Build model
     config = CONFIGS[args.vit_name]
     config.n_classes = args.num_classes
@@ -308,6 +327,7 @@ def main():
     max_iterations = args.max_epochs * len(train_loader)
     logging.info(f'Max iterations: {max_iterations}')
 
+    best_epoch = 0
     for epoch in range(start_epoch, args.max_epochs):
         # Train
         train_metrics = train_one_epoch(
@@ -326,7 +346,18 @@ def main():
 
         # Save checkpoint
         is_best = val_metrics['dice'] > best_dice
-        best_dice = max(val_metrics['dice'], best_dice)
+        if is_best:
+            best_dice = val_metrics['dice']
+            best_epoch = epoch
+
+        # Print beautiful epoch summary
+        logger.print_epoch_summary(
+            epoch=epoch,
+            train_metrics=train_metrics,
+            val_metrics=val_metrics,
+            lr=train_metrics.get('lr', args.base_lr),
+            is_best=is_best
+        )
 
         checkpoint = {
             'epoch': epoch,
@@ -355,6 +386,7 @@ def main():
             torch.save(checkpoint, os.path.join(snapshot_path, f'epoch_{epoch}.pth'))
 
     writer.close()
+    logger.print_training_complete(best_dice, best_epoch)
     logging.info(f'Training finished. Best Dice: {best_dice:.4f}')
 
 

@@ -36,7 +36,7 @@ from data import (
     SAMRandomGenerator,
     SUPPORTED_DATASETS
 )
-from utils import BCEDiceLoss, SAMLoss, MetricTracker
+from utils import BCEDiceLoss, SAMLoss, MetricTracker, TrainingLogger
 
 
 def get_args():
@@ -167,7 +167,7 @@ def train_one_epoch(model, sam_refiner, dataloader, optimizer, criterion, device
     pixel_mean = torch.tensor([123.675, 116.28, 103.53]).view(1, 3, 1, 1).to(device)
     pixel_std = torch.tensor([58.395, 57.12, 57.375]).view(1, 3, 1, 1).to(device)
 
-    pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
+    pbar = tqdm(dataloader, desc=f'  Train', leave=False)
     for batch_idx, batch in enumerate(pbar):
         image = batch['image'].to(device)  # (B, 3, 1024, 1024)
         label = batch['label'].to(device)  # (B, 1024, 1024)
@@ -222,14 +222,16 @@ def validate(model, sam_refiner, dataloader, criterion, device, args):
     model.eval()
     sam_refiner.eval()
 
-    metric_tracker = MetricTracker()
+    metric_tracker = MetricTracker(
+        metrics=['dice', 'iou', 'jaccard', 'precision', 'recall', 'accuracy']
+    )
 
     # SAM normalization
     pixel_mean = torch.tensor([123.675, 116.28, 103.53]).view(1, 3, 1, 1).to(device)
     pixel_std = torch.tensor([58.395, 57.12, 57.375]).view(1, 3, 1, 1).to(device)
 
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc='Validation'):
+        for batch in tqdm(dataloader, desc='  Valid', leave=False):
             image = batch['image'].to(device)
             label = batch['label'].to(device)
 
@@ -308,6 +310,19 @@ def main():
     logging.info(f'Train samples: {len(train_loader.dataset)}')
     logging.info(f'Val samples: {len(val_loader.dataset)}')
 
+    # Initialize beautiful logger
+    logger = TrainingLogger(
+        experiment_name=args.exp_name,
+        total_epochs=args.max_epochs
+    )
+    logger.print_header(
+        dataset='Combined (All)',
+        fold=args.fold,
+        n_splits=args.n_splits,
+        train_samples=len(train_loader.dataset),
+        val_samples=len(val_loader.dataset)
+    )
+
     # Build SAM model
     sam = build_sam_for_training(
         model_type=args.sam_model_type,
@@ -365,6 +380,7 @@ def main():
     writer = SummaryWriter(os.path.join(snapshot_path, 'logs'))
 
     # Training loop
+    best_epoch = 0
     for epoch in range(start_epoch, args.max_epochs):
         # Train
         train_metrics = train_one_epoch(
@@ -383,11 +399,23 @@ def main():
         # Log to tensorboard
         for key, value in val_metrics.items():
             writer.add_scalar(f'val/{key}', value, epoch)
-        writer.add_scalar('train/lr', scheduler.get_last_lr()[0], epoch)
+        current_lr = scheduler.get_last_lr()[0]
+        writer.add_scalar('train/lr', current_lr, epoch)
 
         # Save checkpoint
         is_best = val_metrics['dice'] > best_dice
-        best_dice = max(val_metrics['dice'], best_dice)
+        if is_best:
+            best_dice = val_metrics['dice']
+            best_epoch = epoch
+
+        # Print beautiful epoch summary
+        logger.print_epoch_summary(
+            epoch=epoch,
+            train_metrics=train_metrics,
+            val_metrics=val_metrics,
+            lr=current_lr,
+            is_best=is_best
+        )
 
         checkpoint = {
             'epoch': epoch,
@@ -414,6 +442,7 @@ def main():
             torch.save(checkpoint, os.path.join(snapshot_path, f'epoch_{epoch}.pth'))
 
     writer.close()
+    logger.print_training_complete(best_dice, best_epoch)
     logging.info(f'Training finished. Best Dice: {best_dice:.4f}')
 
 

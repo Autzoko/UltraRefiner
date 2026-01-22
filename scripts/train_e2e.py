@@ -35,7 +35,7 @@ from data import (
     RandomGenerator,
     SUPPORTED_DATASETS
 )
-from utils import DiceLoss, BCEDiceLoss, MetricTracker
+from utils import DiceLoss, BCEDiceLoss, MetricTracker, TrainingLogger
 
 
 def get_args():
@@ -192,7 +192,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, writ
     iter_num = epoch * len(dataloader)
 
     optimizer.zero_grad()
-    pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
+    pbar = tqdm(dataloader, desc=f'  Train', leave=False)
 
     for batch_idx, batch in enumerate(pbar):
         image = batch['image'].to(device)
@@ -251,11 +251,15 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, writ
 def validate(model, dataloader, criterion, device):
     """Validate the model."""
     model.eval()
-    metric_tracker_coarse = MetricTracker()
-    metric_tracker_refined = MetricTracker()
+    metric_tracker_coarse = MetricTracker(
+        metrics=['dice', 'iou', 'jaccard', 'precision', 'recall', 'accuracy']
+    )
+    metric_tracker_refined = MetricTracker(
+        metrics=['dice', 'iou', 'jaccard', 'precision', 'recall', 'accuracy']
+    )
 
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc='Validation'):
+        for batch in tqdm(dataloader, desc='  Valid', leave=False):
             image = batch['image'].to(device)
             label = batch['label'].to(device)
 
@@ -333,6 +337,19 @@ def main():
     logging.info(f'Train samples: {len(train_loader.dataset)}')
     logging.info(f'Val samples: {len(val_loader.dataset)}')
 
+    # Initialize beautiful logger
+    logger = TrainingLogger(
+        experiment_name=args.exp_name,
+        total_epochs=args.max_epochs
+    )
+    logger.print_header(
+        dataset='Combined (End-to-End)',
+        fold=args.fold,
+        n_splits=args.n_splits,
+        train_samples=len(train_loader.dataset),
+        val_samples=len(val_loader.dataset)
+    )
+
     # Build UltraRefiner model
     model = build_ultra_refiner(
         vit_name=args.vit_name,
@@ -393,6 +410,7 @@ def main():
     writer = SummaryWriter(os.path.join(snapshot_path, 'logs'))
 
     # Training loop
+    best_epoch = 0
     for epoch in range(start_epoch, args.max_epochs):
         # Train
         train_metrics = train_one_epoch(
@@ -416,13 +434,31 @@ def main():
         for key, value in val_metrics['refined'].items():
             writer.add_scalar(f'val/refined_{key}', value, epoch)
 
-        writer.add_scalar('train/lr_transunet', scheduler.get_last_lr()[0], epoch)
+        current_lr = scheduler.get_last_lr()[0]
+        writer.add_scalar('train/lr_transunet', current_lr, epoch)
         writer.add_scalar('train/lr_sam', scheduler.get_last_lr()[1], epoch)
 
         # Save checkpoint (based on refined dice)
         refined_dice = val_metrics['refined']['dice']
         is_best = refined_dice > best_dice
-        best_dice = max(refined_dice, best_dice)
+        if is_best:
+            best_dice = refined_dice
+            best_epoch = epoch
+
+        # Print beautiful epoch summary (using refined metrics as the primary)
+        logger.print_epoch_summary(
+            epoch=epoch,
+            train_metrics=train_metrics['refined'],
+            val_metrics=val_metrics['refined'],
+            lr=current_lr,
+            is_best=is_best
+        )
+
+        # Print coarse vs refined comparison
+        print(f"\n  Coarse vs Refined:")
+        print(f"  ├── Coarse Dice:  {val_metrics['coarse']['dice']:.4f}")
+        print(f"  └── Refined Dice: {val_metrics['refined']['dice']:.4f} "
+              f"(+{val_metrics['refined']['dice'] - val_metrics['coarse']['dice']:.4f})")
 
         checkpoint = {
             'epoch': epoch,
@@ -451,6 +487,7 @@ def main():
             torch.save(checkpoint, os.path.join(snapshot_path, f'epoch_{epoch}.pth'))
 
     writer.close()
+    logger.print_training_complete(best_dice, best_epoch)
     logging.info(f'Training finished. Best Dice: {best_dice:.4f}')
 
 
