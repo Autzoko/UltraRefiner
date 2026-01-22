@@ -151,7 +151,8 @@ class SAMDatasetWithPredictions(Dataset):
             self.samples = [line.strip() for line in f.readlines()]
 
         # Predictions directory
-        self.pred_dir = os.path.join(pred_root, dataset_name, f'fold{fold}', 'predictions')
+        # Structure: predictions/transunet/{dataset}/fold_{i}/predictions/
+        self.pred_dir = os.path.join(pred_root, dataset_name.lower(), f'fold_{fold}', 'predictions')
         if not os.path.exists(self.pred_dir):
             raise FileNotFoundError(f"Predictions not found: {self.pred_dir}")
 
@@ -391,7 +392,8 @@ def main():
 
     # Auto-generate experiment name
     if args.exp_name is None:
-        args.exp_name = f'sam_with_preds_fold{args.fold}'
+        # Structure: checkpoints/sam_finetuned_with_preds/fold_{i}/
+        args.exp_name = f'fold_{args.fold}'
 
     # Set seed
     set_seed(args.seed)

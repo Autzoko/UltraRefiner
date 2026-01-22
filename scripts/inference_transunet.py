@@ -229,10 +229,11 @@ def main():
         print(f'Processing Fold {fold + 1}/{args.n_splits}')
         print(f'{"="*60}')
 
-        # Load checkpoint
+        # Load checkpoint (structure: checkpoints/transunet/{dataset}/fold_{i}/)
         checkpoint_path = os.path.join(
             args.checkpoint_root,
-            f'{args.dataset}_fold{fold}',
+            args.dataset.lower(),
+            f'fold_{fold}',
             'best.pth'
         )
 
@@ -276,8 +277,8 @@ def main():
         print(f'  Precision: {fold_metrics["precision"]:.4f}')
         print(f'  Recall:    {fold_metrics["recall"]:.4f}')
 
-        # Save predictions
-        fold_output_dir = os.path.join(output_dir, f'fold{fold}')
+        # Save predictions (structure: predictions/transunet/{dataset}/fold_{i}/)
+        fold_output_dir = os.path.join(output_dir, f'fold_{fold}')
         os.makedirs(fold_output_dir, exist_ok=True)
 
         # Save as numpy arrays

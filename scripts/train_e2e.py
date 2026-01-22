@@ -296,7 +296,8 @@ def main():
 
     # Auto-generate experiment name
     if args.exp_name is None:
-        args.exp_name = f'ultra_refiner_e2e_fold{args.fold}'
+        # Structure: checkpoints/ultra_refiner/fold_{i}/
+        args.exp_name = f'fold_{args.fold}'
 
     # Set seed
     set_seed(args.seed)

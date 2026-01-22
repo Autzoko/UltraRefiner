@@ -270,7 +270,8 @@ def main():
 
     # Auto-generate experiment name
     if args.exp_name is None:
-        args.exp_name = f'sam_finetune_fold{args.fold}'
+        # Structure: checkpoints/sam_finetuned/fold_{i}/
+        args.exp_name = f'fold_{args.fold}'
 
     # Set seed
     set_seed(args.seed)

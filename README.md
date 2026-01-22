@@ -41,7 +41,7 @@ UltraRefiner implements a three-phase training pipeline:
 ║         │                                                                     ║
 ║         ▼                                                                     ║
 ║  ┌─────────────────┐                                                         ║
-║  │   Checkpoints   │   ./checkpoints/transunet/{dataset}_fold{i}/best.pth   ║
+║  │   Checkpoints   │   ./checkpoints/transunet/{dataset}/fold_{i}/best.pth  ║
 ║  └─────────────────┘                                                         ║
 ║                                                                               ║
 ║                              │                                                ║
@@ -60,8 +60,8 @@ UltraRefiner implements a three-phase training pipeline:
 ║                                                        ▼                     ║
 ║                              ┌──────────────────────────────────────┐        ║
 ║                              │  ./predictions/transunet/{dataset}/  │        ║
-║                              │    fold{i}/predictions/*.npy         │        ║
-║                              │    fold{i}/visualizations/*.png      │        ║
+║                              │    fold_{i}/predictions/*.npy        │        ║
+║                              │    fold_{i}/visualizations/*.png     │        ║
 ║                              └──────────────────────────────────────┘        ║
 ║                                                                               ║
 ║                              │                                                ║
@@ -102,7 +102,7 @@ UltraRefiner implements a three-phase training pipeline:
 ║         │                                                                    ║
 ║         ▼                                                                    ║
 ║  ┌─────────────────┐                                                        ║
-║  │   Checkpoints   │   ./checkpoints/sam_finetuned/best.pth                 ║
+║  │   Checkpoints   │   ./checkpoints/sam_finetuned/fold_{i}/best.pth        ║
 ║  └─────────────────┘                                                        ║
 ║                                                                               ║
 ║                              │                                                ║
@@ -154,7 +154,7 @@ UltraRefiner implements a three-phase training pipeline:
 ║                    ┌─────────────────┐                                      ║
 ║                    │   Final Model   │                                      ║
 ║                    │  ./checkpoints/ │                                      ║
-║                    │  ultra_refiner/ │                                      ║
+║                    │  ultra_refiner/fold_{i}/                               ║
 ║                    └─────────────────┘                                      ║
 ║                                                                               ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
@@ -225,8 +225,8 @@ python scripts/finetune_sam.py \
 ```bash
 python scripts/train_e2e.py \
     --data_root ./dataset/processed \
-    --transunet_checkpoint ./checkpoints/transunet/BUSI_fold0/best.pth \
-    --sam_checkpoint ./checkpoints/sam_finetuned/best.pth \
+    --transunet_checkpoint ./checkpoints/transunet/busi/fold_0/best.pth \
+    --sam_checkpoint ./checkpoints/sam_finetuned/fold_0/best.pth \
     --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
     --fold 0 \
     --max_epochs 100
@@ -260,10 +260,14 @@ UltraRefiner/
 │   └── processed/                   # Preprocessed with splits
 ├── predictions/
 │   └── transunet/                   # TransUNet predictions for SAM
+│       └── {dataset}/fold_{i}/      # Per-dataset, per-fold predictions
 ├── checkpoints/
 │   ├── transunet/                   # Phase 1 checkpoints
+│   │   └── {dataset}/fold_{i}/      # Per-dataset, per-fold models
 │   ├── sam_finetuned/               # Phase 2 checkpoints
+│   │   └── fold_{i}/                # Per-fold models
 │   └── ultra_refiner/               # Phase 3 checkpoints
+│       └── fold_{i}/                # Per-fold models
 └── pretrained/
     ├── R50+ViT-B_16.npz             # TransUNet pretrained weights
     └── medsam_vit_b.pth             # MedSAM checkpoint

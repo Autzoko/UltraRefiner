@@ -201,12 +201,14 @@ def main():
         print("Warning: Both --dataset and --datasets provided, using --dataset (single dataset mode)")
         args.datasets = None
 
-    # Auto-generate experiment name
+    # Auto-generate experiment name and path
     if args.exp_name is None:
         if args.dataset:
-            args.exp_name = f'{args.dataset}_fold{args.fold}'
+            # Structure: checkpoints/transunet/{dataset}/fold_{i}/
+            args.exp_name = os.path.join(args.dataset.lower(), f'fold_{args.fold}')
         else:
-            args.exp_name = f'combined_fold{args.fold}'
+            # Structure: checkpoints/transunet/combined/fold_{i}/
+            args.exp_name = os.path.join('combined', f'fold_{args.fold}')
 
     # Set seed
     set_seed(args.seed)
