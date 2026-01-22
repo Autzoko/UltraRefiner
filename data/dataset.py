@@ -45,11 +45,16 @@ class RandomGenerator:
             image = np.flip(image, axis=1).copy()
             label = np.flip(label, axis=1).copy()
 
-        # Resize to output size
-        x, y = image.shape
-        if x != self.output_size[0] or y != self.output_size[1]:
-            image = zoom(image, (self.output_size[0] / x, self.output_size[1] / y), order=3)
-            label = zoom(label, (self.output_size[0] / x, self.output_size[1] / y), order=0)
+        # Resize to exact output size using cv2 (more reliable than scipy.zoom)
+        h, w = image.shape[:2]
+        target_h, target_w = self.output_size[0], self.output_size[1]
+        if h != target_h or w != target_w:
+            image = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            label = cv2.resize(label.astype(np.float32), (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+
+        # Ensure exact output size (safeguard against any floating point issues)
+        image = image[:target_h, :target_w]
+        label = label[:target_h, :target_w]
 
         # Convert to tensor
         image = torch.from_numpy(image.astype(np.float32)).unsqueeze(0)
