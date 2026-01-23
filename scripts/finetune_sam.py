@@ -349,8 +349,22 @@ def main():
     criterion = SAMLoss(mask_weight=1.0, iou_weight=1.0)
 
     # Optimizer - only for trainable parameters
-    trainable_params = [p for p in sam.parameters() if p.requires_grad]
-    trainable_params += [p for p in sam_refiner.parameters() if p.requires_grad and p not in trainable_params]
+    # Collect trainable parameters (avoid duplicates using id())
+    trainable_params = []
+    seen_params = set()
+
+    for p in sam.parameters():
+        if p.requires_grad and id(p) not in seen_params:
+            trainable_params.append(p)
+            seen_params.add(id(p))
+
+    for p in sam_refiner.parameters():
+        if p.requires_grad and id(p) not in seen_params:
+            trainable_params.append(p)
+            seen_params.add(id(p))
+
+    logging.info(f'Trainable parameters: {len(trainable_params)}')
+    logging.info(f'Total trainable params: {sum(p.numel() for p in trainable_params):,}')
 
     optimizer = optim.AdamW(
         trainable_params,
