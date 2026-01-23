@@ -19,7 +19,8 @@ echo ""
 # Activate conda environment
 echo "Activating conda environment..."
 source $(conda info --base)/etc/profile.d/conda.sh
-conda activate /scratch/ll5582/3DSAM/envs/segmamba  # Update this path to your environment
+conda activate /scratch/ll5582/3DSAM/envs/ultrarefiner  # Update this path to your environment
+module load cuda/12.2.0
 
 # Check if activation was successful
 if [ $? -ne 0 ]; then
