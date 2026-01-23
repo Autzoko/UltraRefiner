@@ -100,7 +100,8 @@ def _build_sam(
 
     if checkpoint is not None:
         with open(checkpoint, "rb") as f:
-            state_dict = torch.load(f, map_location="cpu")
+            # weights_only=False for PyTorch 2.6+ compatibility
+            state_dict = torch.load(f, map_location="cpu", weights_only=False)
         # Handle MedSAM checkpoint format
         if 'model' in state_dict:
             state_dict = state_dict['model']

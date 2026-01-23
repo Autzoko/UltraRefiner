@@ -120,7 +120,8 @@ class UltraRefiner(nn.Module):
             print(f"Loaded TransUNet ViT weights from {checkpoint_path}")
         else:
             # Load full model checkpoint
-            state_dict = torch.load(checkpoint_path, map_location='cpu')
+            # weights_only=False for PyTorch 2.6+ compatibility
+            state_dict = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
             if 'model' in state_dict:
                 state_dict = state_dict['model']
             self.transunet.load_state_dict(state_dict, strict=False)
