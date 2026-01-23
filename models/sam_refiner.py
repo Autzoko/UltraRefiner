@@ -87,11 +87,11 @@ class DifferentiableSAMRefiner(nn.Module):
 
         # Soft-argmax: use probability-weighted average
         # Add small epsilon to avoid division by zero
-        mask_sum = soft_mask.sum(dim=(-2, -1), keepdim=True) + 1e-6
+        mask_sum = soft_mask.sum(dim=(-2, -1)) + 1e-6  # (B,)
 
         # Weighted centroid (positive point)
-        y_center = (soft_mask * y_grid.unsqueeze(0)).sum(dim=(-2, -1)) / mask_sum.squeeze(-1)
-        x_center = (soft_mask * x_grid.unsqueeze(0)).sum(dim=(-2, -1)) / mask_sum.squeeze(-1)
+        y_center = (soft_mask * y_grid.unsqueeze(0)).sum(dim=(-2, -1)) / mask_sum  # (B,)
+        x_center = (soft_mask * x_grid.unsqueeze(0)).sum(dim=(-2, -1)) / mask_sum  # (B,)
 
         point_coords = torch.stack([x_center, y_center], dim=-1).unsqueeze(1)  # (B, 1, 2)
         point_labels = torch.ones(B, 1, device=device)
@@ -133,9 +133,9 @@ class DifferentiableSAMRefiner(nn.Module):
         inv_mask_boxed = inv_mask * box_mask
 
         # Soft-argmax on inverse mask
-        mask_sum = inv_mask_boxed.sum(dim=(-2, -1), keepdim=True) + 1e-6
-        y_center = (inv_mask_boxed * y_grid.unsqueeze(0)).sum(dim=(-2, -1)) / mask_sum.squeeze(-1)
-        x_center = (inv_mask_boxed * x_grid.unsqueeze(0)).sum(dim=(-2, -1)) / mask_sum.squeeze(-1)
+        mask_sum = inv_mask_boxed.sum(dim=(-2, -1)) + 1e-6  # (B,)
+        y_center = (inv_mask_boxed * y_grid.unsqueeze(0)).sum(dim=(-2, -1)) / mask_sum  # (B,)
+        x_center = (inv_mask_boxed * x_grid.unsqueeze(0)).sum(dim=(-2, -1)) / mask_sum  # (B,)
 
         point_coords = torch.stack([x_center, y_center], dim=-1).unsqueeze(1)  # (B, 1, 2)
         point_labels = torch.zeros(B, 1, device=device)
