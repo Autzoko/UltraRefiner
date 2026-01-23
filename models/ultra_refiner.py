@@ -124,6 +124,26 @@ class UltraRefiner(nn.Module):
             state_dict = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
             if 'model' in state_dict:
                 state_dict = state_dict['model']
+
+            # Debug: Check key matching
+            model_keys = set(self.transunet.state_dict().keys())
+            ckpt_keys = set(state_dict.keys())
+            matched = model_keys & ckpt_keys
+            missing_in_ckpt = model_keys - ckpt_keys
+            unexpected = ckpt_keys - model_keys
+
+            print(f"TransUNet checkpoint loading:")
+            print(f"  - Model keys: {len(model_keys)}")
+            print(f"  - Checkpoint keys: {len(ckpt_keys)}")
+            print(f"  - Matched keys: {len(matched)}")
+            print(f"  - Missing in checkpoint: {len(missing_in_ckpt)}")
+            print(f"  - Unexpected in checkpoint: {len(unexpected)}")
+
+            if len(matched) == 0:
+                print("  WARNING: No keys matched! Checkpoint may be incompatible.")
+                print(f"  Sample model keys: {list(model_keys)[:3]}")
+                print(f"  Sample ckpt keys: {list(ckpt_keys)[:3]}")
+
             self.transunet.load_state_dict(state_dict, strict=False)
             print(f"Loaded TransUNet checkpoint from {checkpoint_path}")
 
