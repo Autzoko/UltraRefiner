@@ -208,19 +208,38 @@ Mask perturbations are modeled in the continuous signed distance function (SDF) 
 Training mixes perfect masks (10%), mildly corrupted masks (55%), and heavily corrupted masks (35%). A change-penalty term weighted by input mask quality encourages the Refiner to preserve already-good predictions while strongly correcting poor ones.
 
 ```bash
-# Generate augmented training data from all datasets combined
+# Step 1: Generate augmented training data from all datasets combined
 python scripts/generate_augmented_data.py \
     --data_root ./dataset/processed \
     --output_dir ./dataset/augmented \
     --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
     --target_samples 100000 \
-    --use_sdf
+    --use_sdf \
+    --num_workers 8
 
-# Finetune SAM with augmented data
+# Step 2: Finetune SAM with augmented data
+# Note: --dataset should match the combined folder name (sorted alphabetically, joined by _)
 python scripts/finetune_sam_augmented.py \
-    --augmented_data ./dataset/augmented \
-    --medsam_checkpoint ./pretrained/medsam_vit_b.pth \
-    --change_penalty_weight 0.1
+    --data_root ./dataset/augmented \
+    --dataset BUS_BUSBRA_BUSI_BUS_UC_BUS_UCLM \
+    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
+    --sam_model_type vit_b \
+    --epochs 50 \
+    --batch_size 4 \
+    --lr 1e-4 \
+    --change_penalty_weight 0.1 \
+    --output_dir ./checkpoints/sam_finetuned
+
+# Optional: Use curriculum learning (easy to hard)
+python scripts/finetune_sam_augmented.py \
+    --data_root ./dataset/augmented \
+    --dataset BUS_BUSBRA_BUSI_BUS_UC_BUS_UCLM \
+    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
+    --epochs 50 \
+    --batch_size 4 \
+    --change_penalty_weight 0.1 \
+    --curriculum \
+    --output_dir ./checkpoints/sam_finetuned
 ```
 
 **Option B: Use Actual TransUNet Predictions (Alternative)**
@@ -250,11 +269,14 @@ python scripts/finetune_sam_with_preds.py \
 ```bash
 python scripts/train_e2e.py \
     --data_root ./dataset/processed \
-    --transunet_checkpoint ./checkpoints/transunet/busi/fold_0/best.pth \
-    --sam_checkpoint ./checkpoints/sam_finetuned/fold_0/best.pth \
+    --transunet_checkpoint ./checkpoints/transunet/combined/fold_0/best.pth \
+    --sam_checkpoint ./checkpoints/sam_finetuned/best.pth \
     --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
     --fold 0 \
-    --max_epochs 100
+    --max_epochs 100 \
+    --batch_size 8 \
+    --transunet_lr 1e-4 \
+    --sam_lr 1e-5
 ```
 
 ## Project Structure
