@@ -1,13 +1,18 @@
 """
-Phase 2 (Alternative): Finetune SAM using actual TransUNet predictions.
+Phase 2: Finetune SAM using actual TransUNet predictions.
 
 This script finetunes SAM using pre-computed TransUNet predictions as coarse masks,
 instead of simulating coarse masks from ground truth. This provides more realistic
 training conditions for SAM.
 
+The pairing between images and predictions is done by filename matching:
+- Image: dataset/processed/{dataset}/train/images/{name}.png
+- Prediction: predictions/transunet/{dataset}/predictions/{name}.npy
+
 Workflow:
-1. First run: python scripts/inference_transunet.py --dataset BUSI --visualize
-2. Then run this script with the predictions
+1. Train TransUNet with 5-fold CV: python scripts/train_transunet.py
+2. Generate predictions for all folds: python scripts/inference_transunet.py
+3. Run this script to finetune SAM with predictions
 
 Usage:
     python scripts/finetune_sam_with_preds.py \
@@ -31,6 +36,7 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from PIL import Image
+import cv2
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -38,7 +44,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.sam import sam_model_registry, build_sam_for_training
 from models.sam_refiner import DifferentiableSAMRefiner
 from utils import BCEDiceLoss, SAMLoss, MetricTracker, TrainingLogger
-from data import SUPPORTED_DATASETS
+from data import SUPPORTED_DATASETS, KFoldCrossValidator
 
 
 def get_args():
@@ -90,7 +96,7 @@ def get_args():
                         help='Use mask prompts')
 
     # Output arguments
-    parser.add_argument('--output_dir', type=str, default='./checkpoints/sam_finetuned_with_preds',
+    parser.add_argument('--output_dir', type=str, default='./checkpoints/sam_finetuned',
                         help='Output directory for checkpoints')
     parser.add_argument('--exp_name', type=str, default=None,
                         help='Experiment name')
@@ -116,15 +122,15 @@ def set_seed(seed):
 
 class SAMDatasetWithPredictions(Dataset):
     """
-    Dataset that loads images, ground truth, and TransUNet predictions.
+    Dataset that loads images, ground truth masks, and TransUNet predictions.
+    Pairing is done by filename matching.
     """
     def __init__(
         self,
         data_root: str,
         pred_root: str,
         dataset_name: str,
-        fold: int,
-        split: str = 'train',
+        sample_names: list,
         img_size: int = 1024,
     ):
         """
@@ -132,133 +138,135 @@ class SAMDatasetWithPredictions(Dataset):
             data_root: Root directory of processed data
             pred_root: Root directory of TransUNet predictions
             dataset_name: Name of the dataset
-            fold: Fold index
-            split: 'train' or 'val' (uses val predictions for training SAM)
+            sample_names: List of sample names to load
             img_size: Target image size for SAM (1024)
         """
         self.data_root = data_root
         self.pred_root = pred_root
         self.dataset_name = dataset_name
-        self.fold = fold
         self.img_size = img_size
 
-        # Load split file
-        split_file = os.path.join(data_root, dataset_name, f'{split}_fold{fold}.txt')
-        if not os.path.exists(split_file):
-            raise FileNotFoundError(f"Split file not found: {split_file}")
+        # Image and mask directories
+        self.img_dir = os.path.join(data_root, dataset_name, 'train', 'images')
+        self.mask_dir = os.path.join(data_root, dataset_name, 'train', 'masks')
 
-        with open(split_file, 'r') as f:
-            self.samples = [line.strip() for line in f.readlines()]
+        # Predictions directory (unified across all folds)
+        # Structure: predictions/transunet/{dataset}/predictions/{name}.npy
+        self.pred_dir = os.path.join(pred_root, dataset_name, 'predictions')
 
-        # Predictions directory
-        # Structure: predictions/transunet/{dataset}/fold_{i}/predictions/
-        self.pred_dir = os.path.join(pred_root, dataset_name.lower(), f'fold_{fold}', 'predictions')
-        if not os.path.exists(self.pred_dir):
-            raise FileNotFoundError(f"Predictions not found: {self.pred_dir}")
+        # Filter samples that have predictions
+        self.samples = []
+        missing_preds = []
+        for name in sample_names:
+            pred_path = os.path.join(self.pred_dir, f'{name}.npy')
+            img_path = os.path.join(self.img_dir, f'{name}.png')
+            mask_path = os.path.join(self.mask_dir, f'{name}.png')
 
-        # Verify predictions exist
-        self._verify_predictions()
+            if os.path.exists(pred_path) and os.path.exists(img_path) and os.path.exists(mask_path):
+                self.samples.append(name)
+            else:
+                missing_preds.append(name)
 
-        print(f"Loaded {len(self.samples)} samples for {dataset_name} fold {fold} ({split})")
+        if missing_preds:
+            print(f"Warning: {len(missing_preds)} samples missing predictions or images")
+            if len(missing_preds) <= 5:
+                print(f"  Missing: {missing_preds}")
 
-    def _verify_predictions(self):
-        """Verify that predictions exist for all samples."""
-        num_preds = len([f for f in os.listdir(self.pred_dir) if f.endswith('_pred.npy')])
-        if num_preds < len(self.samples):
-            print(f"Warning: Found {num_preds} predictions but {len(self.samples)} samples")
+        print(f"Loaded {len(self.samples)} samples for {dataset_name}")
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        sample_name = self.samples[idx]
+        name = self.samples[idx]
 
         # Load image
-        img_path = os.path.join(self.data_root, self.dataset_name, 'images', f'{sample_name}.png')
-        image = Image.open(img_path).convert('RGB')
+        img_path = os.path.join(self.img_dir, f'{name}.png')
+        image = Image.open(img_path).convert('L')  # Grayscale
         image = image.resize((self.img_size, self.img_size), Image.BILINEAR)
-        image = np.array(image).astype(np.float32)
+        image = np.array(image).astype(np.float32) / 255.0
+        # Convert grayscale to RGB for SAM
+        image = np.stack([image, image, image], axis=-1)
         image = torch.from_numpy(image).permute(2, 0, 1)  # (3, H, W)
 
-        # Load ground truth
-        mask_path = os.path.join(self.data_root, self.dataset_name, 'masks', f'{sample_name}.png')
+        # Load ground truth mask
+        mask_path = os.path.join(self.mask_dir, f'{name}.png')
         mask = Image.open(mask_path).convert('L')
         mask = mask.resize((self.img_size, self.img_size), Image.NEAREST)
-        mask = np.array(mask).astype(np.float32) / 255.0
+        mask = np.array(mask).astype(np.float32)
+        mask = (mask > 127).astype(np.float32)
         mask = torch.from_numpy(mask)  # (H, W)
 
         # Load TransUNet prediction (coarse mask)
-        pred_path = os.path.join(self.pred_dir, f'{idx:04d}_pred.npy')
-        if os.path.exists(pred_path):
-            coarse_mask = np.load(pred_path)
-            # Resize to SAM input size
-            coarse_mask = torch.from_numpy(coarse_mask).unsqueeze(0).unsqueeze(0)
-            coarse_mask = F.interpolate(coarse_mask, size=(self.img_size, self.img_size),
-                                        mode='bilinear', align_corners=False)
-            coarse_mask = coarse_mask.squeeze()
-        else:
-            # Fallback: use ground truth with noise if prediction not found
-            print(f"Warning: Prediction not found for {idx}, using noisy GT")
-            coarse_mask = mask + torch.randn_like(mask) * 0.1
-            coarse_mask = torch.clamp(coarse_mask, 0, 1)
+        pred_path = os.path.join(self.pred_dir, f'{name}.npy')
+        coarse_mask = np.load(pred_path)
+        # Resize to SAM input size
+        coarse_mask = cv2.resize(coarse_mask, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
+        coarse_mask = torch.from_numpy(coarse_mask).float()  # (H, W)
 
         return {
             'image': image,
             'label': mask,
             'coarse_mask': coarse_mask,
-            'case_name': sample_name
+            'name': name
         }
 
 
 def create_dataloaders(args):
-    """Create training and validation dataloaders."""
+    """
+    Create training and validation dataloaders.
+
+    For SAM finetuning, we use all training samples that have predictions.
+    Since predictions are generated by inferencing each fold's validation set,
+    all training samples should have predictions after running inference on all 5 folds.
+    """
     datasets = args.datasets if args.datasets else SUPPORTED_DATASETS
 
-    train_datasets = []
-    val_datasets = []
+    all_datasets = []
 
     for dataset_name in datasets:
         try:
-            # For SAM training, we use TransUNet's validation predictions
-            # because TransUNet was trained on the training set
-            train_ds = SAMDatasetWithPredictions(
+            # Get all training sample names from the dataset
+            img_dir = os.path.join(args.data_root, dataset_name, 'train', 'images')
+            if not os.path.exists(img_dir):
+                print(f"Skipping {dataset_name}: image directory not found")
+                continue
+
+            # Get all sample names
+            all_names = [f.rsplit('.', 1)[0] for f in sorted(os.listdir(img_dir)) if f.endswith('.png')]
+
+            # Create dataset with predictions
+            ds = SAMDatasetWithPredictions(
                 data_root=args.data_root,
                 pred_root=args.pred_root,
                 dataset_name=dataset_name,
-                fold=args.fold,
-                split='val',  # Use validation set predictions
+                sample_names=all_names,
                 img_size=1024
             )
-            train_datasets.append(train_ds)
 
-            # For SAM validation, we can use a subset or different fold
-            # Here we just use a portion of the training data
-            val_ds = SAMDatasetWithPredictions(
-                data_root=args.data_root,
-                pred_root=args.pred_root,
-                dataset_name=dataset_name,
-                fold=args.fold,
-                split='val',
-                img_size=1024
-            )
-            val_datasets.append(val_ds)
+            if len(ds) > 0:
+                all_datasets.append(ds)
+            else:
+                print(f"Skipping {dataset_name}: no valid samples with predictions")
 
-        except FileNotFoundError as e:
+        except Exception as e:
             print(f"Skipping {dataset_name}: {e}")
             continue
 
-    if not train_datasets:
+    if not all_datasets:
         raise RuntimeError("No valid datasets found!")
 
-    train_dataset = ConcatDataset(train_datasets)
-    val_dataset = ConcatDataset(val_datasets)
+    # Combine all datasets
+    combined_dataset = ConcatDataset(all_datasets)
+    total_samples = len(combined_dataset)
+    print(f"\nTotal samples with predictions: {total_samples}")
 
-    # Split val_dataset for actual validation (use 20%)
-    val_size = len(val_dataset) // 5
-    train_size = len(val_dataset) - val_size
+    # Split into train/val (80/20)
+    val_size = total_samples // 5
+    train_size = total_samples - val_size
 
     train_dataset, val_dataset = torch.utils.data.random_split(
-        val_dataset, [train_size, val_size],
+        combined_dataset, [train_size, val_size],
         generator=torch.Generator().manual_seed(args.seed)
     )
 
@@ -297,10 +305,11 @@ def train_one_epoch(model, sam_refiner, dataloader, optimizer, criterion, device
     for batch_idx, batch in enumerate(pbar):
         image = batch['image'].to(device)
         label = batch['label'].to(device)
-        coarse_mask = batch['coarse_mask'].to(device)  # Actual TransUNet prediction
+        coarse_mask = batch['coarse_mask'].to(device)
 
-        # Normalize image for SAM
-        image_normalized = (image - pixel_mean) / pixel_std
+        # Normalize image for SAM (SAM expects values in [0, 255] range before normalization)
+        image_scaled = image * 255.0
+        image_normalized = (image_scaled - pixel_mean) / pixel_std
 
         # Forward through SAM refiner with actual coarse mask
         output = sam_refiner(image_normalized, coarse_mask)
@@ -361,7 +370,8 @@ def validate(model, sam_refiner, dataloader, criterion, device):
             coarse_mask = batch['coarse_mask'].to(device)
 
             # Normalize image for SAM
-            image_normalized = (image - pixel_mean) / pixel_std
+            image_scaled = image * 255.0
+            image_normalized = (image_scaled - pixel_mean) / pixel_std
 
             # Forward
             output = sam_refiner(image_normalized, coarse_mask)
@@ -392,7 +402,6 @@ def main():
 
     # Auto-generate experiment name
     if args.exp_name is None:
-        # Structure: checkpoints/sam_finetuned_with_preds/fold_{i}/
         args.exp_name = f'fold_{args.fold}'
 
     # Set seed
@@ -420,7 +429,6 @@ def main():
     train_loader, val_loader = create_dataloaders(args)
 
     logging.info(f'Training on datasets: {args.datasets}')
-    logging.info(f'Fold {args.fold}/{args.n_splits}')
     logging.info(f'Train samples: {len(train_loader.dataset)}')
     logging.info(f'Val samples: {len(val_loader.dataset)}')
 
