@@ -38,6 +38,7 @@ class UltraRefiner(nn.Module):
         use_point_prompt: bool = True,
         use_box_prompt: bool = True,
         use_mask_prompt: bool = True,
+        mask_prompt_style: str = 'direct',  # 'direct' for E2E (TransUNet outputs are smooth)
     ):
         """
         Args:
@@ -53,6 +54,7 @@ class UltraRefiner(nn.Module):
             use_point_prompt: Whether to use point prompts in refinement
             use_box_prompt: Whether to use box prompts in refinement
             use_mask_prompt: Whether to use mask prompts in refinement
+            mask_prompt_style: Style for mask prompt ('direct' for E2E, 'gaussian' for SAM finetuning)
         """
         super().__init__()
 
@@ -86,6 +88,8 @@ class UltraRefiner(nn.Module):
                 param.requires_grad = False
 
         # Build SAMRefiner
+        # For E2E training, use 'direct' style since TransUNet outputs are already smooth
+        # For SAM-only finetuning with augmented data, use 'gaussian' to smooth artificial edges
         self.sam_refiner = DifferentiableSAMRefiner(
             sam_model=self.sam,
             use_point_prompt=use_point_prompt,
@@ -93,6 +97,7 @@ class UltraRefiner(nn.Module):
             use_mask_prompt=use_mask_prompt,
             freeze_image_encoder=freeze_sam_image_encoder,
             freeze_prompt_encoder=freeze_sam_prompt_encoder,
+            mask_prompt_style=mask_prompt_style,
         )
 
         # SAM normalization parameters
