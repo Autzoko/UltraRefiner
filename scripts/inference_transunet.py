@@ -99,22 +99,40 @@ def visualize_prediction(image, label, pred, save_path, metrics=None):
     Visualize image, ground truth, and prediction side by side.
 
     Args:
-        image: Input image (H, W, 3) or (3, H, W)
+        image: Input image (H, W), (1, H, W), (H, W, 3), or (3, H, W)
         label: Ground truth mask (H, W)
         pred: Predicted mask (H, W)
         save_path: Path to save the visualization
         metrics: Optional dict of metrics to display
     """
-    if image.shape[0] == 3:
-        image = image.transpose(1, 2, 0)
+    # Handle different image formats
+    if image.ndim == 3:
+        if image.shape[0] == 1:
+            # (1, H, W) -> (H, W)
+            image = image.squeeze(0)
+        elif image.shape[0] == 3:
+            # (3, H, W) -> (H, W, 3)
+            image = image.transpose(1, 2, 0)
+        elif image.shape[2] == 1:
+            # (H, W, 1) -> (H, W)
+            image = image.squeeze(2)
 
     # Normalize image for display
     image = (image - image.min()) / (image.max() - image.min() + 1e-8)
 
+    # Convert grayscale to RGB for overlay
+    if image.ndim == 2:
+        image_rgb = np.stack([image, image, image], axis=-1)
+    else:
+        image_rgb = image
+
     fig, axes = plt.subplots(1, 4, figsize=(16, 4))
 
     # Original image
-    axes[0].imshow(image)
+    if image.ndim == 2:
+        axes[0].imshow(image, cmap='gray')
+    else:
+        axes[0].imshow(image)
     axes[0].set_title('Input Image')
     axes[0].axis('off')
 
@@ -129,7 +147,7 @@ def visualize_prediction(image, label, pred, save_path, metrics=None):
     axes[2].axis('off')
 
     # Overlay
-    overlay = image.copy()
+    overlay = image_rgb.copy()
     # Green for true positive, Red for false positive, Blue for false negative
     pred_binary = pred > 0.5
     label_binary = label > 0.5
