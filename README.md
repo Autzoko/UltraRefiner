@@ -201,20 +201,55 @@ python scripts/inference_transunet.py \
     --visualize
 ```
 
-### 4. Phase 2: Finetune SAM with Predictions
+### 4. Phase 2: Finetune SAM
+
+**Option A: GT with Synthetic Failure Simulation (Recommended)**
+
+This approach generates large-scale training data by simulating realistic segmentation failures on ground-truth masks, enabling the Refiner to learn both when to correct and when to preserve.
+
+### Data Augmentation for SAM Finetuning
+
+To train a robust SAM Refiner, we employ a systematic data augmentation strategy that simulates realistic segmentation failures. This approach expands the limited training data (~3K samples) to a large-scale dataset (~100K samples) with controlled quality distribution.
+
+**Simulated Failure Modes:**
+- **Under-segmentation**: Boundary erosion, missing parts, partial breakage
+- **Over-segmentation**: Boundary dilation, attachment to nearby structures
+- **Boundary roughness**: Pixel-level noise, contour jitter along edges
+- **Topological errors**: Internal holes, false-positive islands, artificial bridges
+- **Small-lesion failure**: Extreme shrinkage or complete disappearance (critical failure case)
+
+**Size and Shape Conditioning:**
+Augmentation intensity and failure type selection are conditioned on lesion characteristics (area, circularity, boundary complexity). Tiny or irregularly-shaped lesions receive more aggressive corruption to reflect realistic model behavior.
+
+**SDF-Based Augmentation:**
+Mask perturbations are modeled in the continuous signed distance function (SDF) domain, where the zero level-set defines the contour. Boundary shifts are expressed as additive fields (global offsets for uniform erosion/dilation, low-frequency Gaussian random fields for spatially varying deformation), ensuring smooth, anatomically plausible results. This formulation provides explicit control over boundary displacement magnitude, smoothness, and topological constraints.
+
+**Quality-Aware Training:**
+Training mixes perfect masks (10%), mildly corrupted masks (55%), and heavily corrupted masks (35%). A change-penalty term weighted by input mask quality encourages the Refiner to preserve already-good predictions while strongly correcting poor ones.
 
 ```bash
-# Option A: Use actual TransUNet predictions (recommended)
+# Generate augmented training data
+python scripts/generate_augmented_data.py \
+    --data_root ./dataset/processed \
+    --output_dir ./dataset/augmented \
+    --num_samples 100000 \
+    --use_sdf
+
+# Finetune SAM with augmented data
+python scripts/finetune_sam_augmented.py \
+    --augmented_data ./dataset/augmented \
+    --medsam_checkpoint ./pretrained/medsam_vit_b.pth \
+    --change_penalty_weight 0.1
+```
+
+**Option B: Use Actual TransUNet Predictions (Alternative)**
+
+Alternatively, finetune SAM using actual TransUNet predictions from Phase 1.
+
+```bash
 python scripts/finetune_sam_with_preds.py \
     --data_root ./dataset/processed \
     --pred_root ./predictions/transunet \
-    --medsam_checkpoint ./pretrained/medsam_vit_b.pth \
-    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
-    --fold 0
-
-# Option B: Use simulated coarse masks from GT
-python scripts/finetune_sam.py \
-    --data_root ./dataset/processed \
     --medsam_checkpoint ./pretrained/medsam_vit_b.pth \
     --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
     --fold 0
@@ -244,7 +279,8 @@ UltraRefiner/
 │   ├── sam_refiner.py               # Differentiable SAM Refiner
 │   └── ultra_refiner.py             # End-to-end model
 ├── data/
-│   └── dataset.py                   # Dataset loaders with K-fold CV
+│   ├── dataset.py                   # Dataset loaders with K-fold CV
+│   └── augmented_dataset.py         # Augmented data loaders
 ├── utils/
 │   ├── losses.py                    # Loss functions (Dice, BCE, SAM Loss)
 │   └── metrics.py                   # Metrics & TrainingLogger
@@ -254,10 +290,14 @@ UltraRefiner/
 │   ├── inference_transunet.py       # Generate predictions & visualizations
 │   ├── finetune_sam.py              # Phase 2 (simulated masks)
 │   ├── finetune_sam_with_preds.py   # Phase 2 (actual predictions)
+│   ├── generate_augmented_data.py   # Data augmentation generation
+│   ├── sdf_augmentation.py          # SDF-based augmentation
+│   ├── finetune_sam_augmented.py    # Phase 2 with augmented data
 │   └── train_e2e.py                 # Phase 3 training
 ├── dataset/
 │   ├── raw/                         # Original datasets
-│   └── processed/                   # Preprocessed with splits
+│   ├── processed/                   # Preprocessed with splits
+│   └── augmented/                   # Generated augmented training data
 ├── predictions/
 │   └── transunet/                   # TransUNet predictions for SAM
 │       └── {dataset}/fold_{i}/      # Per-dataset, per-fold predictions

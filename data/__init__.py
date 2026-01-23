@@ -21,11 +21,19 @@ from .dataset import (
     load_split_info,
 )
 
+from .augmented_dataset import (
+    AugmentedSAMDataset,
+    CurriculumAugmentedDataset,
+    get_augmented_dataloaders,
+)
+
 __all__ = [
     # Constants
     'SUPPORTED_DATASETS',
     # Dataset classes
     'BreastUltrasoundDataset',
+    'AugmentedSAMDataset',
+    'CurriculumAugmentedDataset',
     # Transform classes
     'RandomGenerator',
     'SAMRandomGenerator',
@@ -40,6 +48,8 @@ __all__ = [
     'get_combined_dataloader',
     'get_combined_test_dataloader',
     'get_combined_kfold_dataloaders',
+    # Augmented data loaders
+    'get_augmented_dataloaders',
     # Utilities
     'load_split_info',
 ]

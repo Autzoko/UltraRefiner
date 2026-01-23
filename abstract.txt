@@ -128,129 +128,105 @@ Phase 2: SAM Fine-tuning
 We provide TWO approaches for Phase 2, each with different trade-offs:
 
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  OPTION A: Using Actual TransUNet Predictions (RECOMMENDED)                 │
+│  OPTION A: Using GT with Synthetic Failure Simulation (RECOMMENDED)         │
+│  Script: finetune_sam_augmented.py                                          │
+│  Pros: Large-scale training data (~100K), diverse failure modes,            │
+│        teaches "when to modify" and "when to preserve"                      │
+│  Cons: Simulated errors may differ from actual model failures               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  OPTION B: Using Actual TransUNet Predictions                               │
 │  Script: finetune_sam_with_preds.py                                         │
 │  Pros: Realistic coarse masks, matches E2E training distribution            │
-│  Cons: Requires Phase 1 completion + inference                              │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  OPTION B: Using GT with Simulated Noise                                    │
-│  Script: finetune_sam.py                                                    │
-│  Pros: No dependency on Phase 1, can train immediately                      │
-│  Cons: Simulated errors may not match real segmentation failures            │
+│  Cons: Limited training data (~3K), requires Phase 1 completion + inference │
 └─────────────────────────────────────────────────────────────────────────────┘
 
 ================================================================================
-Phase 2 Option B: SAM Fine-tuning with Simulated Coarse Masks
+Phase 2 Option A: SAM Fine-tuning with Synthetic Failure Simulation [RECOMMENDED]
 ================================================================================
-Objective: Train SAM using GT masks with augmentations that simulate segmentation errors.
+Objective: Train SAM to refine imperfect masks by simulating realistic segmentation
+failures directly on ground-truth masks.
 
-This approach uses ground truth masks and applies various corruptions to simulate
-the typical failures of segmentation models like TransUNet.
+Key Challenge: Teaching the Refiner "When Not to Modify"
+--------------------------------------------------------
+A critical challenge is ensuring the refiner learns both:
+  (1) When TO modify: Low-quality inputs need strong correction
+  (2) When NOT to modify: High-quality inputs should be preserved
 
-Simulated Segmentation Errors:
-------------------------------
-We apply 8 types of augmentations that mimic real segmentation model failures:
+Failure Mode Simulation
+-----------------------
+We simulate realistic segmentation failures that match observed model behavior:
 
-1. GAUSSIAN NOISE - Simulates prediction uncertainty
-   coarse = gt + N(0, σ²)
-   σ = 0.1 (noise_level parameter)
-   Effect: Soft, uncertain predictions instead of sharp binary masks
+Under-segmentation:
+  - Boundary erosion: Missing boundary regions due to conservative predictions
+  - Partial breakage: Object split into disconnected parts (common for irregular shapes)
+  - Small-lesion disappearance: Tiny lesions completely missed (most critical failure)
+  - Extreme shrinkage: Severe size reduction from pooling/downsampling artifacts
 
-2. BOUNDARY SMOOTHING - Simulates over-smoothed edges (CNN artifact)
-   coarse = AvgPool2D(gt, kernel_size=7)
-   Effect: Blurry boundaries, loss of fine detail
+Over-segmentation:
+  - Boundary dilation: Bleeding into background from over-confident predictions
+  - Attachment to nearby structures: Unintended connection to adjacent anatomy
+  - Artificial bridges: Thin spurious connections to nearby regions
 
-3. EROSION - Simulates under-segmentation
-   coarse = erode(gt, kernel_size=3-5)
-   Effect: Mask shrinks, boundary regions missed
+Boundary Artifacts:
+  - Contour jitter: Pixel-level noise along edge band from aliasing
+  - Edge roughening: Jagged boundaries from low-resolution feature maps
+  - Elastic deformation: Wavy/distorted boundaries from spatial inconsistency
 
-4. DILATION - Simulates over-segmentation
-   coarse = dilate(gt, kernel_size=3-5)
-   Effect: Mask expands, bleeds into background
+Internal Failures:
+  - Internal holes: Missing low-contrast central regions
+  - Partial dropout: Missing object regions from attention failures
 
-5. RANDOM HOLES - Simulates false negatives inside mask
-   For random points inside foreground:
-     Create hole of size 5-15 pixels
-     coarse[hole_region] *= 0.0-0.3
-   Effect: Missing regions within the object
+False Positives:
+  - False-positive islands: Small spurious blobs near lesion mimicking speckle/artifacts
 
-6. FALSE POSITIVE BLOBS - Simulates spurious detections
-   For random points in background:
-     Create Gaussian blob of size 3-10 pixels
-     coarse[blob_region] = max(coarse, blob * 0.5-0.9)
-   Effect: Small false positive regions outside object
+Size and Shape Conditioning
+---------------------------
+Augmentation intensity is conditioned on lesion properties to reflect realistic behavior:
+  - Tiny lesions (<500 pixels): Higher probability of disappearance/shrinkage
+  - Irregular shapes (low circularity): Higher probability of breakage
+  - Large lesions: Higher probability of internal holes and partial dropout
 
-7. BOUNDARY JITTER - Simulates imprecise boundaries
-   boundary = detect_edges(gt)  # Using Sobel
-   coarse = gt + N(0, 2σ²) * boundary
-   Effect: Noisy, imprecise object boundaries
+SDF-Based Augmentation (Mathematically Grounded)
+------------------------------------------------
+For anatomically plausible deformations, we operate in the continuous Signed Distance
+Function (SDF) domain rather than directly on binary masks:
 
-8. PARTIAL REGION DROPOUT - Simulates missing parts of object
-   Randomly drop left/right/top/bottom half or quadrant:
-     coarse[region] *= 0.3-0.7
-   Effect: Part of the object is missing (partial segmentation failure)
+  1. Convert GT mask M to SDF φ (zero level set defines the contour)
+  2. Apply perturbations: φ'(x,y) = φ(x,y) + c + G(x,y)
+     - c: global offset for uniform erosion/dilation
+     - G(x,y): low-frequency Gaussian random field for spatially varying boundary shifts
+  3. Threshold back to binary: M' = (φ' < 0)
 
-Augmentation Pipeline:
-----------------------
-def simulate_coarse_mask(gt_mask, noise_level=0.1, augment_prob=0.8):
-    coarse = gt_mask.clone()
+This formulation provides:
+  - Smooth, anatomically plausible deformations (no pixel-level artifacts)
+  - Explicit control over boundary displacement magnitude (in pixels)
+  - Topological consistency through level-set representation
+  - Regularization via total variation and area constraints
 
-    # Each augmentation applied with probability augment_prob * weight
-    if random() < augment_prob:
-        coarse += gaussian_noise(σ=noise_level)              # Always high prob
+Controlled Dice Score Distribution
+----------------------------------
+Training samples are generated with controlled quality distribution:
+  - Perfect (Dice = 1.0): 10% - Teaches preservation of good predictions
+  - High (Dice 0.9-1.0): 15% - Minor artifacts, should mostly preserve
+  - Medium (Dice 0.8-0.9): 40% - Moderate errors, needs refinement
+  - Low (Dice 0.6-0.8): 35% - Severe failures, needs strong correction
 
-    if random() < augment_prob * 0.5:
-        coarse = boundary_smoothing(coarse, k=5-9)           # 40% chance
+Quality-Aware Training Loss
+---------------------------
+We introduce a change-penalty term weighted by input mask quality:
 
-    if random() < augment_prob * 0.5:
-        coarse = erosion(coarse, k=3-5)                      # 40% chance
-    elif random() < augment_prob * 0.5:
-        coarse = dilation(coarse, k=3-5)                     # 40% chance (else)
+  L_total = L_segmentation + λ · L_change_penalty
 
-    if random() < augment_prob * 0.3:
-        coarse = add_holes(coarse, n=1-3, size=5-15)         # 24% chance
+where L_change_penalty = ||refined - coarse||² × quality_weight(Dice(coarse, GT))
 
-    if random() < augment_prob * 0.2:
-        coarse = add_false_positives(coarse, n=1-2, size=3-10)  # 16% chance
+The quality weight increases with input quality:
+  - Dice ≈ 0.6 (poor quality): penalty_weight ≈ 0 → allow strong modifications
+  - Dice ≈ 1.0 (perfect): penalty_weight ≈ 1 → preserve input, penalize changes
 
-    if random() < augment_prob * 0.3:
-        coarse = boundary_jitter(coarse, σ=2*noise_level)    # 24% chance
-
-    if random() < augment_prob * 0.2:
-        coarse = partial_dropout(coarse, strength=0.3-0.7)   # 16% chance
-
-    return clamp(coarse, 0, 1)
-
-Visual Example of Simulated Errors:
------------------------------------
-Ground Truth:           Simulated Coarse Mask:
-┌─────────────┐        ┌─────────────┐
-│             │        │      ○      │  ← False positive blob
-│   ██████    │        │   █████▒    │  ← Boundary smoothing
-│   ██████    │        │   ███ ██    │  ← Hole (false negative)
-│   ██████    │        │   ██████    │
-│             │        │             │
-└─────────────┘        └─────────────┘
-
-Comparison: Simulated vs Real TransUNet Errors
-----------------------------------------------
-| Error Type          | Simulated | Real TransUNet |
-|---------------------|-----------|----------------|
-| Gaussian noise      | ✓         | ✓ (soft predictions) |
-| Over-smoothed edges | ✓         | ✓ (CNN limitation) |
-| Under-segmentation  | ✓         | ✓ (conservative) |
-| Over-segmentation   | ✓         | ✓ (false positives) |
-| Missing regions     | ✓         | ✓ (hard cases) |
-| Boundary imprecision| ✓         | ✓ (always present) |
-| Partial failures    | ✓         | ✓ (challenging images) |
-| Systematic bias     | ✗         | ✓ (model-specific) |
-| Dataset-specific    | ✗         | ✓ (learned patterns) |
-
-Recommendation: Use Option A (actual predictions) when possible, as it captures
-model-specific and dataset-specific error patterns that simulation cannot replicate.
+This ensures the refiner learns to make corrections proportional to input quality.
 
 ================================================================================
-Phase 2 Option A: SAM Fine-tuning (With Actual TransUNet Predictions) [RECOMMENDED]
+Phase 2 Option B: SAM Fine-tuning (With Actual TransUNet Predictions)
 ================================================================================
 Objective: Adapt SAM to refine TransUNet's actual outputs.
 
