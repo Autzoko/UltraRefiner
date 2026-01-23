@@ -1,16 +1,27 @@
 """
 Inference TransUNet on validation sets and save predictions.
 
-This script runs inference using each fold's best checkpoint on its validation set,
-saves predictions as numpy arrays, and optionally generates visualizations.
+This script runs inference using each fold's best checkpoint on its validation set.
+By processing all folds, every training sample gets predicted exactly once (when it's
+in the validation set of its respective fold), covering the entire training set.
+
+Predictions are saved with original filenames to a unified directory for SAM training.
 
 Usage:
+    # Process all folds for a dataset (recommended)
     python scripts/inference_transunet.py \
         --data_root ./dataset/processed \
         --checkpoint_root ./checkpoints/transunet \
         --dataset BUSI \
         --n_splits 5 \
         --visualize
+
+    # Process specific folds only
+    python scripts/inference_transunet.py \
+        --data_root ./dataset/processed \
+        --checkpoint_root ./checkpoints/transunet \
+        --dataset BUSI \
+        --folds 0 1 2
 """
 import argparse
 import os
@@ -179,7 +190,7 @@ def run_inference(model, dataloader, device):
     Run inference and return predictions with metrics.
 
     Returns:
-        results: List of dicts with image, label, pred, and metrics
+        results: List of dicts with image, label, pred, metrics, and name
     """
     results = []
 
@@ -187,6 +198,7 @@ def run_inference(model, dataloader, device):
         for batch in tqdm(dataloader, desc='Inference'):
             image = batch['image'].to(device)
             label = batch['label'].to(device)
+            names = batch.get('name', [f'sample_{i}' for i in range(image.shape[0])])
 
             # Forward pass
             outputs = model(image)
@@ -197,6 +209,9 @@ def run_inference(model, dataloader, device):
                 img_np = image[i].cpu().numpy()
                 label_np = label[i].cpu().numpy()
                 pred_np = pred[i].cpu().numpy()
+
+                # Get original filename
+                name = names[i] if isinstance(names, list) else names
 
                 # Compute metrics
                 metrics = {
@@ -211,8 +226,7 @@ def run_inference(model, dataloader, device):
                     'label': label_np,
                     'pred': pred_np,
                     'metrics': metrics,
-                    'case_name': batch.get('case_name', [f'sample_{len(results)}'])[i]
-                                 if 'case_name' in batch else f'sample_{len(results)}'
+                    'name': name
                 })
 
     return results
@@ -235,12 +249,17 @@ def main():
     if args.vit_name.startswith('R50'):
         config.patches.grid = (args.img_size // 16, args.img_size // 16)
 
-    # Create output directory
+    # Create output directories
     output_dir = os.path.join(args.output_dir, args.dataset)
     os.makedirs(output_dir, exist_ok=True)
 
+    # Create unified predictions directory (all folds combined)
+    predictions_dir = os.path.join(output_dir, 'predictions')
+    os.makedirs(predictions_dir, exist_ok=True)
+
     # Process each fold
     all_fold_metrics = []
+    all_results = []  # Track all predictions across folds
 
     for fold in folds:
         print(f'\n{"="*60}')
@@ -295,23 +314,20 @@ def main():
         print(f'  Precision: {fold_metrics["precision"]:.4f}')
         print(f'  Recall:    {fold_metrics["recall"]:.4f}')
 
-        # Save predictions (structure: predictions/transunet/{dataset}/fold_{i}/)
+        # Save predictions to unified directory with original filenames
+        # Structure: predictions/transunet/{dataset}/predictions/{name}.npy
+        for result in results:
+            name = result['name']
+            np.save(os.path.join(predictions_dir, f'{name}.npy'), result['pred'])
+            all_results.append(result)
+
+        # Save fold-specific metrics
         fold_output_dir = os.path.join(output_dir, f'fold_{fold}')
         os.makedirs(fold_output_dir, exist_ok=True)
-
-        # Save as numpy arrays
-        predictions_dir = os.path.join(fold_output_dir, 'predictions')
-        os.makedirs(predictions_dir, exist_ok=True)
-
-        for i, result in enumerate(results):
-            np.save(os.path.join(predictions_dir, f'{i:04d}_pred.npy'), result['pred'])
-            np.save(os.path.join(predictions_dir, f'{i:04d}_label.npy'), result['label'])
-
-        # Save metrics
         metrics_path = os.path.join(fold_output_dir, 'metrics.npy')
         np.save(metrics_path, {
             'fold_metrics': fold_metrics,
-            'sample_metrics': [r['metrics'] for r in results]
+            'sample_metrics': [{'name': r['name'], **r['metrics']} for r in results]
         })
 
         # Generate visualizations
@@ -325,7 +341,8 @@ def main():
             # Visualize worst cases
             num_worst = min(args.num_vis // 2, len(sorted_results))
             for i, result in enumerate(sorted_results[:num_worst]):
-                save_path = os.path.join(vis_dir, f'worst_{i:02d}_dice{result["metrics"]["dice"]:.3f}.png')
+                name = result['name']
+                save_path = os.path.join(vis_dir, f'worst_{i:02d}_{name}_dice{result["metrics"]["dice"]:.3f}.png')
                 visualize_prediction(
                     result['image'], result['label'], result['pred'],
                     save_path, result['metrics']
@@ -334,7 +351,8 @@ def main():
             # Visualize best cases
             num_best = min(args.num_vis // 2, len(sorted_results))
             for i, result in enumerate(sorted_results[-num_best:]):
-                save_path = os.path.join(vis_dir, f'best_{i:02d}_dice{result["metrics"]["dice"]:.3f}.png')
+                name = result['name']
+                save_path = os.path.join(vis_dir, f'best_{i:02d}_{name}_dice{result["metrics"]["dice"]:.3f}.png')
                 visualize_prediction(
                     result['image'], result['label'], result['pred'],
                     save_path, result['metrics']
@@ -345,7 +363,8 @@ def main():
             random_indices = np.random.choice(len(results), num_random, replace=False)
             for i, idx in enumerate(random_indices):
                 result = results[idx]
-                save_path = os.path.join(vis_dir, f'random_{i:02d}_dice{result["metrics"]["dice"]:.3f}.png')
+                name = result['name']
+                save_path = os.path.join(vis_dir, f'random_{i:02d}_{name}_dice{result["metrics"]["dice"]:.3f}.png')
                 visualize_prediction(
                     result['image'], result['label'], result['pred'],
                     save_path, result['metrics']
@@ -358,6 +377,9 @@ def main():
     print(f'OVERALL SUMMARY - {args.dataset}')
     print(f'{"="*60}')
 
+    print(f'Total predictions saved: {len(all_results)}')
+    print(f'Predictions directory: {predictions_dir}')
+
     if all_fold_metrics:
         avg_metrics = {
             'dice': np.mean([m['dice'] for m in all_fold_metrics]),
@@ -369,23 +391,29 @@ def main():
             'dice': np.std([m['dice'] for m in all_fold_metrics]),
             'iou': np.std([m['iou'] for m in all_fold_metrics]),
             'precision': np.std([m['precision'] for m in all_fold_metrics]),
-            'recall': np.std([m['recall'] for m in all_fold_metrics]),
+            'recall': np.mean([m['recall'] for m in all_fold_metrics]),
         }
 
-        print(f'Average across {len(all_fold_metrics)} folds:')
+        print(f'\nAverage across {len(all_fold_metrics)} folds:')
         print(f'  Dice:      {avg_metrics["dice"]:.4f} +/- {std_metrics["dice"]:.4f}')
         print(f'  IoU:       {avg_metrics["iou"]:.4f} +/- {std_metrics["iou"]:.4f}')
         print(f'  Precision: {avg_metrics["precision"]:.4f} +/- {std_metrics["precision"]:.4f}')
         print(f'  Recall:    {avg_metrics["recall"]:.4f} +/- {std_metrics["recall"]:.4f}')
 
-        # Save overall summary
+        # Save overall summary with all sample info
         summary_path = os.path.join(output_dir, 'summary.npy')
         np.save(summary_path, {
             'avg_metrics': avg_metrics,
             'std_metrics': std_metrics,
-            'fold_metrics': all_fold_metrics
+            'fold_metrics': all_fold_metrics,
+            'total_samples': len(all_results),
+            'sample_names': [r['name'] for r in all_results],
+            'sample_metrics': [{'name': r['name'], **r['metrics']} for r in all_results]
         })
         print(f'\nSaved summary to {summary_path}')
+
+    print(f'\nPredictions saved to: {predictions_dir}')
+    print(f'Each prediction file is named as {{original_name}}.npy')
 
 
 if __name__ == '__main__':
