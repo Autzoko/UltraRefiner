@@ -7,7 +7,7 @@ A unified framework for breast ultrasound segmentation that combines **TransUNet
 UltraRefiner implements a three-phase training pipeline:
 
 1. **Phase 1**: Train TransUNet independently on breast ultrasound datasets (per-dataset or combined)
-2. **Phase 2**: Finetune SAM using TransUNet predictions as prompts
+2. **Phase 2**: Finetune SAM using augmented GT masks that simulate realistic segmentation failures
 3. **Phase 3**: End-to-end training with gradients flowing from SAMRefiner to TransUNet
 
 ## Training Pipeline Flow Chart
@@ -44,46 +44,39 @@ UltraRefiner implements a three-phase training pipeline:
 ║  │   Checkpoints   │   ./checkpoints/transunet/{dataset}/fold_{i}/best.pth  ║
 ║  └─────────────────┘                                                         ║
 ║                                                                               ║
-║                              │                                                ║
-║                              ▼                                                ║
-║  ┌─────────────────────────────────────────────────────────────────────────┐ ║
-║  │                  INFERENCE: Generate Predictions                        │ ║
-║  └─────────────────────────────────────────────────────────────────────────┘ ║
-║                                                                               ║
-║     For each fold's validation set:                                          ║
-║                                                                               ║
-║  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐          ║
-║  │  Load Best      │ ─► │  Inference on   │ ─► │  Save Coarse    │          ║
-║  │  Checkpoint     │    │  Val Set        │    │  Predictions    │          ║
-║  └─────────────────┘    └─────────────────┘    └─────────────────┘          ║
-║                                                        │                     ║
-║                                                        ▼                     ║
-║                              ┌──────────────────────────────────────┐        ║
-║                              │  ./predictions/transunet/{dataset}/  │        ║
-║                              │    fold_{i}/predictions/*.npy        │        ║
-║                              │    fold_{i}/visualizations/*.png     │        ║
-║                              └──────────────────────────────────────┘        ║
-║                                                                               ║
-║                              │                                                ║
-║                              ▼                                                ║
 ║  ┌─────────────────────────────────────────────────────────────────────────┐ ║
 ║  │                     PHASE 2: SAM Finetuning                             │ ║
-║  │               (Using Actual TransUNet Predictions)                      │ ║
+║  │               (Using GT Mask Augmentation)                              │ ║
 ║  └─────────────────────────────────────────────────────────────────────────┘ ║
 ║                                                                               ║
 ║     ┌─────────────────┐         ┌─────────────────┐                         ║
-║     │  Original Image │         │  TransUNet Pred │                         ║
-║     │   (1024×1024)   │         │  (Coarse Mask)  │                         ║
-║     └────────┬────────┘         └────────┬────────┘                         ║
-║              │                           │                                   ║
-║              │     ┌─────────────────────┴─────────────────────┐            ║
-║              │     │        Differentiable Prompt Generator    │            ║
-║              │     │  ┌─────────┬──────────────┬────────────┐  │            ║
-║              │     │  │  Point  │     Box      │    Mask    │  │            ║
-║              │     │  │ (soft   │ (threshold   │  (resize   │  │            ║
-║              │     │  │ argmax) │  + minmax)   │  to 256²)  │  │            ║
-║              │     │  └─────────┴──────────────┴────────────┘  │            ║
-║              │     └─────────────────────┬─────────────────────┘            ║
+║     │   GT Masks      │         │  Failure        │                         ║
+║     │   (Binary)      │ ──────► │  Simulation     │                         ║
+║     └─────────────────┘         └────────┬────────┘                         ║
+║                                          │                                   ║
+║                                          ▼                                   ║
+║     ┌────────────────────────────────────────────────────────────────┐      ║
+║     │              SDF-Based Augmentation Pipeline                    │      ║
+║     │  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐    │      ║
+║     │  │ Mask→SDF │ ► │ Add GRF  │ ► │Threshold │ ► │ Corrupted│    │      ║
+║     │  │          │   │ + Offset │   │ SDF→Mask │   │   Mask   │    │      ║
+║     │  └──────────┘   └──────────┘   └──────────┘   └──────────┘    │      ║
+║     │                                                                │      ║
+║     │  Failure Modes: erosion, dilation, breakage, holes,           │      ║
+║     │                 bridges, small-lesion disappearance           │      ║
+║     └────────────────────────────────────────────────────────────────┘      ║
+║                                          │                                   ║
+║     ┌─────────────────┐                  │                                   ║
+║     │  Original Image │                  │                                   ║
+║     │   (1024×1024)   │                  │                                   ║
+║     └────────┬────────┘                  │                                   ║
+║              │                           ▼                                   ║
+║              │     ┌─────────────────────────────────────────┐              ║
+║              │     │        Differentiable Prompt Generator  │              ║
+║              │     │  ┌─────────┬──────────────┬──────────┐  │              ║
+║              │     │  │  Point  │     Box      │   Mask   │  │              ║
+║              │     │  └─────────┴──────────────┴──────────┘  │              ║
+║              │     └─────────────────────┬───────────────────┘              ║
 ║              │                           │                                   ║
 ║              ▼                           ▼                                   ║
 ║  ┌─────────────────────────────────────────────────────────────────┐        ║
@@ -96,8 +89,8 @@ UltraRefiner implements a three-phase training pipeline:
 ║  └─────────────────────────────────────────────────────────────────┘        ║
 ║         │                                                                    ║
 ║         ▼                                                                    ║
-║  ┌─────────────────┐                                                        ║
-║  │  Refined Mask   │   Loss = BCE-Dice + IoU Prediction Loss                ║
+║  ┌─────────────────┐   Loss = BCE-Dice + IoU Loss + Change Penalty          ║
+║  │  Refined Mask   │   (Quality-aware: penalize changes on good inputs)     ║
 ║  └─────────────────┘                                                        ║
 ║         │                                                                    ║
 ║         ▼                                                                    ║
@@ -188,20 +181,7 @@ python scripts/train_transunet.py \
 # Repeat for all folds (0-4) and all datasets
 ```
 
-### 3. Inference & Visualize TransUNet Predictions
-
-```bash
-# Generate predictions for SAM training
-python scripts/inference_transunet.py \
-    --data_root ./dataset/processed \
-    --dataset BUSI \
-    --checkpoint_root ./checkpoints/transunet \
-    --output_dir ./predictions/transunet \
-    --n_splits 5 \
-    --visualize
-```
-
-### 4. Phase 2: Finetune SAM
+### 3. Phase 2: Finetune SAM
 
 **Option A: GT with Synthetic Failure Simulation (Recommended)**
 
@@ -244,9 +224,18 @@ python scripts/finetune_sam_augmented.py \
 
 **Option B: Use Actual TransUNet Predictions (Alternative)**
 
-Alternatively, finetune SAM using actual TransUNet predictions from Phase 1.
+Alternatively, finetune SAM using actual TransUNet predictions from Phase 1. This requires generating predictions first:
 
 ```bash
+# Step 1: Generate TransUNet predictions
+python scripts/inference_transunet.py \
+    --data_root ./dataset/processed \
+    --dataset BUSI \
+    --checkpoint_root ./checkpoints/transunet \
+    --output_dir ./predictions/transunet \
+    --n_splits 5
+
+# Step 2: Finetune SAM with predictions
 python scripts/finetune_sam_with_preds.py \
     --data_root ./dataset/processed \
     --pred_root ./predictions/transunet \
@@ -255,7 +244,7 @@ python scripts/finetune_sam_with_preds.py \
     --fold 0
 ```
 
-### 5. Phase 3: End-to-End Training
+### 4. Phase 3: End-to-End Training
 
 ```bash
 python scripts/train_e2e.py \
