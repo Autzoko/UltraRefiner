@@ -208,11 +208,12 @@ Mask perturbations are modeled in the continuous signed distance function (SDF) 
 Training mixes perfect masks (10%), mildly corrupted masks (55%), and heavily corrupted masks (35%). A change-penalty term weighted by input mask quality encourages the Refiner to preserve already-good predictions while strongly correcting poor ones.
 
 ```bash
-# Generate augmented training data
+# Generate augmented training data from all datasets combined
 python scripts/generate_augmented_data.py \
     --data_root ./dataset/processed \
     --output_dir ./dataset/augmented \
-    --num_samples 100000 \
+    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
+    --target_samples 100000 \
     --use_sdf
 
 # Finetune SAM with augmented data

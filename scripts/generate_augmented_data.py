@@ -53,18 +53,25 @@ Augmentation Backends:
    function domain, producing smoother and more anatomically plausible deformations
 
 Usage:
-    # Pixel-level augmentation (default)
+    # Single dataset
     python scripts/generate_augmented_data.py \
         --data_root ./dataset/processed \
         --output_dir ./dataset/augmented \
-        --dataset BUSI \
+        --datasets BUSI \
         --target_samples 100000
 
-    # SDF-based augmentation (recommended for smoother deformations)
+    # Multiple datasets combined (recommended)
     python scripts/generate_augmented_data.py \
         --data_root ./dataset/processed \
         --output_dir ./dataset/augmented \
-        --dataset BUSI \
+        --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
+        --target_samples 100000
+
+    # SDF-based augmentation (smoother deformations)
+    python scripts/generate_augmented_data.py \
+        --data_root ./dataset/processed \
+        --output_dir ./dataset/augmented \
+        --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
         --target_samples 100000 \
         --use_sdf
 """
@@ -1245,7 +1252,7 @@ class SegmentationFailureSimulator:
 def generate_augmented_dataset(
     data_root: str,
     output_dir: str,
-    dataset_name: str,
+    datasets: list,
     target_samples: int = 100000,
     seed: int = 42,
     use_sdf: bool = False
@@ -1256,7 +1263,7 @@ def generate_augmented_dataset(
     Args:
         data_root: Root directory containing preprocessed datasets
         output_dir: Output directory for augmented data
-        dataset_name: Dataset name
+        datasets: List of dataset names to combine
         target_samples: Target number of total samples
         seed: Random seed
         use_sdf: If True, use SDF-based augmentation (smoother deformations)
@@ -1274,19 +1281,51 @@ def generate_augmented_dataset(
         simulator = SegmentationFailureSimulator(seed=seed)
         print("Using pixel-level augmentation")
 
-    # Setup paths
-    image_dir = os.path.join(data_root, dataset_name, 'train', 'images')
-    mask_dir = os.path.join(data_root, dataset_name, 'train', 'masks')
+    # Collect all samples from all datasets
+    all_samples = []  # List of (dataset_name, image_file, image_path, mask_path)
 
-    if not os.path.exists(image_dir):
-        print(f"Error: Image directory not found: {image_dir}")
+    print(f"\nLoading samples from {len(datasets)} dataset(s): {', '.join(datasets)}")
+
+    for dataset_name in datasets:
+        image_dir = os.path.join(data_root, dataset_name, 'train', 'images')
+        mask_dir = os.path.join(data_root, dataset_name, 'train', 'masks')
+
+        if not os.path.exists(image_dir):
+            print(f"Warning: Image directory not found: {image_dir}, skipping {dataset_name}")
+            continue
+
+        # Get all samples from this dataset
+        image_files = sorted([f for f in os.listdir(image_dir) if f.endswith(('.png', '.jpg', '.npy'))])
+
+        for image_file in image_files:
+            name = os.path.splitext(image_file)[0]
+            image_path = os.path.join(image_dir, image_file)
+
+            # Find corresponding mask
+            mask_file = image_file.replace('.jpg', '.png')
+            mask_path = os.path.join(mask_dir, mask_file)
+
+            if not os.path.exists(mask_path):
+                for ext in ['.png', '.npy', '.jpg']:
+                    alt_path = os.path.join(mask_dir, name + ext)
+                    if os.path.exists(alt_path):
+                        mask_path = alt_path
+                        break
+
+            if os.path.exists(mask_path):
+                all_samples.append((dataset_name, image_file, image_path, mask_path))
+            else:
+                print(f"Warning: Mask not found for {dataset_name}/{image_file}")
+
+        print(f"  {dataset_name}: {len([s for s in all_samples if s[0] == dataset_name])} samples")
+
+    num_original = len(all_samples)
+
+    if num_original == 0:
+        print("Error: No samples found!")
         return
 
-    # Get all samples
-    image_files = sorted([f for f in os.listdir(image_dir) if f.endswith(('.png', '.jpg', '.npy'))])
-    num_original = len(image_files)
-
-    print(f"Found {num_original} original samples")
+    print(f"\nTotal samples from all datasets: {num_original}")
     print(f"Target: {target_samples} augmented samples")
 
     # Calculate augmentations per sample
@@ -1311,10 +1350,11 @@ def generate_augmented_dataset(
     print(f"  Medium (0.8-0.9): {medium_count}")
     print(f"  Low (0.6-0.8):    {low_count}")
 
-    # Create output directories
-    out_image_dir = os.path.join(output_dir, dataset_name, 'images')
-    out_mask_dir = os.path.join(output_dir, dataset_name, 'masks')
-    out_coarse_dir = os.path.join(output_dir, dataset_name, 'coarse_masks')
+    # Create output directories (combined output for all datasets)
+    combined_name = '_'.join(sorted(datasets)) if len(datasets) > 1 else datasets[0]
+    out_image_dir = os.path.join(output_dir, combined_name, 'images')
+    out_mask_dir = os.path.join(output_dir, combined_name, 'masks')
+    out_coarse_dir = os.path.join(output_dir, combined_name, 'coarse_masks')
 
     os.makedirs(out_image_dir, exist_ok=True)
     os.makedirs(out_mask_dir, exist_ok=True)
@@ -1327,35 +1367,18 @@ def generate_augmented_dataset(
 
     # Metadata
     metadata = {
-        'dataset': dataset_name,
+        'datasets': datasets,
         'original_samples': num_original,
         'target_samples': target_samples,
         'seed': seed,
         'samples': []
     }
 
-    # Process each original sample
+    # Process each original sample from combined pool
     sample_idx = 0
 
-    for file_idx, image_file in enumerate(tqdm(image_files, desc='Processing samples')):
+    for file_idx, (dataset_name, image_file, image_path, mask_path) in enumerate(tqdm(all_samples, desc='Processing samples')):
         name = os.path.splitext(image_file)[0]
-
-        # Load image and mask
-        image_path = os.path.join(image_dir, image_file)
-        mask_file = image_file.replace('.jpg', '.png')  # Masks are typically PNG
-        mask_path = os.path.join(mask_dir, mask_file)
-
-        if not os.path.exists(mask_path):
-            # Try other extensions
-            for ext in ['.png', '.npy', '.jpg']:
-                alt_path = os.path.join(mask_dir, name + ext)
-                if os.path.exists(alt_path):
-                    mask_path = alt_path
-                    break
-
-        if not os.path.exists(mask_path):
-            print(f"Warning: Mask not found for {image_file}")
-            continue
 
         # Load data
         if image_path.endswith('.npy'):
@@ -1404,8 +1427,8 @@ def generate_augmented_dataset(
                     gt_mask, dice_range, max_attempts=15
                 )
 
-                # Create output filename
-                out_name = f"{name}_aug{sample_idx:06d}_{level}"
+                # Create output filename (include dataset name to avoid collisions)
+                out_name = f"{dataset_name}_{name}_aug{sample_idx:06d}_{level}"
 
                 # Save image (copy original)
                 if image_path.endswith('.npy'):
@@ -1441,6 +1464,7 @@ def generate_augmented_dataset(
                 metadata['samples'].append({
                     'name': out_name,
                     'original': name,
+                    'source_dataset': dataset_name,
                     'dice': float(actual_dice),
                     'augmentations': aug_info,
                     'level': level
@@ -1481,12 +1505,12 @@ def generate_augmented_dataset(
         'augmentation_stats': dict(augmentation_stats)
     }
 
-    metadata_path = os.path.join(output_dir, dataset_name, 'metadata.json')
+    metadata_path = os.path.join(output_dir, combined_name, 'metadata.json')
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2)
 
     print(f"\nMetadata saved to: {metadata_path}")
-    print(f"Output directory: {os.path.join(output_dir, dataset_name)}")
+    print(f"Output directory: {os.path.join(output_dir, combined_name)}")
 
 
 def main():
@@ -1496,8 +1520,8 @@ def main():
                         help='Root directory containing preprocessed datasets')
     parser.add_argument('--output_dir', type=str, default='./dataset/augmented',
                         help='Output directory for augmented data')
-    parser.add_argument('--dataset', type=str, required=True,
-                        help='Dataset name (e.g., BUSI, ISIC)')
+    parser.add_argument('--datasets', type=str, nargs='+', required=True,
+                        help='Dataset names to combine (e.g., BUSI BUSBRA BUS)')
     parser.add_argument('--target_samples', type=int, default=100000,
                         help='Target number of augmented samples')
     parser.add_argument('--seed', type=int, default=42,
@@ -1507,7 +1531,7 @@ def main():
 
     args = parser.parse_args()
 
-    print(f"Generating augmented dataset for {args.dataset}")
+    print(f"Generating augmented dataset from: {', '.join(args.datasets)}")
     print(f"Target samples: {args.target_samples}")
     print(f"Output directory: {args.output_dir}")
     print(f"Augmentation backend: {'SDF-based' if args.use_sdf else 'Pixel-level'}")
@@ -1515,7 +1539,7 @@ def main():
     generate_augmented_dataset(
         data_root=args.data_root,
         output_dir=args.output_dir,
-        dataset_name=args.dataset,
+        datasets=args.datasets,
         target_samples=args.target_samples,
         seed=args.seed,
         use_sdf=args.use_sdf
