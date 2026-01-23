@@ -351,11 +351,20 @@ def train_one_epoch(model, sam_refiner, dataloader, optimizer, criterion, device
 
 
 def validate(model, sam_refiner, dataloader, criterion, device):
-    """Validate the model."""
+    """
+    Validate the model and compare coarse vs refined metrics.
+
+    Returns:
+        Dictionary with 'coarse', 'refined', and 'delta' metrics
+    """
     model.eval()
     sam_refiner.eval()
 
-    metric_tracker = MetricTracker(
+    # Track metrics for both coarse (TransUNet) and refined (SAM) masks
+    coarse_tracker = MetricTracker(
+        metrics=['dice', 'iou', 'jaccard', 'precision', 'recall', 'accuracy']
+    )
+    refined_tracker = MetricTracker(
         metrics=['dice', 'iou', 'jaccard', 'precision', 'recall', 'accuracy']
     )
 
@@ -381,16 +390,83 @@ def validate(model, sam_refiner, dataloader, criterion, device):
 
             loss, _ = criterion(pred_masks, pred_ious, label)
 
-            # Best mask
+            # Best refined mask
             best_idx = pred_ious.argmax(dim=1)
             pred_best = torch.stack([
                 pred_masks[b, best_idx[b]] for b in range(pred_masks.size(0))
             ])
             pred_best = torch.sigmoid(pred_best)
 
-            metric_tracker.update(pred_best, label, loss.item())
+            # Update metrics for coarse mask (TransUNet prediction)
+            # Resize coarse_mask to match label size if needed
+            if coarse_mask.shape[-2:] != label.shape[-2:]:
+                coarse_resized = F.interpolate(
+                    coarse_mask.unsqueeze(1),
+                    size=label.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False
+                ).squeeze(1)
+            else:
+                coarse_resized = coarse_mask
+            coarse_tracker.update(coarse_resized, label, 0.0)
 
-    return metric_tracker.get_average()
+            # Update metrics for refined mask (SAM output)
+            refined_tracker.update(pred_best, label, loss.item())
+
+    coarse_metrics = coarse_tracker.get_average()
+    refined_metrics = refined_tracker.get_average()
+
+    # Compute improvement (delta)
+    delta_metrics = {}
+    for key in ['dice', 'iou', 'jaccard', 'precision', 'recall', 'accuracy']:
+        if key in coarse_metrics and key in refined_metrics:
+            delta_metrics[key] = refined_metrics[key] - coarse_metrics[key]
+
+    return {
+        'coarse': coarse_metrics,
+        'refined': refined_metrics,
+        'delta': delta_metrics
+    }
+
+
+def print_validation_comparison(val_result, is_best=False):
+    """Print a nice comparison table of coarse vs refined metrics."""
+    coarse = val_result['coarse']
+    refined = val_result['refined']
+    delta = val_result['delta']
+
+    print("\n  [VALIDATION] Coarse (TransUNet) vs Refined (SAM)")
+    if is_best:
+        print("  " + "=" * 60 + " ★ BEST")
+    else:
+        print("  " + "=" * 60)
+
+    print(f"  {'Metric':<12} {'Coarse':>10} {'Refined':>10} {'Delta':>12}")
+    print("  " + "-" * 60)
+
+    for metric in ['dice', 'iou', 'precision', 'recall', 'accuracy']:
+        c_val = coarse.get(metric, 0)
+        r_val = refined.get(metric, 0)
+        d_val = delta.get(metric, 0)
+
+        # Color indicator for improvement
+        if d_val > 0.001:
+            indicator = "↑"  # Improved
+        elif d_val < -0.001:
+            indicator = "↓"  # Worse
+        else:
+            indicator = "→"  # No change
+
+        print(f"  {metric.capitalize():<12} {c_val:>10.4f} {r_val:>10.4f} {d_val:>+10.4f} {indicator}")
+
+    print("  " + "=" * 60)
+
+    # Summary
+    avg_improvement = sum(delta.values()) / len(delta) if delta else 0
+    if avg_improvement > 0:
+        print(f"  Average improvement: +{avg_improvement:.4f} (SAM is helping!)")
+    else:
+        print(f"  Average improvement: {avg_improvement:.4f}")
 
 
 def main():
@@ -524,33 +600,46 @@ def main():
         )
         logging.info(f'Epoch {epoch} Train: {train_metrics}')
 
-        # Validate
-        val_metrics = validate(sam, sam_refiner, val_loader, criterion, device)
-        logging.info(f'Epoch {epoch} Val: {val_metrics}')
+        # Validate (returns coarse, refined, delta metrics)
+        val_result = validate(sam, sam_refiner, val_loader, criterion, device)
+        logging.info(f'Epoch {epoch} Val Coarse: {val_result["coarse"]}')
+        logging.info(f'Epoch {epoch} Val Refined: {val_result["refined"]}')
+        logging.info(f'Epoch {epoch} Val Delta: {val_result["delta"]}')
 
         # Update scheduler
         scheduler.step()
 
         # Log to tensorboard
-        for key, value in val_metrics.items():
-            writer.add_scalar(f'val/{key}', value, epoch)
         current_lr = scheduler.get_last_lr()[0]
         writer.add_scalar('train/lr', current_lr, epoch)
 
-        # Save checkpoint
-        is_best = val_metrics['dice'] > best_dice
+        # Log coarse metrics
+        for key, value in val_result['coarse'].items():
+            writer.add_scalar(f'val_coarse/{key}', value, epoch)
+
+        # Log refined metrics
+        for key, value in val_result['refined'].items():
+            writer.add_scalar(f'val_refined/{key}', value, epoch)
+
+        # Log improvement (delta)
+        for key, value in val_result['delta'].items():
+            writer.add_scalar(f'val_delta/{key}', value, epoch)
+
+        # Save checkpoint based on refined dice
+        refined_dice = val_result['refined']['dice']
+        is_best = refined_dice > best_dice
         if is_best:
-            best_dice = val_metrics['dice']
+            best_dice = refined_dice
             best_epoch = epoch
 
-        # Print beautiful epoch summary
-        logger.print_epoch_summary(
-            epoch=epoch,
-            train_metrics=train_metrics,
-            val_metrics=val_metrics,
-            lr=current_lr,
-            is_best=is_best
-        )
+        # Print training metrics
+        print(f"\n  [TRAIN] Epoch {epoch}/{args.max_epochs-1}")
+        print(f"  ├── Loss: {train_metrics['loss']:.4f}")
+        print(f"  ├── Dice: {train_metrics['dice']:.4f}")
+        print(f"  └── LR:   {current_lr:.2e}")
+
+        # Print validation comparison table
+        print_validation_comparison(val_result, is_best=is_best)
 
         checkpoint = {
             'epoch': epoch,
