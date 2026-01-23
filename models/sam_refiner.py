@@ -295,6 +295,7 @@ class DifferentiableSAMRefiner(nn.Module):
         image: torch.Tensor,
         coarse_mask: torch.Tensor,
         return_intermediate: bool = False,
+        image_already_normalized: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
         Refine coarse masks using SAM with full differentiability.
@@ -305,9 +306,12 @@ class DifferentiableSAMRefiner(nn.Module):
                      → extract_soft_* → coarse_mask → TransUNet
 
         Args:
-            image: Input image (B, 3, H, W) normalized for SAM
+            image: Input image (B, 3, H, W)
+                   If image_already_normalized=True: expects SAM-normalized image
+                   If image_already_normalized=False: expects [0, 255] range
             coarse_mask: Coarse segmentation mask (B, H, W) with values in [0, 1]
             return_intermediate: Whether to return intermediate results
+            image_already_normalized: If True, skip SAM preprocessing (avoid double normalization)
 
         Returns:
             Dictionary containing:
@@ -322,7 +326,21 @@ class DifferentiableSAMRefiner(nn.Module):
 
         # Get image embeddings (frozen, but keep in graph for proper device handling)
         with torch.set_grad_enabled(self.sam.image_encoder.training):
-            input_images = torch.stack([self.sam.preprocess(img) for img in image])
+            if image_already_normalized:
+                # Image is already normalized for SAM - just ensure correct size with padding
+                H, W = image.shape[-2:]
+                target_size = self.sam.image_encoder.img_size
+                if H != target_size or W != target_size:
+                    # Pad to target size if needed
+                    padh = target_size - H
+                    padw = target_size - W
+                    input_images = F.pad(image, (0, padw, 0, padh))
+                else:
+                    input_images = image
+            else:
+                # Image is raw [0, 255] - apply SAM preprocessing
+                input_images = torch.stack([self.sam.preprocess(img) for img in image])
+
             image_embeddings = self.sam.image_encoder(input_images)
 
         # Prepare prompts (ALL DIFFERENTIABLE)

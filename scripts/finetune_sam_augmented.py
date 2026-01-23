@@ -287,8 +287,9 @@ def train_epoch(model, dataloader, optimizer, device, epoch, change_penalty_weig
         coarse_mask = batch['coarse_mask'].to(device)
 
         # Forward pass
+        # Note: image is already normalized by the dataset (for_sam=True)
         optimizer.zero_grad()
-        result = model(image, coarse_mask)
+        result = model(image, coarse_mask, image_already_normalized=True)
 
         refined_masks = result['masks']  # (B, H, W) - logits
 
@@ -337,8 +338,8 @@ def validate(model, dataloader, device):
             gt_mask = batch['label'].to(device)
             coarse_mask = batch['coarse_mask'].to(device)
 
-            # Forward pass
-            result = model(image, coarse_mask)
+            # Forward pass (image is already normalized by dataset)
+            result = model(image, coarse_mask, image_already_normalized=True)
             refined_masks = torch.sigmoid(result['masks'])
 
             # Compute metrics for each sample
