@@ -113,28 +113,52 @@ def set_seed(seed):
     torch.cuda.manual_seed(seed)
 
 
-def simulate_coarse_mask(gt_mask, noise_level=0.1):
+def simulate_coarse_mask(gt_mask, noise_level=0.1, augment_prob=0.8):
     """
-    Simulate coarse mask from ground truth by adding noise and morphological operations.
-    This simulates the output quality of TransUNet.
+    Simulate coarse mask from ground truth by applying various augmentations
+    that mimic typical segmentation model failures.
+
+    Simulated errors include:
+    1. Gaussian noise - simulates prediction uncertainty
+    2. Boundary smoothing - simulates over-smoothed edges (common in CNNs)
+    3. Erosion - simulates under-segmentation / missing boundary regions
+    4. Dilation - simulates over-segmentation / bleeding into background
+    5. Random holes - simulates false negatives inside the mask
+    6. Random blobs - simulates false positives outside the mask
+    7. Elastic deformation - simulates boundary imprecision
+    8. Partial dropout - simulates missing regions of the object
 
     Args:
-        gt_mask: Ground truth mask (B, H, W)
-        noise_level: Amount of noise to add
+        gt_mask: Ground truth mask (B, H, W) with values in [0, 1]
+        noise_level: Base noise level (0.0-0.3 recommended)
+        augment_prob: Probability of applying each augmentation
 
     Returns:
-        Coarse mask (B, H, W)
+        Coarse mask (B, H, W) simulating segmentation model output
     """
+    B, H, W = gt_mask.shape
+    device = gt_mask.device
     coarse_mask = gt_mask.clone()
 
-    # Add Gaussian noise
-    noise = torch.randn_like(coarse_mask) * noise_level
-    coarse_mask = coarse_mask + noise
-    coarse_mask = torch.clamp(coarse_mask, 0, 1)
+    # 1. Gaussian noise - simulates prediction uncertainty
+    if random.random() < augment_prob:
+        noise = torch.randn_like(coarse_mask) * noise_level
+        coarse_mask = coarse_mask + noise
 
-    # Random erosion/dilation simulation
-    if random.random() > 0.5:
-        # Simulated erosion (shrink mask slightly)
+    # 2. Boundary smoothing - simulates over-smoothed edges (CNN artifact)
+    if random.random() < augment_prob * 0.5:
+        kernel_size = random.choice([5, 7, 9])
+        padding = kernel_size // 2
+        # Gaussian-like smoothing using avg pool
+        coarse_mask = F.avg_pool2d(
+            coarse_mask.unsqueeze(1),
+            kernel_size=kernel_size,
+            stride=1,
+            padding=padding
+        ).squeeze(1)
+
+    # 3. Random erosion - simulates under-segmentation
+    if random.random() < augment_prob * 0.5:
         kernel_size = random.choice([3, 5])
         coarse_mask = F.max_pool2d(
             1 - coarse_mask.unsqueeze(1),
@@ -143,8 +167,9 @@ def simulate_coarse_mask(gt_mask, noise_level=0.1):
             padding=kernel_size // 2
         ).squeeze(1)
         coarse_mask = 1 - coarse_mask
-    else:
-        # Simulated dilation (expand mask slightly)
+
+    # 4. Random dilation - simulates over-segmentation
+    elif random.random() < augment_prob * 0.5:
         kernel_size = random.choice([3, 5])
         coarse_mask = F.max_pool2d(
             coarse_mask.unsqueeze(1),
@@ -152,6 +177,98 @@ def simulate_coarse_mask(gt_mask, noise_level=0.1):
             stride=1,
             padding=kernel_size // 2
         ).squeeze(1)
+
+    # 5. Random holes inside mask - simulates false negatives
+    if random.random() < augment_prob * 0.3:
+        for b in range(B):
+            # Find foreground region
+            fg_coords = torch.nonzero(coarse_mask[b] > 0.5, as_tuple=True)
+            if len(fg_coords[0]) > 100:
+                # Add 1-3 random holes
+                num_holes = random.randint(1, 3)
+                for _ in range(num_holes):
+                    idx = random.randint(0, len(fg_coords[0]) - 1)
+                    cy, cx = fg_coords[0][idx].item(), fg_coords[1][idx].item()
+                    hole_size = random.randint(5, 15)
+
+                    y1, y2 = max(0, cy - hole_size), min(H, cy + hole_size)
+                    x1, x2 = max(0, cx - hole_size), min(W, cx + hole_size)
+                    coarse_mask[b, y1:y2, x1:x2] *= random.uniform(0.0, 0.3)
+
+    # 6. Random false positive blobs - simulates spurious detections
+    if random.random() < augment_prob * 0.2:
+        for b in range(B):
+            # Find background region
+            bg_coords = torch.nonzero(coarse_mask[b] < 0.3, as_tuple=True)
+            if len(bg_coords[0]) > 100:
+                # Add 1-2 random false positive blobs
+                num_blobs = random.randint(1, 2)
+                for _ in range(num_blobs):
+                    idx = random.randint(0, len(bg_coords[0]) - 1)
+                    cy, cx = bg_coords[0][idx].item(), bg_coords[1][idx].item()
+                    blob_size = random.randint(3, 10)
+
+                    y1, y2 = max(0, cy - blob_size), min(H, cy + blob_size)
+                    x1, x2 = max(0, cx - blob_size), min(W, cx + blob_size)
+
+                    # Create soft blob
+                    yy, xx = torch.meshgrid(
+                        torch.arange(y2 - y1, device=device),
+                        torch.arange(x2 - x1, device=device),
+                        indexing='ij'
+                    )
+                    dist = ((yy - blob_size) ** 2 + (xx - blob_size) ** 2).float()
+                    blob = torch.exp(-dist / (blob_size ** 2)) * random.uniform(0.5, 0.9)
+                    coarse_mask[b, y1:y2, x1:x2] = torch.maximum(
+                        coarse_mask[b, y1:y2, x1:x2],
+                        blob[:y2-y1, :x2-x1]
+                    )
+
+    # 7. Boundary jitter - simulates imprecise boundaries
+    if random.random() < augment_prob * 0.3:
+        # Add spatially correlated noise near boundaries
+        # Detect boundary using gradient
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], device=device, dtype=torch.float32).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], device=device, dtype=torch.float32).view(1, 1, 3, 3)
+
+        grad_x = F.conv2d(coarse_mask.unsqueeze(1), sobel_x, padding=1)
+        grad_y = F.conv2d(coarse_mask.unsqueeze(1), sobel_y, padding=1)
+        boundary = (grad_x.abs() + grad_y.abs()).squeeze(1)
+        boundary = (boundary > 0.1).float()
+
+        # Add noise only at boundaries
+        boundary_noise = torch.randn_like(coarse_mask) * noise_level * 2 * boundary
+        coarse_mask = coarse_mask + boundary_noise
+
+    # 8. Partial region dropout - simulates missing part of object
+    if random.random() < augment_prob * 0.2:
+        for b in range(B):
+            # Randomly drop a quadrant or half of the mask
+            drop_type = random.choice(['left', 'right', 'top', 'bottom', 'quadrant'])
+            drop_strength = random.uniform(0.3, 0.7)
+
+            if drop_type == 'left':
+                coarse_mask[b, :, :W//2] *= drop_strength
+            elif drop_type == 'right':
+                coarse_mask[b, :, W//2:] *= drop_strength
+            elif drop_type == 'top':
+                coarse_mask[b, :H//2, :] *= drop_strength
+            elif drop_type == 'bottom':
+                coarse_mask[b, H//2:, :] *= drop_strength
+            elif drop_type == 'quadrant':
+                qh, qw = H//2, W//2
+                q = random.randint(0, 3)
+                if q == 0:
+                    coarse_mask[b, :qh, :qw] *= drop_strength
+                elif q == 1:
+                    coarse_mask[b, :qh, qw:] *= drop_strength
+                elif q == 2:
+                    coarse_mask[b, qh:, :qw] *= drop_strength
+                else:
+                    coarse_mask[b, qh:, qw:] *= drop_strength
+
+    # Clamp to valid range
+    coarse_mask = torch.clamp(coarse_mask, 0, 1)
 
     return coarse_mask
 

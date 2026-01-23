@@ -123,8 +123,135 @@ For each dataset D:
 
 Result: Every training sample has exactly one prediction (from when it was in validation set)
 
-Phase 2: SAM Fine-tuning (With Actual TransUNet Predictions)
-------------------------------------------------------------
+Phase 2: SAM Fine-tuning
+========================
+We provide TWO approaches for Phase 2, each with different trade-offs:
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  OPTION A: Using Actual TransUNet Predictions (RECOMMENDED)                 │
+│  Script: finetune_sam_with_preds.py                                         │
+│  Pros: Realistic coarse masks, matches E2E training distribution            │
+│  Cons: Requires Phase 1 completion + inference                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  OPTION B: Using GT with Simulated Noise                                    │
+│  Script: finetune_sam.py                                                    │
+│  Pros: No dependency on Phase 1, can train immediately                      │
+│  Cons: Simulated errors may not match real segmentation failures            │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+Phase 2 Option B: SAM Fine-tuning with Simulated Coarse Masks
+================================================================================
+Objective: Train SAM using GT masks with augmentations that simulate segmentation errors.
+
+This approach uses ground truth masks and applies various corruptions to simulate
+the typical failures of segmentation models like TransUNet.
+
+Simulated Segmentation Errors:
+------------------------------
+We apply 8 types of augmentations that mimic real segmentation model failures:
+
+1. GAUSSIAN NOISE - Simulates prediction uncertainty
+   coarse = gt + N(0, σ²)
+   σ = 0.1 (noise_level parameter)
+   Effect: Soft, uncertain predictions instead of sharp binary masks
+
+2. BOUNDARY SMOOTHING - Simulates over-smoothed edges (CNN artifact)
+   coarse = AvgPool2D(gt, kernel_size=7)
+   Effect: Blurry boundaries, loss of fine detail
+
+3. EROSION - Simulates under-segmentation
+   coarse = erode(gt, kernel_size=3-5)
+   Effect: Mask shrinks, boundary regions missed
+
+4. DILATION - Simulates over-segmentation
+   coarse = dilate(gt, kernel_size=3-5)
+   Effect: Mask expands, bleeds into background
+
+5. RANDOM HOLES - Simulates false negatives inside mask
+   For random points inside foreground:
+     Create hole of size 5-15 pixels
+     coarse[hole_region] *= 0.0-0.3
+   Effect: Missing regions within the object
+
+6. FALSE POSITIVE BLOBS - Simulates spurious detections
+   For random points in background:
+     Create Gaussian blob of size 3-10 pixels
+     coarse[blob_region] = max(coarse, blob * 0.5-0.9)
+   Effect: Small false positive regions outside object
+
+7. BOUNDARY JITTER - Simulates imprecise boundaries
+   boundary = detect_edges(gt)  # Using Sobel
+   coarse = gt + N(0, 2σ²) * boundary
+   Effect: Noisy, imprecise object boundaries
+
+8. PARTIAL REGION DROPOUT - Simulates missing parts of object
+   Randomly drop left/right/top/bottom half or quadrant:
+     coarse[region] *= 0.3-0.7
+   Effect: Part of the object is missing (partial segmentation failure)
+
+Augmentation Pipeline:
+----------------------
+def simulate_coarse_mask(gt_mask, noise_level=0.1, augment_prob=0.8):
+    coarse = gt_mask.clone()
+
+    # Each augmentation applied with probability augment_prob * weight
+    if random() < augment_prob:
+        coarse += gaussian_noise(σ=noise_level)              # Always high prob
+
+    if random() < augment_prob * 0.5:
+        coarse = boundary_smoothing(coarse, k=5-9)           # 40% chance
+
+    if random() < augment_prob * 0.5:
+        coarse = erosion(coarse, k=3-5)                      # 40% chance
+    elif random() < augment_prob * 0.5:
+        coarse = dilation(coarse, k=3-5)                     # 40% chance (else)
+
+    if random() < augment_prob * 0.3:
+        coarse = add_holes(coarse, n=1-3, size=5-15)         # 24% chance
+
+    if random() < augment_prob * 0.2:
+        coarse = add_false_positives(coarse, n=1-2, size=3-10)  # 16% chance
+
+    if random() < augment_prob * 0.3:
+        coarse = boundary_jitter(coarse, σ=2*noise_level)    # 24% chance
+
+    if random() < augment_prob * 0.2:
+        coarse = partial_dropout(coarse, strength=0.3-0.7)   # 16% chance
+
+    return clamp(coarse, 0, 1)
+
+Visual Example of Simulated Errors:
+-----------------------------------
+Ground Truth:           Simulated Coarse Mask:
+┌─────────────┐        ┌─────────────┐
+│             │        │      ○      │  ← False positive blob
+│   ██████    │        │   █████▒    │  ← Boundary smoothing
+│   ██████    │        │   ███ ██    │  ← Hole (false negative)
+│   ██████    │        │   ██████    │
+│             │        │             │
+└─────────────┘        └─────────────┘
+
+Comparison: Simulated vs Real TransUNet Errors
+----------------------------------------------
+| Error Type          | Simulated | Real TransUNet |
+|---------------------|-----------|----------------|
+| Gaussian noise      | ✓         | ✓ (soft predictions) |
+| Over-smoothed edges | ✓         | ✓ (CNN limitation) |
+| Under-segmentation  | ✓         | ✓ (conservative) |
+| Over-segmentation   | ✓         | ✓ (false positives) |
+| Missing regions     | ✓         | ✓ (hard cases) |
+| Boundary imprecision| ✓         | ✓ (always present) |
+| Partial failures    | ✓         | ✓ (challenging images) |
+| Systematic bias     | ✗         | ✓ (model-specific) |
+| Dataset-specific    | ✗         | ✓ (learned patterns) |
+
+Recommendation: Use Option A (actual predictions) when possible, as it captures
+model-specific and dataset-specific error patterns that simulation cannot replicate.
+
+================================================================================
+Phase 2 Option A: SAM Fine-tuning (With Actual TransUNet Predictions) [RECOMMENDED]
+================================================================================
 Objective: Adapt SAM to refine TransUNet's actual outputs.
 
 2.1 Data Organization and Pairing
