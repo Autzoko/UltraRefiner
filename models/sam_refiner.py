@@ -42,6 +42,7 @@ class DifferentiableSAMRefiner(nn.Module):
         freeze_prompt_encoder=False,
         selection_temperature=0.1,
         box_temperature=0.01,
+        mask_prompt_style='gaussian',
     ):
         """
         Args:
@@ -55,6 +56,10 @@ class DifferentiableSAMRefiner(nn.Module):
             freeze_prompt_encoder: Whether to freeze SAM's prompt encoder
             selection_temperature: Temperature for soft mask selection (lower = sharper)
             box_temperature: Temperature for soft box extraction (lower = sharper)
+            mask_prompt_style: Style for mask prompt preparation
+                - 'gaussian': Apply Gaussian blur (softer boundaries, recommended)
+                - 'direct': Direct conversion (sharp boundaries)
+                - 'distance': Distance-weighted confidence (SDF-like)
         """
         super().__init__()
 
@@ -66,6 +71,7 @@ class DifferentiableSAMRefiner(nn.Module):
         self.add_negative_point = add_negative_point
         self.selection_temperature = selection_temperature
         self.box_temperature = box_temperature
+        self.mask_prompt_style = mask_prompt_style
 
         # Freeze components if specified
         if freeze_image_encoder:
@@ -231,26 +237,86 @@ class DifferentiableSAMRefiner(nn.Module):
         boxes = torch.stack([x1, y1, x2, y2], dim=1)  # (B, 4)
         return boxes
 
-    def prepare_mask_input(self, soft_mask: torch.Tensor, target_size: int = 256) -> torch.Tensor:
+    def prepare_mask_input(
+        self,
+        soft_mask: torch.Tensor,
+        target_size: int = 256,
+        style: str = 'gaussian'
+    ) -> torch.Tensor:
         """
-        Prepare mask prompt for SAM.
-
-        Mathematical formulation:
-            logits = (p - 0.5) * 20 = (p * 2 - 1) * 10
-
-        Maps [0, 1] probability to [-10, 10] logits.
-        Fully differentiable via linear transformation + bilinear interpolation.
+        Prepare mask prompt for SAM with different styles.
 
         Args:
-            soft_mask: Soft probability mask (B, H, W)
+            soft_mask: Soft probability mask (B, H, W) with values in [0, 1]
             target_size: Target size for mask input (SAM uses 256x256)
+            style: Mask prompt style
+                - 'direct': Direct conversion to logits (sharp boundaries)
+                - 'gaussian': Apply Gaussian blur for softer boundaries (recommended)
+                - 'distance': Distance-weighted confidence (SDF-like)
 
         Returns:
             mask_input: (B, 1, target_size, target_size) mask prompt
         """
-        # Convert to logits-like values
-        # SAM expects values where positive = foreground
-        mask_logits = (soft_mask * 2 - 1) * 10  # Scale to [-10, 10]
+        B, H, W = soft_mask.shape
+
+        if style == 'gaussian':
+            # Apply Gaussian blur for softer, more natural boundaries
+            # This helps SAM generalize better to various input qualities
+            kernel_size = max(3, int(H / 64) * 2 + 1)  # Adaptive kernel size
+            sigma = kernel_size / 3.0
+
+            # Create Gaussian kernel
+            x = torch.arange(kernel_size, device=soft_mask.device, dtype=torch.float32)
+            x = x - (kernel_size - 1) / 2
+            gauss_1d = torch.exp(-x.pow(2) / (2 * sigma ** 2))
+            gauss_2d = gauss_1d.unsqueeze(0) * gauss_1d.unsqueeze(1)
+            gauss_2d = gauss_2d / gauss_2d.sum()
+            gauss_2d = gauss_2d.unsqueeze(0).unsqueeze(0)  # (1, 1, K, K)
+
+            # Apply Gaussian blur (differentiable)
+            padding = kernel_size // 2
+            soft_mask_4d = soft_mask.unsqueeze(1)  # (B, 1, H, W)
+            blurred_mask = F.conv2d(soft_mask_4d, gauss_2d, padding=padding)
+            blurred_mask = blurred_mask.squeeze(1)  # (B, H, W)
+
+            # Convert to logits
+            mask_logits = (blurred_mask * 2 - 1) * 10  # [-10, 10]
+
+        elif style == 'distance':
+            # Distance-weighted: higher confidence near mask center, lower near boundaries
+            # Approximates SDF-like behavior using soft distance transform
+            # Uses iterative erosion to estimate distance
+
+            # Compute approximate distance from boundary using soft operations
+            mask_4d = soft_mask.unsqueeze(1)  # (B, 1, H, W)
+
+            # Soft erosion to find "core" regions
+            kernel_size = 5
+            erosion_kernel = torch.ones(1, 1, kernel_size, kernel_size, device=soft_mask.device)
+            erosion_kernel = erosion_kernel / (kernel_size ** 2)
+
+            # Multiple erosion passes for distance estimation
+            distance_map = torch.zeros_like(soft_mask)
+            current_mask = mask_4d
+            for i in range(5):
+                # Soft erosion: convolve and threshold
+                eroded = F.conv2d(current_mask, erosion_kernel, padding=kernel_size // 2)
+                eroded = torch.sigmoid((eroded - 0.5) * 10)  # Soft threshold
+                distance_map = distance_map + eroded.squeeze(1)
+                current_mask = eroded
+
+            # Normalize distance map
+            distance_map = distance_map / 5.0
+
+            # Combine with original mask: high confidence in core, lower at boundaries
+            confidence_mask = soft_mask * (0.5 + 0.5 * distance_map)
+
+            # Convert to logits
+            mask_logits = (confidence_mask * 2 - 1) * 10
+
+        else:  # 'direct'
+            # Direct conversion: sharp boundaries preserved
+            mask_logits = (soft_mask * 2 - 1) * 10  # Scale to [-10, 10]
 
         # Resize to SAM's expected input size (bilinear is differentiable)
         mask_input = F.interpolate(
@@ -375,9 +441,9 @@ class DifferentiableSAMRefiner(nn.Module):
             prompts['point_coords'] = scaled_points
             prompts['point_labels'] = point_labels
 
-        # Mask prompts (differentiable linear transform + interpolation)
+        # Mask prompts (differentiable, with configurable style)
         if self.use_mask_prompt:
-            mask_input = self.prepare_mask_input(coarse_mask)
+            mask_input = self.prepare_mask_input(coarse_mask, style=self.mask_prompt_style)
             prompts['mask_inputs'] = mask_input
 
         # Run through SAM decoder

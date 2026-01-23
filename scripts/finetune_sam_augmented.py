@@ -74,6 +74,9 @@ def get_args():
                         help='Use box prompts')
     parser.add_argument('--use_mask_prompt', action='store_true', default=True,
                         help='Use mask prompts')
+    parser.add_argument('--mask_prompt_style', type=str, default='gaussian',
+                        choices=['gaussian', 'direct', 'distance'],
+                        help='Mask prompt style: gaussian (soft boundaries), direct (sharp), distance (SDF-like)')
 
     # Quality-aware loss arguments
     parser.add_argument('--change_penalty_weight', type=float, default=0.5,
@@ -430,7 +433,9 @@ def main():
         use_mask_prompt=args.use_mask_prompt,
         freeze_image_encoder=True,  # Always freeze for efficiency
         freeze_prompt_encoder=False,
+        mask_prompt_style=args.mask_prompt_style,
     )
+    print(f'Mask prompt style: {args.mask_prompt_style}')
     model = model.to(device)
 
     # Get dataloaders
