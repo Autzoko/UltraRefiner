@@ -127,48 +127,236 @@ Phase 2: SAM Fine-tuning (With Actual TransUNet Predictions)
 ------------------------------------------------------------
 Objective: Adapt SAM to refine TransUNet's actual outputs.
 
-Data pairing by filename matching:
-  image = dataset/processed/{D}/train/images/{name}.png
-  mask = dataset/processed/{D}/train/masks/{name}.png
-  coarse_pred = predictions/{D}/predictions/{name}.npy
+2.1 Data Organization and Pairing
+---------------------------------
+Data is paired by filename matching across three sources:
 
+  Original Image:    dataset/processed/{dataset}/train/images/{name}.png
+  Ground Truth Mask: dataset/processed/{dataset}/train/masks/{name}.png
+  TransUNet Pred:    predictions/transunet/{dataset}/predictions/{name}.npy
+
+Example for sample "benign_001":
+  image:      dataset/processed/BUSI/train/images/benign_001.png      (grayscale PNG)
+  gt_mask:    dataset/processed/BUSI/train/masks/benign_001.png       (binary PNG)
+  coarse:     predictions/transunet/BUSI/predictions/benign_001.npy   (float32 [0,1])
+
+The dataset loader automatically pairs these by scanning the image directory
+and loading corresponding mask and prediction files with matching names.
+
+2.2 Image Preprocessing for SAM
+-------------------------------
+SAM requires specific input format different from TransUNet:
+
+Step 1: Load grayscale image
+  image_gray = load_png(image_path)              # Shape: (H_orig, W_orig), uint8
+
+Step 2: Resize to SAM input size (1024x1024)
+  image_resized = resize(image_gray, (1024, 1024), mode='bilinear')
+
+Step 3: Convert grayscale to RGB (SAM expects 3-channel input)
+  image_rgb = stack([image_resized] * 3, axis=-1)  # Shape: (1024, 1024, 3)
+
+Step 4: Normalize to [0, 1] range
+  image_norm = image_rgb / 255.0                 # Shape: (1024, 1024, 3), float32
+
+Step 5: Convert to tensor and permute
+  image_tensor = torch.tensor(image_norm).permute(2, 0, 1)  # Shape: (3, 1024, 1024)
+
+Step 6: SAM-specific normalization (ImageNet stats, but input in [0,255] range)
+  pixel_mean = [123.675, 116.28, 103.53]
+  pixel_std = [58.395, 57.12, 57.375]
+  image_sam = (image_tensor * 255.0 - pixel_mean) / pixel_std  # Shape: (B, 3, 1024, 1024)
+
+2.3 Coarse Mask Preprocessing
+-----------------------------
+The TransUNet prediction (coarse mask) needs to be prepared for SAM:
+
+Step 1: Load prediction
+  coarse_mask = np.load(pred_path)               # Shape: (224, 224), float32 [0,1]
+
+Step 2: Resize to SAM input size
+  coarse_resized = resize(coarse_mask, (1024, 1024), mode='bilinear')
+                                                 # Shape: (1024, 1024), float32 [0,1]
+
+Step 3: Convert to tensor
+  coarse_tensor = torch.tensor(coarse_resized)   # Shape: (B, 1024, 1024)
+
+2.4 Prompt Generation from Coarse Mask
+--------------------------------------
+The DifferentiableSAMRefiner extracts three types of prompts:
+
+POINT PROMPTS (Foreground + Background):
+  # Positive point: centroid of foreground
+  mask_sum = coarse_mask.sum() + 1e-6
+  x_pos = (coarse_mask * X_grid).sum() / mask_sum    # Weighted x-coordinate
+  y_pos = (coarse_mask * Y_grid).sum() / mask_sum    # Weighted y-coordinate
+  point_pos = (x_pos, y_pos)                         # Shape: (B, 1, 2)
+  label_pos = 1                                      # Foreground label
+
+  # Negative point: centroid of background within bounding box
+  inv_mask = (1 - coarse_mask) * box_region
+  x_neg = (inv_mask * X_grid).sum() / inv_mask.sum()
+  y_neg = (inv_mask * Y_grid).sum() / inv_mask.sum()
+  point_neg = (x_neg, y_neg)                         # Shape: (B, 1, 2)
+  label_neg = 0                                      # Background label
+
+  # Combine points
+  point_coords = concat([point_pos, point_neg])      # Shape: (B, 2, 2)
+  point_labels = concat([label_pos, label_neg])      # Shape: (B, 2)
+
+  # Scale to SAM coordinate system (1024x1024)
+  scale = 1024 / 224
+  point_coords_scaled = point_coords * scale         # Shape: (B, 2, 2)
+
+BOX PROMPTS:
+  # Threshold mask to find boundaries
+  binary_mask = (coarse_mask > 0.5)
+
+  # Project to axes and find extent
+  y_proj = binary_mask.any(dim=1)                    # Which rows have foreground
+  x_proj = binary_mask.any(dim=0)                    # Which cols have foreground
+
+  y_indices = nonzero(y_proj)
+  x_indices = nonzero(x_proj)
+
+  y_min, y_max = y_indices.min(), y_indices.max()
+  x_min, x_max = x_indices.min(), x_indices.max()
+
+  box = (x_min, y_min, x_max, y_max)                 # Shape: (B, 4)
+
+  # Scale to SAM coordinate system
+  box_scaled = box * scale                           # Shape: (B, 4)
+
+MASK PROMPTS:
+  # Convert probability to logits for SAM
+  mask_logits = (coarse_mask * 2 - 1) * 10           # Scale [0,1] to [-10, 10]
+
+  # Resize to SAM's expected mask input size (256x256)
+  mask_input = resize(mask_logits, (256, 256), mode='bilinear')
+  mask_input = mask_input.unsqueeze(1)               # Shape: (B, 1, 256, 256)
+
+2.5 SAMRefiner Forward Pass (Detailed)
+--------------------------------------
 Model configuration:
   sam = load_sam('vit_b', checkpoint='medsam_vit_b.pth')
-  sam.image_encoder.freeze()           # Keep pretrained features
-  sam.prompt_encoder.trainable()       # Adapt to coarse mask prompts
-  sam.mask_decoder.trainable()         # Adapt refinement behavior
+  sam.image_encoder.freeze()           # 89M params frozen
+  sam.prompt_encoder.trainable()       # ~6K params trainable
+  sam.mask_decoder.trainable()         # ~4M params trainable
 
-Optional LoRA adaptation for image encoder:
+Optional LoRA for image encoder:
   lora_config = {rank: 4, alpha: 4.0, dropout: 0.0}
   inject_lora(sam.image_encoder.blocks, target=['qkv'])
-  # Adds ~300K trainable params to 89M frozen params
+  # Adds ~300K trainable params
 
-SAM Refiner forward pass:
-  img_emb = sam.image_encoder(image_1024x1024)
+Forward pass step-by-step:
 
-  # Generate prompts from coarse mask
-  point_prompt = soft_argmax(coarse_mask)
-  box_prompt = extract_box(coarse_mask)
-  mask_prompt = resize(coarse_mask, 256x256)
+  INPUT:
+    image_sam: (B, 3, 1024, 1024)    - Normalized image
+    coarse_mask: (B, 1024, 1024)     - TransUNet prediction resized
 
-  sparse_emb, dense_emb = sam.prompt_encoder(points, boxes, masks)
-  masks_3, iou_scores = sam.mask_decoder(img_emb, sparse_emb, dense_emb)
+  STEP 1: Image Encoding
+    img_embedding = sam.image_encoder(image_sam)
+    # Shape: (B, 256, 64, 64)
+    # 256 channels, 64x64 spatial (16x downsampled from 1024)
 
-  refined_mask = masks_3[argmax(iou_scores)]
+  STEP 2: Prompt Generation
+    point_coords, point_labels = extract_points(coarse_mask)
+    # point_coords: (B, 2, 2) - [pos_point, neg_point] x [x, y]
+    # point_labels: (B, 2) - [1, 0] for [foreground, background]
 
-Loss function:
-  L_mask = BCE(refined_mask, gt_mask) + Dice(refined_mask, gt_mask)
-  L_iou = MSE(iou_pred, iou_actual)
-  L_total = L_mask + L_iou
+    box = extract_box(coarse_mask)
+    # box: (B, 4) - [x1, y1, x2, y2]
 
-Validation comparison (displayed each epoch):
+    mask_input = prepare_mask(coarse_mask)
+    # mask_input: (B, 1, 256, 256) - logits
+
+  STEP 3: Prompt Encoding
+    sparse_embeddings, dense_embeddings = sam.prompt_encoder(
+        points=(point_coords, point_labels),
+        boxes=box,
+        masks=mask_input
+    )
+    # sparse_embeddings: (B, N_points+2, 256) - point/box embeddings
+    # dense_embeddings: (B, 256, 64, 64) - mask embedding
+
+  STEP 4: Mask Decoding
+    low_res_masks, iou_predictions = sam.mask_decoder(
+        image_embeddings=img_embedding,
+        image_pe=sam.prompt_encoder.get_dense_pe(),
+        sparse_prompt_embeddings=sparse_embeddings,
+        dense_prompt_embeddings=dense_embeddings,
+        multimask_output=True
+    )
+    # low_res_masks: (B, 3, 256, 256) - 3 candidate masks at low resolution
+    # iou_predictions: (B, 3) - predicted IoU for each mask
+
+  STEP 5: Mask Selection and Upsampling
+    # Select best mask based on predicted IoU
+    best_idx = iou_predictions.argmax(dim=1)
+    best_mask_low = low_res_masks[batch_idx, best_idx]
+    # best_mask_low: (B, 256, 256)
+
+    # Upsample to full resolution
+    refined_mask = F.interpolate(
+        best_mask_low.unsqueeze(1),
+        size=(1024, 1024),
+        mode='bilinear'
+    ).squeeze(1)
+    # refined_mask: (B, 1024, 1024) - logits
+
+    # Apply sigmoid for probability
+    refined_prob = torch.sigmoid(refined_mask)
+    # refined_prob: (B, 1024, 1024) - probability [0, 1]
+
+  OUTPUT:
+    masks_all: (B, 3, 1024, 1024)    - All 3 upsampled candidate masks
+    iou_predictions: (B, 3)          - IoU scores for each mask
+    refined_mask: (B, 1024, 1024)    - Best mask (highest IoU)
+
+2.6 Loss Function
+-----------------
+  # Ground truth also resized to 1024x1024
+  gt_mask_resized = resize(gt_mask, (1024, 1024))
+
+  # Mask loss (BCE + Dice for each of 3 candidate masks)
+  L_bce = BCE_with_logits(masks_all, gt_mask_resized)
+  L_dice = 1 - (2 * intersection + 1) / (union + 1)
+  L_mask = L_bce + L_dice
+
+  # IoU prediction loss
+  iou_actual = compute_iou(sigmoid(masks_all), gt_mask_resized)
+  L_iou = MSE(iou_predictions, iou_actual)
+
+  # Total loss
+  L_total = 1.0 * L_mask + 1.0 * L_iou
+
+2.7 Validation Metrics Comparison
+---------------------------------
+During validation, we compute metrics for both coarse and refined masks:
+
+  Coarse metrics: Compare TransUNet prediction vs Ground Truth
+  Refined metrics: Compare SAM output vs Ground Truth
+  Delta: Refined - Coarse (positive = improvement)
+
+Display format (each epoch):
   ┌────────────────────────────────────────────────────────────┐
-  │  Metric       Coarse    Refined      Delta                 │
-  │  Dice         0.7500    0.8200      +0.0700 ↑              │
-  │  IoU          0.6000    0.6900      +0.0900 ↑              │
-  │  Precision    0.7800    0.8100      +0.0300 ↑              │
-  │  Recall       0.7200    0.8300      +0.1100 ↑              │
+  │  [VALIDATION] Coarse (TransUNet) vs Refined (SAM)          │
+  │  ============================================================│
+  │  Metric       Coarse    Refined      Delta                  │
+  │  ------------------------------------------------------------│
+  │  Dice         0.7500    0.8200      +0.0700 ↑               │
+  │  IoU          0.6000    0.6900      +0.0900 ↑               │
+  │  Precision    0.7800    0.8100      +0.0300 ↑               │
+  │  Recall       0.7200    0.8300      +0.1100 ↑               │
+  │  Accuracy     0.9500    0.9650      +0.0150 ↑               │
+  │  ============================================================│
+  │  Average improvement: +0.0630 (SAM is helping!)             │
   └────────────────────────────────────────────────────────────┘
+
+TensorBoard logging:
+  - val_coarse/dice, val_coarse/iou, ...
+  - val_refined/dice, val_refined/iou, ...
+  - val_delta/dice, val_delta/iou, ...
 
 Output: checkpoints/sam_finetuned/fold_{k}/best.pth
 
