@@ -241,6 +241,16 @@ python scripts/finetune_sam_augmented.py \
     --change_penalty_weight 0.1 \
     --curriculum \
     --output_dir ./checkpoints/sam_finetuned
+
+# Resume training from checkpoint (if interrupted)
+python scripts/finetune_sam_augmented.py \
+    --data_root ./dataset/augmented \
+    --dataset BUS_BUSBRA_BUSI_BUS_UC_BUS_UCLM \
+    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
+    --epochs 50 \
+    --batch_size 4 \
+    --output_dir ./checkpoints/sam_finetuned \
+    --resume ./checkpoints/sam_finetuned/BUS_BUSBRA_BUSI_BUS_UC_BUS_UCLM/best.pth
 ```
 
 **Option B: Use Actual TransUNet Predictions (Alternative)**

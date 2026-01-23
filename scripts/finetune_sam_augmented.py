@@ -105,6 +105,8 @@ def get_args():
                         help='Validation interval (epochs)')
     parser.add_argument('--save_interval', type=int, default=5,
                         help='Checkpoint save interval (epochs)')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume from (e.g., best.pth or epoch_X.pth)')
 
     return parser.parse_args()
 
@@ -503,10 +505,27 @@ def main():
     optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
-    # Training loop
+    # Resume from checkpoint if specified
+    start_epoch = 1
     best_dice = 0.0
 
-    for epoch in range(1, args.epochs + 1):
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print(f'Loading checkpoint from {args.resume}')
+            checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+            model.load_state_dict(checkpoint['model'])
+            if 'optimizer' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+            if 'scheduler' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler'])
+            start_epoch = checkpoint.get('epoch', 0) + 1
+            best_dice = checkpoint.get('best_dice', 0.0)
+            print(f'Resumed from epoch {start_epoch - 1}, best_dice: {best_dice:.4f}')
+        else:
+            print(f'Warning: checkpoint not found at {args.resume}, starting from scratch')
+
+    # Training loop
+    for epoch in range(start_epoch, args.epochs + 1):
         print(f'\n{"="*60}')
         print(f'Epoch {epoch}/{args.epochs}')
         print(f'{"="*60}')
