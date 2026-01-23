@@ -402,12 +402,28 @@ Samples:    Train: 409 | Val: 103
 ## Requirements
 
 - Python >= 3.8
-- PyTorch >= 1.10
+- PyTorch >= 1.10 (tested up to 2.6)
 - CUDA >= 11.0 (recommended)
 
 ```bash
 pip install -r requirements.txt
 ```
+
+## Troubleshooting
+
+### PyTorch 2.6+ Checkpoint Loading
+
+PyTorch 2.6 changed the default value of `weights_only` from `False` to `True` in `torch.load()`. This project handles this automatically, but if you encounter errors like:
+
+```
+_pickle.UnpicklingError: Weights only load failed...
+```
+
+Ensure you're using the latest version of the scripts, which include `weights_only=False` for all checkpoint loading.
+
+### Image Size Mismatch During Training
+
+If you see errors about tensor size mismatch (e.g., `[224, 224]` vs `[224, 225]`), this was caused by floating-point precision issues in image resizing. The latest version uses `cv2.resize()` which produces exact dimensions.
 
 ## Citation
 
