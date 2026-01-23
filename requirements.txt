@@ -14,3 +14,5 @@ Pillow
 FastGeodis
 matplotlib
 einops
+# SAM - install via: pip install git+https://github.com/facebookresearch/segment-anything.git
+# Or for MedSAM: pip install git+https://github.com/bowang-lab/MedSAM.git
