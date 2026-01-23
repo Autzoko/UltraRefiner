@@ -94,8 +94,9 @@ UltraRefiner implements a three-phase training pipeline:
 ║  └─────────────────┘                                                        ║
 ║         │                                                                    ║
 ║         ▼                                                                    ║
-║  ┌─────────────────┐                                                        ║
-║  │   Checkpoints   │   ./checkpoints/sam_finetuned/fold_{i}/best.pth        ║
+║  ┌─────────────────┐   ./checkpoints/sam_finetuned/{dataset}/               ║
+║  │   Checkpoints   │   ├── best.pth      (full refiner, for resume)        ║
+║  │                 │   └── best_sam.pth  (SAM weights, for Phase 3)        ║
 ║  └─────────────────┘                                                        ║
 ║                                                                               ║
 ║                              │                                                ║
@@ -266,11 +267,13 @@ python scripts/finetune_sam_with_preds.py \
 
 ### 4. Phase 3: End-to-End Training
 
+**Important**: Use `best_sam.pth` (not `best.pth`) from Phase 2. The `best_sam.pth` contains SAM weights in the correct format for loading.
+
 ```bash
 python scripts/train_e2e.py \
     --data_root ./dataset/processed \
     --transunet_checkpoint ./checkpoints/transunet/combined/fold_0/best.pth \
-    --sam_checkpoint ./checkpoints/sam_finetuned/best.pth \
+    --sam_checkpoint ./checkpoints/sam_finetuned/{dataset}/best_sam.pth \
     --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
     --fold 0 \
     --max_epochs 100 \
@@ -278,6 +281,12 @@ python scripts/train_e2e.py \
     --transunet_lr 1e-4 \
     --sam_lr 1e-5
 ```
+
+**Checkpoint Format Note:**
+- Phase 2 saves two checkpoint files:
+  - `best.pth`: Full SAMRefiner state (for resuming training)
+  - `best_sam.pth`: SAM-only weights (for Phase 3 loading)
+- Phase 3 expects the SAM-native format, so always use `best_sam.pth`
 
 ## Project Structure
 

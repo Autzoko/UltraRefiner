@@ -104,6 +104,18 @@ def _build_sam(
         # Handle MedSAM checkpoint format
         if 'model' in state_dict:
             state_dict = state_dict['model']
+
+        # Handle DifferentiableSAMRefiner checkpoint format (has "sam." prefix)
+        # This can happen if user accidentally passes the refiner checkpoint
+        # instead of the SAM-specific checkpoint
+        if any(k.startswith('sam.') for k in state_dict.keys()):
+            print("Detected SAMRefiner checkpoint format, stripping 'sam.' prefix...")
+            state_dict = {
+                k.replace('sam.', '', 1): v
+                for k, v in state_dict.items()
+                if k.startswith('sam.')
+            }
+
         sam.load_state_dict(state_dict, strict=False)
         print(f"Loaded checkpoint from {checkpoint}")
 

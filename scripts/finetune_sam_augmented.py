@@ -553,6 +553,7 @@ def main():
 
             # Save best checkpoint
             if is_best:
+                # Save full refiner state for potential resume
                 checkpoint = {
                     'epoch': epoch,
                     'model': model.state_dict(),
@@ -562,6 +563,13 @@ def main():
                     'args': vars(args),
                 }
                 torch.save(checkpoint, os.path.join(output_dir, 'best.pth'))
+
+                # IMPORTANT: Also save SAM-compatible checkpoint for Phase 3
+                # Phase 3 loads via sam_model_registry which expects SAM's native format
+                sam_checkpoint = {
+                    'model': model.sam.state_dict(),  # SAM state dict without "sam." prefix
+                }
+                torch.save(sam_checkpoint, os.path.join(output_dir, 'best_sam.pth'))
                 print(f'Saved best checkpoint with Dice: {best_dice:.4f}')
 
         # Save periodic checkpoint
@@ -573,6 +581,10 @@ def main():
                 'scheduler': scheduler.state_dict(),
             }
             torch.save(checkpoint, os.path.join(output_dir, f'epoch_{epoch}.pth'))
+
+            # Also save SAM-compatible checkpoint
+            sam_checkpoint = {'model': model.sam.state_dict()}
+            torch.save(sam_checkpoint, os.path.join(output_dir, f'epoch_{epoch}_sam.pth'))
 
         scheduler.step()
 
