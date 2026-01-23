@@ -277,19 +277,61 @@ python scripts/finetune_sam_with_preds.py \
 
 ### 4. Phase 3: End-to-End Training
 
-**Important**: Use `best_sam.pth` (not `best.pth`) from Phase 2. The `best_sam.pth` contains SAM weights in the correct format for loading.
+Since TransUNet is trained per-dataset in Phase 1, E2E training should also be per-dataset.
+
+**Option A: Skip Phase 2 (Direct E2E with Original SAM)**
+
+Use original MedSAM/SAM checkpoint directly without Phase 2 finetuning:
 
 ```bash
+# Single dataset, single fold
 python scripts/train_e2e.py \
     --data_root ./dataset/processed \
-    --transunet_checkpoint ./checkpoints/transunet/combined/fold_0/best.pth \
-    --sam_checkpoint ./checkpoints/sam_finetuned/{dataset}/best_sam.pth \
-    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
+    --datasets BUSI \
     --fold 0 \
+    --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
+    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
+    --output_dir ./checkpoints/ultra_refiner/BUSI \
     --max_epochs 100 \
     --batch_size 8 \
     --transunet_lr 1e-4 \
     --sam_lr 1e-5
+
+# Or use sbatch for cluster (single job)
+sbatch sbatch/sbatch_phase3_e2e_single.sh BUSI 0
+
+# Submit all 25 jobs (5 datasets × 5 folds)
+bash sbatch/sbatch_phase3_e2e_all.sh
+```
+
+**Option B: With Phase 2 Finetuned SAM**
+
+Use `best_sam.pth` from Phase 2 (contains SAM weights in correct format):
+
+```bash
+python scripts/train_e2e.py \
+    --data_root ./dataset/processed \
+    --datasets BUSI \
+    --fold 0 \
+    --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
+    --sam_checkpoint ./checkpoints/sam_finetuned/{dataset}/best_sam.pth \
+    --output_dir ./checkpoints/ultra_refiner/BUSI \
+    --max_epochs 100 \
+    --batch_size 8 \
+    --transunet_lr 1e-4 \
+    --sam_lr 1e-5
+```
+
+**Per-Dataset Training Structure:**
+```
+Phase 1 TransUNet              →    Phase 3 UltraRefiner
+───────────────────────             ─────────────────────
+transunet/BUSI/fold_0/best.pth  →  ultra_refiner/BUSI/fold_0/best.pth
+transunet/BUSI/fold_1/best.pth  →  ultra_refiner/BUSI/fold_1/best.pth
+...
+transunet/BUSBRA/fold_0/best.pth → ultra_refiner/BUSBRA/fold_0/best.pth
+...
+(5 datasets × 5 folds = 25 models)
 ```
 
 **Checkpoint Format Note:**
