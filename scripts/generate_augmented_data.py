@@ -90,6 +90,9 @@ from skimage import morphology
 import json
 from collections import defaultdict
 import shutil
+from multiprocessing import Pool, cpu_count
+from functools import partial
+import time
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1249,13 +1252,93 @@ class SegmentationFailureSimulator:
             return mask
 
 
+def process_single_augmentation(task, use_sdf=False):
+    """
+    Worker function to process a single augmentation task.
+
+    Args:
+        task: tuple of (task_idx, dataset_name, name, image_path, mask_path,
+                       dice_range, level, aug_seed, out_dirs)
+        use_sdf: Whether to use SDF-based augmentation
+
+    Returns:
+        dict with result info or None if skipped
+    """
+    (task_idx, dataset_name, name, image_path, mask_path,
+     dice_range, level, aug_seed, out_dirs) = task
+
+    out_image_dir, out_mask_dir, out_coarse_dir = out_dirs
+
+    # Create output filename
+    out_name = f"{dataset_name}_{name}_aug{task_idx:06d}_{level}"
+
+    # Check if already exists (for resume)
+    out_coarse_path = os.path.join(out_coarse_dir, f"{out_name}.png")
+    if os.path.exists(out_coarse_path):
+        return None  # Skip, already processed
+
+    # Initialize simulator (each worker needs its own instance)
+    if use_sdf:
+        from sdf_augmentation import SDFSegmentationFailureSimulator
+        simulator = SDFSegmentationFailureSimulator(seed=aug_seed)
+    else:
+        simulator = SegmentationFailureSimulator(seed=aug_seed)
+
+    # Load data
+    if image_path.endswith('.npy'):
+        image = np.load(image_path)
+    else:
+        image = np.array(Image.open(image_path))
+
+    if mask_path.endswith('.npy'):
+        gt_mask = np.load(mask_path)
+    else:
+        gt_mask = np.array(Image.open(mask_path).convert('L'))
+
+    # Normalize mask to [0, 1]
+    if gt_mask.max() > 1:
+        gt_mask = gt_mask.astype(np.float32) / 255.0
+    else:
+        gt_mask = gt_mask.astype(np.float32)
+
+    # Generate augmented mask
+    coarse_mask, actual_dice, aug_info = simulator.compose_augmentations(
+        gt_mask, dice_range, max_attempts=15
+    )
+
+    # Save image (copy original)
+    if image_path.endswith('.npy'):
+        np.save(os.path.join(out_image_dir, f"{out_name}.npy"), image)
+    else:
+        Image.fromarray(image).save(os.path.join(out_image_dir, f"{out_name}.png"))
+
+    # Save ground truth mask
+    gt_save = (gt_mask * 255).astype(np.uint8)
+    Image.fromarray(gt_save).save(os.path.join(out_mask_dir, f"{out_name}.png"))
+
+    # Save coarse mask
+    coarse_save = (coarse_mask * 255).astype(np.uint8)
+    Image.fromarray(coarse_save).save(os.path.join(out_coarse_dir, f"{out_name}.png"))
+
+    return {
+        'name': out_name,
+        'original': name,
+        'source_dataset': dataset_name,
+        'dice': float(actual_dice),
+        'augmentations': aug_info,
+        'level': level
+    }
+
+
 def generate_augmented_dataset(
     data_root: str,
     output_dir: str,
     datasets: list,
     target_samples: int = 100000,
     seed: int = 42,
-    use_sdf: bool = False
+    use_sdf: bool = False,
+    num_workers: int = None,
+    resume: bool = True
 ):
     """
     Generate augmented dataset with controlled Dice distribution.
@@ -1267,19 +1350,19 @@ def generate_augmented_dataset(
         target_samples: Target number of total samples
         seed: Random seed
         use_sdf: If True, use SDF-based augmentation (smoother deformations)
+        num_workers: Number of parallel workers (default: CPU count)
+        resume: If True, skip already generated samples (default: True)
     """
-    # Set random seeds
+    # Set number of workers
+    if num_workers is None:
+        num_workers = max(1, cpu_count() - 1)  # Leave one core free
+
+    print(f"Using {num_workers} parallel workers")
+    print(f"Augmentation backend: {'SDF-based' if use_sdf else 'Pixel-level'}")
+
+    # Set random seeds for reproducibility
     random.seed(seed)
     np.random.seed(seed)
-
-    # Initialize simulator based on backend choice
-    if use_sdf:
-        from sdf_augmentation import SDFSegmentationFailureSimulator
-        simulator = SDFSegmentationFailureSimulator(seed=seed)
-        print("Using SDF-based augmentation (smooth, anatomically plausible)")
-    else:
-        simulator = SegmentationFailureSimulator(seed=seed)
-        print("Using pixel-level augmentation")
 
     # Collect all samples from all datasets
     all_samples = []  # List of (dataset_name, image_file, image_path, mask_path)
@@ -1360,42 +1443,14 @@ def generate_augmented_dataset(
     os.makedirs(out_mask_dir, exist_ok=True)
     os.makedirs(out_coarse_dir, exist_ok=True)
 
-    # Statistics tracking
-    dice_scores = []
-    dice_distribution = {'perfect': 0, 'high': 0, 'medium': 0, 'low': 0}
-    augmentation_stats = defaultdict(int)
-
-    # Metadata
-    metadata = {
-        'datasets': datasets,
-        'original_samples': num_original,
-        'target_samples': target_samples,
-        'seed': seed,
-        'samples': []
-    }
-
-    # Process each original sample from combined pool
+    # Build list of all tasks
+    print("\nBuilding task list...")
+    all_tasks = []
+    out_dirs = (out_image_dir, out_mask_dir, out_coarse_dir)
     sample_idx = 0
 
-    for file_idx, (dataset_name, image_file, image_path, mask_path) in enumerate(tqdm(all_samples, desc='Processing samples')):
+    for file_idx, (dataset_name, image_file, image_path, mask_path) in enumerate(all_samples):
         name = os.path.splitext(image_file)[0]
-
-        # Load data
-        if image_path.endswith('.npy'):
-            image = np.load(image_path)
-        else:
-            image = np.array(Image.open(image_path))
-
-        if mask_path.endswith('.npy'):
-            gt_mask = np.load(mask_path)
-        else:
-            gt_mask = np.array(Image.open(mask_path).convert('L'))
-
-        # Normalize mask to [0, 1]
-        if gt_mask.max() > 1:
-            gt_mask = gt_mask.astype(np.float32) / 255.0
-        else:
-            gt_mask = gt_mask.astype(np.float32)
 
         # Determine augmentation counts for this sample
         extra = 1 if file_idx < remainder else 0
@@ -1408,89 +1463,117 @@ def generate_augmented_dataset(
         low_n = total_augs - perfect_n - high_n - medium_n
 
         # Generate augmentations for each Dice range
-        # NOTE: 'perfect' means unmodified GT mask (Dice = 1.0)
         augmentation_configs = [
-            ('perfect', perfect_n, 'perfect'),      # Perfect masks - no modification
-            ((0.90, 1.00), high_n, 'high'),         # Minor artifacts
-            ((0.80, 0.90), medium_n, 'medium'),     # Moderate errors
-            ((0.60, 0.80), low_n, 'low'),           # Severe failures
+            ('perfect', perfect_n, 'perfect'),
+            ((0.90, 1.00), high_n, 'high'),
+            ((0.80, 0.90), medium_n, 'medium'),
+            ((0.60, 0.80), low_n, 'low'),
         ]
 
         for dice_range, count, level in augmentation_configs:
             for aug_idx in range(count):
-                # Set unique seed for reproducibility
                 aug_seed = seed + sample_idx * 1000 + aug_idx
-                simulator.set_seed(aug_seed)
-
-                # Generate augmented mask
-                coarse_mask, actual_dice, aug_info = simulator.compose_augmentations(
-                    gt_mask, dice_range, max_attempts=15
-                )
-
-                # Create output filename (include dataset name to avoid collisions)
-                out_name = f"{dataset_name}_{name}_aug{sample_idx:06d}_{level}"
-
-                # Save image (copy original)
-                if image_path.endswith('.npy'):
-                    np.save(os.path.join(out_image_dir, f"{out_name}.npy"), image)
-                else:
-                    Image.fromarray(image).save(os.path.join(out_image_dir, f"{out_name}.png"))
-
-                # Save ground truth mask
-                gt_save = (gt_mask * 255).astype(np.uint8)
-                Image.fromarray(gt_save).save(os.path.join(out_mask_dir, f"{out_name}.png"))
-
-                # Save coarse mask
-                coarse_save = (coarse_mask * 255).astype(np.uint8)
-                Image.fromarray(coarse_save).save(os.path.join(out_coarse_dir, f"{out_name}.png"))
-
-                # Track statistics
-                dice_scores.append(actual_dice)
-
-                if actual_dice >= 0.99:
-                    dice_distribution['perfect'] += 1
-                elif actual_dice >= 0.9:
-                    dice_distribution['high'] += 1
-                elif actual_dice >= 0.8:
-                    dice_distribution['medium'] += 1
-                else:
-                    dice_distribution['low'] += 1
-
-                for aug in aug_info:
-                    aug_name = aug.split('(')[0]
-                    augmentation_stats[aug_name] += 1
-
-                # Record metadata
-                metadata['samples'].append({
-                    'name': out_name,
-                    'original': name,
-                    'source_dataset': dataset_name,
-                    'dice': float(actual_dice),
-                    'augmentations': aug_info,
-                    'level': level
-                })
-
+                task = (sample_idx, dataset_name, name, image_path, mask_path,
+                       dice_range, level, aug_seed, out_dirs)
+                all_tasks.append(task)
                 sample_idx += 1
+
+    total_tasks = len(all_tasks)
+    print(f"Total tasks to process: {total_tasks}")
+
+    # Check for existing files (resume capability)
+    if resume:
+        existing_count = 0
+        tasks_to_process = []
+        for task in all_tasks:
+            task_idx, dataset_name, name, _, _, _, level, _, _ = task
+            out_name = f"{dataset_name}_{name}_aug{task_idx:06d}_{level}"
+            out_coarse_path = os.path.join(out_coarse_dir, f"{out_name}.png")
+            if os.path.exists(out_coarse_path):
+                existing_count += 1
+            else:
+                tasks_to_process.append(task)
+
+        if existing_count > 0:
+            print(f"Resume mode: Found {existing_count} existing samples, skipping them")
+            print(f"Remaining tasks: {len(tasks_to_process)}")
+        all_tasks = tasks_to_process
+
+    if len(all_tasks) == 0:
+        print("All samples already generated. Nothing to do.")
+        return
+
+    # Process tasks in parallel
+    print(f"\nProcessing {len(all_tasks)} augmentation tasks with {num_workers} workers...")
+    start_time = time.time()
+
+    # Use multiprocessing Pool
+    worker_fn = partial(process_single_augmentation, use_sdf=use_sdf)
+
+    results = []
+    with Pool(num_workers) as pool:
+        # Use imap_unordered for better progress tracking
+        for result in tqdm(pool.imap_unordered(worker_fn, all_tasks, chunksize=10),
+                          total=len(all_tasks), desc='Generating augmentations'):
+            if result is not None:
+                results.append(result)
+
+    elapsed_time = time.time() - start_time
+    print(f"\nProcessing completed in {elapsed_time:.1f} seconds")
+    print(f"Speed: {len(results) / elapsed_time:.1f} samples/second")
+
+    # Compute statistics from results
+    dice_scores = [r['dice'] for r in results]
+    dice_distribution = {'perfect': 0, 'high': 0, 'medium': 0, 'low': 0}
+    augmentation_stats = defaultdict(int)
+
+    for r in results:
+        actual_dice = r['dice']
+        if actual_dice >= 0.99:
+            dice_distribution['perfect'] += 1
+        elif actual_dice >= 0.9:
+            dice_distribution['high'] += 1
+        elif actual_dice >= 0.8:
+            dice_distribution['medium'] += 1
+        else:
+            dice_distribution['low'] += 1
+
+        for aug in r['augmentations']:
+            aug_name = aug.split('(')[0]
+            augmentation_stats[aug_name] += 1
+
+    # Metadata
+    metadata = {
+        'datasets': datasets,
+        'original_samples': num_original,
+        'target_samples': target_samples,
+        'seed': seed,
+        'samples': results
+    }
 
     # Print statistics
     print(f"\n{'='*60}")
     print("AUGMENTATION SUMMARY")
     print(f"{'='*60}")
 
-    print(f"\nTotal samples generated: {sample_idx}")
+    print(f"\nTotal samples generated: {len(results)}")
 
     print(f"\nDice Score Distribution:")
     total = sum(dice_distribution.values())
-    print(f"  Perfect (1.0):    {dice_distribution['perfect']:6d} ({100*dice_distribution['perfect']/total:.1f}%) <- preservation learning")
-    print(f"  High (0.9-1.0):   {dice_distribution['high']:6d} ({100*dice_distribution['high']/total:.1f}%)")
-    print(f"  Medium (0.8-0.9): {dice_distribution['medium']:6d} ({100*dice_distribution['medium']/total:.1f}%)")
-    print(f"  Low (0.6-0.8):    {dice_distribution['low']:6d} ({100*dice_distribution['low']/total:.1f}%)")
+    if total > 0:
+        print(f"  Perfect (1.0):    {dice_distribution['perfect']:6d} ({100*dice_distribution['perfect']/total:.1f}%) <- preservation learning")
+        print(f"  High (0.9-1.0):   {dice_distribution['high']:6d} ({100*dice_distribution['high']/total:.1f}%)")
+        print(f"  Medium (0.8-0.9): {dice_distribution['medium']:6d} ({100*dice_distribution['medium']/total:.1f}%)")
+        print(f"  Low (0.6-0.8):    {dice_distribution['low']:6d} ({100*dice_distribution['low']/total:.1f}%)")
+    else:
+        print("  No samples generated")
 
-    print(f"\nDice Score Statistics:")
-    print(f"  Mean: {np.mean(dice_scores):.4f}")
-    print(f"  Std:  {np.std(dice_scores):.4f}")
-    print(f"  Min:  {np.min(dice_scores):.4f}")
-    print(f"  Max:  {np.max(dice_scores):.4f}")
+    if len(dice_scores) > 0:
+        print(f"\nDice Score Statistics:")
+        print(f"  Mean: {np.mean(dice_scores):.4f}")
+        print(f"  Std:  {np.std(dice_scores):.4f}")
+        print(f"  Min:  {np.min(dice_scores):.4f}")
+        print(f"  Max:  {np.max(dice_scores):.4f}")
 
     print(f"\nAugmentation Type Usage:")
     for aug_name, count in sorted(augmentation_stats.items(), key=lambda x: -x[1]):
@@ -1498,10 +1581,10 @@ def generate_augmented_dataset(
 
     # Save metadata
     metadata['statistics'] = {
-        'total_samples': sample_idx,
+        'total_samples': len(results),
         'dice_distribution': dice_distribution,
-        'dice_mean': float(np.mean(dice_scores)),
-        'dice_std': float(np.std(dice_scores)),
+        'dice_mean': float(np.mean(dice_scores)) if dice_scores else 0.0,
+        'dice_std': float(np.std(dice_scores)) if dice_scores else 0.0,
         'augmentation_stats': dict(augmentation_stats)
     }
 
@@ -1528,6 +1611,10 @@ def main():
                         help='Random seed')
     parser.add_argument('--use_sdf', action='store_true',
                         help='Use SDF-based augmentation (smoother, more anatomically plausible)')
+    parser.add_argument('--num_workers', type=int, default=None,
+                        help='Number of parallel workers (default: CPU count - 1)')
+    parser.add_argument('--no_resume', action='store_true',
+                        help='Disable resume mode (regenerate all samples)')
 
     args = parser.parse_args()
 
@@ -1535,6 +1622,7 @@ def main():
     print(f"Target samples: {args.target_samples}")
     print(f"Output directory: {args.output_dir}")
     print(f"Augmentation backend: {'SDF-based' if args.use_sdf else 'Pixel-level'}")
+    print(f"Resume mode: {'Disabled' if args.no_resume else 'Enabled'}")
 
     generate_augmented_dataset(
         data_root=args.data_root,
@@ -1542,7 +1630,9 @@ def main():
         datasets=args.datasets,
         target_samples=args.target_samples,
         seed=args.seed,
-        use_sdf=args.use_sdf
+        use_sdf=args.use_sdf,
+        num_workers=args.num_workers,
+        resume=not args.no_resume
     )
 
 
