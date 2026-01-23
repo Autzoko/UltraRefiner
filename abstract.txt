@@ -1,0 +1,29 @@
+UltraRefiner: End-to-End Differentiable Segmentation Refinement for Medical Image Analysis
+
+Abstract
+
+We present UltraRefiner, a novel end-to-end differentiable framework that unifies coarse segmentation and mask refinement into a single jointly optimizable pipeline. Unlike existing two-stage approaches that treat segmentation and refinement as independent processes, UltraRefiner enables gradient flow from the refinement network back to the segmentation backbone, allowing both components to co-adapt during training. Our framework combines TransUNet, a hybrid CNN-Transformer encoder-decoder architecture, with a differentiable adaptation of the Segment Anything Model (SAM) for mask refinement.
+
+The key technical contribution of this work is our differentiable prompt generation mechanism, which bridges the gap between the coarse segmentation output and SAM's prompt-based refinement interface. Specifically, we introduce: (1) soft-argmax point extraction that computes differentiable centroid coordinates from probability maps as weighted spatial expectations, enabling gradient propagation through discrete point sampling; (2) differentiable bounding box estimation that derives box coordinates directly from soft mask statistics without hard thresholding; and (3) continuous mask prompt encoding that preserves the full probability distribution rather than binary discretization. These innovations transform SAM's traditionally non-differentiable prompt interface into a fully differentiable module, enabling true end-to-end optimization.
+
+We propose a three-phase training strategy with rigorous K-fold cross-validation:
+
+Phase 1 - TransUNet Pre-training: We train TransUNet independently on each dataset using 5-fold cross-validation within the training set. Each fold produces a specialized checkpoint that achieves robust coarse segmentation. After training, we inference each fold's validation set using its corresponding checkpoint, generating predictions that cover the entire training set with original filenames preserved for seamless data pairing.
+
+Phase 2 - SAM Fine-tuning: We fine-tune SAM's prompt encoder and mask decoder using the actual TransUNet predictions as coarse mask inputs, rather than simulated masks from ground truth. This approach exposes SAM to realistic coarse mask characteristics including typical error patterns, boundary imprecision, and noise distributions that it will encounter during end-to-end training. During validation, we display side-by-side comparison of coarse (TransUNet) versus refined (SAM) metrics with delta indicators, enabling direct observation of refinement improvement. We also support Low-Rank Adaptation (LoRA) for parameter-efficient fine-tuning of SAM's image encoder, adding only ~0.3% additional parameters while enabling domain adaptation for medical ultrasound images.
+
+Phase 3 - End-to-End Joint Optimization: We jointly optimize both TransUNet and SAM, where gradients from the refinement loss propagate through the differentiable prompt generator to update the segmentation backbone. The total loss combines coarse segmentation loss (L_coarse) and refined mask loss (L_refined) with learned weighting, allowing the framework to balance direct supervision with refinement-guided learning.
+
+Our architecture maintains SAM's powerful pre-trained image encoder frozen (or adapts it efficiently via LoRA) while fine-tuning the prompt encoder and mask decoder, achieving parameter efficiency while leveraging large-scale pre-training. The differentiable prompt generator extracts multi-modal prompts (points, boxes, and masks) from TransUNet's soft predictions, which are then processed by SAM to produce refined segmentation masks. Crucially, the entire forward pass remains differentiable, enabling the refined mask loss to directly influence the coarse segmentation network's parameters.
+
+We evaluate UltraRefiner on breast ultrasound segmentation across five diverse datasets (BUSI, BUSBRA, BUS, BUS_UC, BUS_UCLM) with a total of over 4,000 samples. Our evaluation protocol uses K-fold cross-validation within each dataset's training set, with a held-out test set for final evaluation. We demonstrate that end-to-end training consistently outperforms the cascaded baseline where components are trained independently. The joint optimization allows TransUNet to learn features that are not only discriminative for segmentation but also conducive to effective refinement, while SAM adapts its refinement behavior to complement the specific error patterns of the upstream segmentation network.
+
+Implementation Highlights:
+- Unified data pipeline supporting multiple breast ultrasound datasets with automatic blank mask filtering
+- K-fold cross-validation with deterministic splits for reproducibility
+- Prediction-based SAM training using actual TransUNet outputs paired by filename matching
+- Real-time validation metrics comparing coarse vs refined performance with improvement indicators
+- LoRA integration for parameter-efficient adaptation of SAM's frozen image encoder
+- Comprehensive logging with TensorBoard support for coarse/refined/delta metric tracking
+
+Our work establishes a new paradigm for integrating foundation models into task-specific pipelines through differentiable interfaces, with broad applicability beyond medical image segmentation to any domain requiring coarse-to-fine prediction refinement.
