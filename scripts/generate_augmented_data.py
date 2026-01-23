@@ -1257,20 +1257,24 @@ def process_single_augmentation(task, use_sdf=False):
     Worker function to process a single augmentation task.
 
     Args:
-        task: tuple of (task_idx, dataset_name, name, image_path, mask_path,
+        task: tuple of (file_idx, within_level_idx, dataset_name, name, image_path, mask_path,
                        dice_range, level, aug_seed, out_dirs)
         use_sdf: Whether to use SDF-based augmentation
 
     Returns:
         dict with result info or None if skipped
     """
-    (task_idx, dataset_name, name, image_path, mask_path,
+    (file_idx, within_level_idx, dataset_name, name, image_path, mask_path,
      dice_range, level, aug_seed, out_dirs) = task
 
     out_image_dir, out_mask_dir, out_coarse_dir = out_dirs
 
-    # Create output filename
-    out_name = f"{dataset_name}_{name}_aug{task_idx:06d}_{level}"
+    # Create stable output filename: {dataset}_{name}_{level}_{idx}
+    # This naming is independent of global ordering and only depends on:
+    # - Original sample identity (dataset + name)
+    # - Augmentation level (perfect/high/medium/low)
+    # - Index within that level for this sample
+    out_name = f"{dataset_name}_{name}_{level}_{within_level_idx:04d}"
 
     # Check if already exists (for resume)
     out_coarse_path = os.path.join(out_coarse_dir, f"{out_name}.png")
@@ -1471,9 +1475,12 @@ def generate_augmented_dataset(
         ]
 
         for dice_range, count, level in augmentation_configs:
-            for aug_idx in range(count):
-                aug_seed = seed + sample_idx * 1000 + aug_idx
-                task = (sample_idx, dataset_name, name, image_path, mask_path,
+            for within_level_idx in range(count):
+                # Use file_idx and within_level_idx for stable seed (independent of global order)
+                aug_seed = seed + file_idx * 10000 + hash(level) % 1000 + within_level_idx
+                # Use per-sample naming: {dataset}_{name}_{level}_{idx}
+                # This is stable and doesn't depend on global sample ordering
+                task = (file_idx, within_level_idx, dataset_name, name, image_path, mask_path,
                        dice_range, level, aug_seed, out_dirs)
                 all_tasks.append(task)
                 sample_idx += 1
@@ -1486,8 +1493,9 @@ def generate_augmented_dataset(
         existing_count = 0
         tasks_to_process = []
         for task in all_tasks:
-            task_idx, dataset_name, name, _, _, _, level, _, _ = task
-            out_name = f"{dataset_name}_{name}_aug{task_idx:06d}_{level}"
+            file_idx, within_level_idx, dataset_name, name, _, _, _, level, _, _ = task
+            # Stable naming: uses original sample name + level + index within that level
+            out_name = f"{dataset_name}_{name}_{level}_{within_level_idx:04d}"
             out_coarse_path = os.path.join(out_coarse_dir, f"{out_name}.png")
             if os.path.exists(out_coarse_path):
                 existing_count += 1
