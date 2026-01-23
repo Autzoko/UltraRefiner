@@ -87,7 +87,7 @@ def load_model(checkpoint_path, config, img_size, num_classes, device):
         num_classes=num_classes
     ).to(device)
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model'])
     model.eval()
 

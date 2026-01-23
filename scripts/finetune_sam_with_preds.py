@@ -483,7 +483,7 @@ def main():
     best_dice = 0.0
     best_epoch = 0
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location=device)
+        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
         sam.load_state_dict(checkpoint['sam_model'])
         sam_refiner.load_state_dict(checkpoint['sam_refiner'])
         optimizer.load_state_dict(checkpoint['optimizer'])

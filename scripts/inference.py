@@ -184,7 +184,7 @@ def main():
             return
 
         # Load checkpoint to get config
-        checkpoint = torch.load(args.model_checkpoint, map_location=device)
+        checkpoint = torch.load(args.model_checkpoint, map_location=device, weights_only=False)
         config = checkpoint.get('config', {})
 
         model = build_ultra_refiner(
@@ -215,7 +215,7 @@ def main():
             num_classes=args.num_classes
         ).to(device)
 
-        checkpoint = torch.load(args.transunet_checkpoint, map_location=device)
+        checkpoint = torch.load(args.transunet_checkpoint, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model'])
         print(f'Loaded TransUNet from {args.transunet_checkpoint}')
 
