@@ -74,8 +74,8 @@ def get_args():
                         help='Batch size')
     parser.add_argument('--max_epochs', type=int, default=100,
                         help='Maximum number of epochs')
-    parser.add_argument('--transunet_lr', type=float, default=1e-4,
-                        help='Learning rate for TransUNet')
+    parser.add_argument('--transunet_lr', type=float, default=1e-5,
+                        help='Learning rate for TransUNet (use low value to prevent destabilization)')
     parser.add_argument('--sam_lr', type=float, default=1e-5,
                         help='Learning rate for SAM components')
     parser.add_argument('--weight_decay', type=float, default=0.01,
@@ -84,9 +84,9 @@ def get_args():
                         help='Number of data loading workers')
 
     # Loss weights
-    parser.add_argument('--coarse_loss_weight', type=float, default=0.3,
-                        help='Weight for coarse mask loss')
-    parser.add_argument('--refined_loss_weight', type=float, default=0.7,
+    parser.add_argument('--coarse_loss_weight', type=float, default=0.5,
+                        help='Weight for coarse mask loss (higher = more stable TransUNet)')
+    parser.add_argument('--refined_loss_weight', type=float, default=0.5,
                         help='Weight for refined mask loss')
 
     # SAM freezing options
@@ -110,6 +110,8 @@ def get_args():
                         help='Path to checkpoint to resume from')
     parser.add_argument('--gradient_accumulation', type=int, default=1,
                         help='Gradient accumulation steps')
+    parser.add_argument('--grad_clip', type=float, default=1.0,
+                        help='Gradient clipping max norm (0 to disable)')
 
     return parser.parse_args()
 
@@ -210,6 +212,9 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, writ
 
         # Gradient accumulation
         if (batch_idx + 1) % args.gradient_accumulation == 0:
+            # Gradient clipping to prevent TransUNet destabilization
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
             optimizer.zero_grad()
 
