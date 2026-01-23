@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=192G
-#SBATCH --time=95:00:00
+#SBATCH --time=90:00:00
 
 # Print job information
 echo "Job ID: $SLURM_JOB_ID"
@@ -48,11 +48,11 @@ echo ""
 # Configuration - modify these as needed
 DATA_ROOT="./dataset/augmented"
 DATASET="BUS_BUSBRA_BUSI_BUS_UC_BUS_UCLM"  # Combined dataset folder name
-SAM_CHECKPOINT="./pretrained/medsam_vit_b.pth"
+SAM_CHECKPOINT="./pretrained/sam_vit_b_01ec64.pth"
 SAM_MODEL_TYPE="vit_b"
-OUTPUT_DIR="./checkpoints/sam_finetuned"
+OUTPUT_DIR="./checkpoints/sam_finetuned_sbatch"
 EPOCHS=50
-BATCH_SIZE=4
+BATCH_SIZE=8
 LR=1e-4
 CHANGE_PENALTY_WEIGHT=0.1
 NUM_WORKERS=8
