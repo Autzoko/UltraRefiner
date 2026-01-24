@@ -6,35 +6,38 @@ from the SAM refinement back to TransUNet. Both models are jointly optimized.
 
 Uses K-fold cross-validation within the training set for validation.
 
-IMPORTANT: Phase 2 -> Phase 3 Compatibility
-============================================
-For the finetuned SAM from Phase 2 to work correctly in Phase 3, the input
-distribution must match:
+IMPORTANT: Mask Prompt Style Selection
+======================================
+The mask_prompt_style parameter is CRITICAL for SAM performance:
 
-1. Phase 2 should be trained with --soft_masks augmented data (soft probability
-   maps matching TransUNet's output distribution)
-2. Phase 2 should use --mask_prompt_style direct (default)
-3. Phase 3 should use --mask_prompt_style direct (default) to match
+**gaussian (DEFAULT, recommended for unfinetuned SAM)**
+- Applies Gaussian blur to soft masks before passing to SAM
+- Creates softer, more natural boundaries that match SAM's training distribution
+- As shown in SAMRefiner paper: unfinetuned SAM + gaussian style + pos/neg points + box = good results
+- Use this when: skipping Phase 2, or using original SAM/MedSAM checkpoint
 
-If Phase 2 was trained with binary masks and gaussian prompt style, you may need to:
-- Use --sharpen_coarse_mask to make TransUNet outputs more binary-like
-- Use --mask_prompt_style gaussian to match Phase 2
+**direct (recommended for Phase 2-finetuned SAM)**
+- Passes soft masks directly without blur
+- Preserves sharp boundaries from TransUNet output
+- Use this when: Phase 2 was trained with --soft_masks and --mask_prompt_style direct
+- Phase 2 and Phase 3 must use the same style for consistency
 
 Usage:
-    # Standard E2E training (Phase 2 trained with soft masks)
-    python scripts/train_e2e.py \
-        --data_root ./dataset/processed \
-        --transunet_checkpoint ./checkpoints/transunet/best.pth \
-        --sam_checkpoint ./checkpoints/sam_finetuned/best_sam.pth \
-        --fold 0 \
-        --mask_prompt_style direct
+    # E2E training WITHOUT Phase 2 (using unfinetuned SAM/MedSAM) - GAUSSIAN STYLE
+    python scripts/train_e2e.py \\
+        --data_root ./dataset/processed \\
+        --transunet_checkpoint ./checkpoints/transunet/best.pth \\
+        --sam_checkpoint ./checkpoints/medsam_vit_b.pth \\
+        --fold 0 \\
+        --mask_prompt_style gaussian  # DEFAULT, matches SAMRefiner paper
 
-    # E2E training without Phase 2 (using original SAM)
-    python scripts/train_e2e.py \
-        --data_root ./dataset/processed \
-        --transunet_checkpoint ./checkpoints/transunet/best.pth \
-        --sam_checkpoint ./checkpoints/medsam_vit_b.pth \
-        --fold 0
+    # E2E training WITH Phase 2 finetuned SAM - DIRECT STYLE (must match Phase 2)
+    python scripts/train_e2e.py \\
+        --data_root ./dataset/processed \\
+        --transunet_checkpoint ./checkpoints/transunet/best.pth \\
+        --sam_checkpoint ./checkpoints/sam_finetuned/best_sam.pth \\
+        --fold 0 \\
+        --mask_prompt_style direct  # Must match Phase 2 setting
 """
 import argparse
 import logging
@@ -130,10 +133,10 @@ def get_args():
                              '(only needed if Phase 2 was trained with binary masks)')
     parser.add_argument('--sharpen_temperature', type=float, default=10.0,
                         help='Temperature for sharpening (higher = more binary-like)')
-    parser.add_argument('--mask_prompt_style', type=str, default='direct',
+    parser.add_argument('--mask_prompt_style', type=str, default='gaussian',
                         choices=['gaussian', 'direct', 'distance'],
-                        help='Mask prompt style: direct (RECOMMENDED, matches Phase 2 with soft masks), '
-                             'gaussian (use if Phase 2 was trained with binary masks)')
+                        help='Mask prompt style: gaussian (RECOMMENDED for unfinetuned SAM, matches SAMRefiner paper), '
+                             'direct (use if Phase 2 was trained with soft masks to match distribution)')
 
     # ROI cropping (focuses SAM on lesion area)
     parser.add_argument('--use_roi_crop', action='store_true',
@@ -259,21 +262,59 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, writ
                 coarse_mask = outputs['coarse_mask']
                 print(f"\n  [DEBUG] Mask Statistics:")
                 print(f"  ├── Coarse mask:  min={coarse_mask.min():.4f}, max={coarse_mask.max():.4f}, mean={coarse_mask.mean():.4f}")
-                print(f"  ├── Refined logits: min={refined_logits.min():.4f}, max={refined_logits.max():.4f}, mean={refined_logits.mean():.4f}")
+                print(f"  ├── Coarse shape: {coarse_mask.shape}")
+                print(f"  ├── Refined logits (224): min={refined_logits.min():.4f}, max={refined_logits.max():.4f}, mean={refined_logits.mean():.4f}")
+                print(f"  ├── Refined shape: {refined_logits.shape}")
                 print(f"  ├── Refined prob:   min={refined_prob.min():.4f}, max={refined_prob.max():.4f}, mean={refined_prob.mean():.4f}")
                 print(f"  ├── Refined > 0.5:  {(refined_prob > 0.5).float().mean():.4f} of pixels")
                 print(f"  └── Label > 0.5:    {(label > 0.5).float().mean():.4f} of pixels")
+
+                # Check 1024x1024 refined mask (before resize) vs 224x224 (after resize)
+                if 'refined_mask_logits' in outputs:
+                    rm_1024 = outputs['refined_mask_logits']  # (B, H, W) at 1024x1024
+                    rm_1024_prob = torch.sigmoid(rm_1024)
+                    print(f"\n  [DEBUG] Refined mask BEFORE resize (1024x1024):")
+                    print(f"  ├── Shape: {rm_1024.shape}")
+                    print(f"  ├── Logits: min={rm_1024.min():.4f}, max={rm_1024.max():.4f}, mean={rm_1024.mean():.4f}")
+                    print(f"  └── Area > 0.5: {(rm_1024_prob > 0.5).float().mean():.4f}")
 
                 # Check SAM's 3 candidate masks and IoU predictions
                 if 'sam_masks_all' in outputs:
                     masks_all = outputs['sam_masks_all']  # (B, 3, H, W)
                     iou_preds = outputs['iou_predictions']  # (B, 3)
-                    print(f"\n  [DEBUG] SAM's 3 Candidate Masks:")
+                    print(f"\n  [DEBUG] SAM's 3 Candidate Masks (shape: {masks_all.shape}):")
                     for i in range(3):
                         mask_i = torch.sigmoid(masks_all[0, i])
                         area = (mask_i > 0.5).float().mean()
-                        print(f"  ├── Mask {i}: area={area:.4f}, IoU_pred={iou_preds[0, i]:.4f}")
-                    print(f"  └── SAM prefers mask with highest IoU prediction")
+                        print(f"  ├── Mask {i}: area={area:.4f}, IoU_pred={iou_preds[0, i]:.4f}, logit_mean={masks_all[0, i].mean():.4f}")
+
+                    # Compute soft selection weights
+                    tau = 0.1  # Default selection temperature
+                    selection_weights = torch.softmax(iou_preds / tau, dim=1)
+                    print(f"  ├── Selection weights: {selection_weights[0].tolist()}")
+
+                    # Manually compute soft-selected result at 1024x1024
+                    selected = (masks_all * selection_weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
+                    selected_prob = torch.sigmoid(selected)
+                    print(f"  ├── Soft-selected (manual): mean_logit={selected[0].mean():.4f}, area>0.5={(selected_prob[0] > 0.5).float().mean():.4f}")
+
+                    # Check prompts if available
+                    if 'prompts' in outputs:
+                        prompts = outputs['prompts']
+                        if 'boxes' in prompts:
+                            boxes = prompts['boxes'][0]
+                            print(f"\n  [DEBUG] Prompts sent to SAM:")
+                            print(f"  ├── Box: [{boxes[0]:.1f}, {boxes[1]:.1f}, {boxes[2]:.1f}, {boxes[3]:.1f}]")
+                            box_area = (boxes[2] - boxes[0]) * (boxes[3] - boxes[1]) / (1024 * 1024)
+                            print(f"  ├── Box area: {box_area:.4f} of image")
+                        if 'point_coords' in prompts:
+                            pts = prompts['point_coords'][0]
+                            lbls = prompts['point_labels'][0]
+                            pts_str = ", ".join([f"({p[0].item():.1f}, {p[1].item():.1f}, lbl={l.item():.0f})" for p, l in zip(pts, lbls)])
+                            print(f"  ├── Points: [{pts_str}]")
+                        if 'mask_inputs' in prompts:
+                            mask_in = prompts['mask_inputs'][0, 0]  # (256, 256)
+                            print(f"  └── Mask prompt: shape={mask_in.shape}, mean={mask_in.mean():.4f}, >0 area={(mask_in > 0).float().mean():.4f}")
 
         # Compute loss
         loss, loss_dict = criterion(outputs, label)
@@ -429,6 +470,9 @@ def main():
     )
 
     # Build UltraRefiner model
+    logging.info(f'mask_prompt_style: {args.mask_prompt_style}')
+    logging.info(f'use_roi_crop: {args.use_roi_crop}')
+
     model = build_ultra_refiner(
         vit_name=args.vit_name,
         img_size=args.img_size,

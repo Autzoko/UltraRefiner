@@ -48,7 +48,10 @@ class DifferentiableROICropper(nn.Module):
 
     def extract_roi_box(self, soft_mask: torch.Tensor) -> torch.Tensor:
         """
-        Extract ROI bounding box from soft mask using differentiable soft-min/max.
+        Extract ROI bounding box from soft mask using weighted statistics.
+
+        Uses center ± k*std approach which correctly restricts computation
+        to the mask region and is fully differentiable.
 
         Args:
             soft_mask: Soft probability mask (B, H, W)
@@ -58,30 +61,37 @@ class DifferentiableROICropper(nn.Module):
         """
         B, H, W = soft_mask.shape
         device = soft_mask.device
-        tau = self.box_temperature
 
         # Create coordinate grids
         y_coords = torch.arange(H, device=device, dtype=torch.float32)
         x_coords = torch.arange(W, device=device, dtype=torch.float32)
+        y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
+        y_grid = y_grid.unsqueeze(0).expand(B, -1, -1)  # (B, H, W)
+        x_grid = x_grid.unsqueeze(0).expand(B, -1, -1)  # (B, H, W)
 
-        # Soft projection to axes
-        y_proj = torch.logsumexp(soft_mask / tau, dim=2) * tau
-        x_proj = torch.logsumexp(soft_mask / tau, dim=1) * tau
+        # Compute weighted statistics
+        mask_sum = soft_mask.sum(dim=(-2, -1), keepdim=True) + 1e-6  # (B, 1, 1)
 
-        # Normalize to get weights
-        y_weights = F.softmax(y_proj / tau, dim=1)
-        x_weights = F.softmax(x_proj / tau, dim=1)
+        # Weighted centroid
+        y_center = (soft_mask * y_grid).sum(dim=(-2, -1)) / mask_sum.squeeze()  # (B,)
+        x_center = (soft_mask * x_grid).sum(dim=(-2, -1)) / mask_sum.squeeze()  # (B,)
 
-        # Soft-min/max
-        y_min_weights = F.softmax(-y_coords.unsqueeze(0) * y_weights / tau, dim=1)
-        y_max_weights = F.softmax(y_coords.unsqueeze(0) * y_weights / tau, dim=1)
-        x_min_weights = F.softmax(-x_coords.unsqueeze(0) * x_weights / tau, dim=1)
-        x_max_weights = F.softmax(x_coords.unsqueeze(0) * x_weights / tau, dim=1)
+        # Weighted standard deviation
+        y_diff = y_grid - y_center.view(B, 1, 1)
+        x_diff = x_grid - x_center.view(B, 1, 1)
 
-        y1 = (y_coords.unsqueeze(0) * y_min_weights).sum(dim=1)
-        y2 = (y_coords.unsqueeze(0) * y_max_weights).sum(dim=1)
-        x1 = (x_coords.unsqueeze(0) * x_min_weights).sum(dim=1)
-        x2 = (x_coords.unsqueeze(0) * x_max_weights).sum(dim=1)
+        y_var = (soft_mask * y_diff ** 2).sum(dim=(-2, -1)) / mask_sum.squeeze()
+        x_var = (soft_mask * x_diff ** 2).sum(dim=(-2, -1)) / mask_sum.squeeze()
+
+        y_std = torch.sqrt(y_var + 1e-6)
+        x_std = torch.sqrt(x_var + 1e-6)
+
+        # Box from center ± k*std (k=2.5 covers ~99% of distribution)
+        k = 2.5
+        y1 = y_center - k * y_std
+        y2 = y_center + k * y_std
+        x1 = x_center - k * x_std
+        x2 = x_center + k * x_std
 
         # Expand box by ratio
         box_h = y2 - y1
@@ -99,7 +109,6 @@ class DifferentiableROICropper(nn.Module):
         center_x = (x1 + x2) / 2
         half_size = max(self.min_roi_size, 1) / 2
 
-        # Soft minimum size enforcement
         box_h = y2 - y1
         box_w = x2 - x1
         y1 = torch.where(box_h < self.min_roi_size, center_y - half_size, y1)
@@ -481,11 +490,14 @@ class DifferentiableSAMRefiner(nn.Module):
         """
         Extract bounding box from soft masks in a FULLY DIFFERENTIABLE manner.
 
-        Mathematical formulation using soft-min/max:
-            For soft-min: weighted average with negative temperature softmax
-            x_min ≈ Σ(x_i · softmax(-x_i / τ · w_i))
+        Uses weighted statistics (mean ± k*std) approach which is more robust
+        than soft-min/max and correctly restricts computation to mask region.
 
-            where w_i is the mask projection weight at position i.
+        Mathematical formulation:
+            center = Σ(coord_i · mask_i) / Σ(mask_i)  (weighted centroid)
+            std = sqrt(Σ(mask_i · (coord_i - center)²) / Σ(mask_i))
+            min = center - k * std
+            max = center + k * std
 
         This provides non-zero gradients everywhere the mask is non-zero.
 
@@ -497,36 +509,40 @@ class DifferentiableSAMRefiner(nn.Module):
         """
         B, H, W = soft_mask.shape
         device = soft_mask.device
-        tau = self.box_temperature
 
         # Create coordinate grids
         y_coords = torch.arange(H, device=device, dtype=torch.float32)
         x_coords = torch.arange(W, device=device, dtype=torch.float32)
+        y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
+        y_grid = y_grid.unsqueeze(0).expand(B, -1, -1)  # (B, H, W)
+        x_grid = x_grid.unsqueeze(0).expand(B, -1, -1)  # (B, H, W)
 
-        # Project mask to axes (soft projection)
-        # y_proj[i] = max_j(mask[i,j]) approximated by logsumexp
-        y_proj = torch.logsumexp(soft_mask / tau, dim=2) * tau  # (B, H) - soft max over columns
-        x_proj = torch.logsumexp(soft_mask / tau, dim=1) * tau  # (B, W) - soft max over rows
+        # Compute weighted statistics
+        mask_sum = soft_mask.sum(dim=(-2, -1), keepdim=True) + 1e-6  # (B, 1, 1)
 
-        # Normalize projections to get weights
-        y_weights = F.softmax(y_proj / tau, dim=1)  # (B, H)
-        x_weights = F.softmax(x_proj / tau, dim=1)  # (B, W)
+        # Weighted centroid
+        y_center = (soft_mask * y_grid).sum(dim=(-2, -1)) / mask_sum.squeeze()  # (B,)
+        x_center = (soft_mask * x_grid).sum(dim=(-2, -1)) / mask_sum.squeeze()  # (B,)
 
-        # Soft-min: use negative temperature
-        # x_min = Σ(x_i · softmax(-x_i · w_i / τ))
-        y_min_weights = F.softmax(-y_coords.unsqueeze(0) * y_weights / tau, dim=1)  # (B, H)
-        y_max_weights = F.softmax(y_coords.unsqueeze(0) * y_weights / tau, dim=1)   # (B, H)
-        x_min_weights = F.softmax(-x_coords.unsqueeze(0) * x_weights / tau, dim=1)  # (B, W)
-        x_max_weights = F.softmax(x_coords.unsqueeze(0) * x_weights / tau, dim=1)   # (B, W)
+        # Weighted standard deviation
+        y_diff = y_grid - y_center.view(B, 1, 1)
+        x_diff = x_grid - x_center.view(B, 1, 1)
 
-        # Compute soft min/max coordinates
-        y1 = (y_coords.unsqueeze(0) * y_min_weights).sum(dim=1)  # (B,)
-        y2 = (y_coords.unsqueeze(0) * y_max_weights).sum(dim=1)  # (B,)
-        x1 = (x_coords.unsqueeze(0) * x_min_weights).sum(dim=1)  # (B,)
-        x2 = (x_coords.unsqueeze(0) * x_max_weights).sum(dim=1)  # (B,)
+        y_var = (soft_mask * y_diff ** 2).sum(dim=(-2, -1)) / mask_sum.squeeze()
+        x_var = (soft_mask * x_diff ** 2).sum(dim=(-2, -1)) / mask_sum.squeeze()
 
-        # Add small margin to ensure box contains object
-        margin = 2.0
+        y_std = torch.sqrt(y_var + 1e-6)
+        x_std = torch.sqrt(x_var + 1e-6)
+
+        # Box from center ± k*std (k=2.5 covers ~99% of a Gaussian distribution)
+        k = 2.5
+        y1 = y_center - k * y_std
+        y2 = y_center + k * y_std
+        x1 = x_center - k * x_std
+        x2 = x_center + k * x_std
+
+        # Add small margin
+        margin = 5.0
         y1 = torch.clamp(y1 - margin, min=0)
         y2 = torch.clamp(y2 + margin, max=H - 1)
         x1 = torch.clamp(x1 - margin, min=0)
@@ -626,7 +642,7 @@ class DifferentiableSAMRefiner(nn.Module):
 
         return mask_input
 
-    def soft_mask_selection(self, masks: torch.Tensor, iou_predictions: torch.Tensor) -> torch.Tensor:
+    def soft_mask_selection(self, masks: torch.Tensor, iou_predictions: torch.Tensor, debug: bool = False) -> torch.Tensor:
         """
         Select refined mask using DIFFERENTIABLE soft selection.
 
@@ -638,6 +654,7 @@ class DifferentiableSAMRefiner(nn.Module):
         Args:
             masks: All candidate masks (B, 3, H, W)
             iou_predictions: IoU predictions (B, 3)
+            debug: Whether to print debug information
 
         Returns:
             refined_mask: Soft-selected mask (B, H, W)
@@ -648,9 +665,24 @@ class DifferentiableSAMRefiner(nn.Module):
         # Soft selection weights via softmax
         selection_weights = F.softmax(iou_predictions / tau, dim=1)  # (B, 3)
 
+        if debug:
+            print(f"\n  [DEBUG soft_mask_selection]")
+            print(f"  ├── masks shape: {masks.shape}")
+            print(f"  ├── iou_predictions: {iou_predictions[0].tolist()}")
+            print(f"  ├── selection_weights: {selection_weights[0].tolist()}")
+            for i in range(num_masks):
+                mask_prob = torch.sigmoid(masks[0, i])
+                area = (mask_prob > 0.5).float().mean().item()
+                print(f"  ├── Mask {i} before selection: logit_mean={masks[0, i].mean().item():.4f}, area>0.5={area:.4f}")
+
         # Weighted combination of all masks
         # refined = Σ(w_i · mask_i)
         refined_mask = (masks * selection_weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)  # (B, H, W)
+
+        if debug:
+            refined_prob = torch.sigmoid(refined_mask)
+            area = (refined_prob > 0.5).float().mean().item()
+            print(f"  └── Refined after selection: logit_mean={refined_mask[0].mean().item():.4f}, area>0.5={area:.4f}")
 
         return refined_mask
 
@@ -688,6 +720,14 @@ class DifferentiableSAMRefiner(nn.Module):
         B = image.shape[0]
         device = image.device
         original_size = coarse_mask.shape[-2:]
+
+        if return_intermediate:
+            print(f"\n  [DEBUG sam_refiner.forward]")
+            print(f"  ├── image shape: {image.shape}")
+            print(f"  ├── coarse_mask shape: {coarse_mask.shape}")
+            print(f"  ├── original_size: {original_size}")
+            print(f"  ├── use_roi_crop: {self.use_roi_crop}")
+            print(f"  └── mask_prompt_style: {self.mask_prompt_style}")
 
         # ROI Cropping Mode: Focus SAM computation on lesion area
         if self.use_roi_crop:
@@ -810,7 +850,7 @@ class DifferentiableSAMRefiner(nn.Module):
         all_low_res = torch.stack(all_low_res)  # (B, 3, 256, 256)
 
         # DIFFERENTIABLE mask selection using soft weighting
-        refined_masks = self.soft_mask_selection(all_masks, all_ious)  # (B, H, W)
+        refined_masks = self.soft_mask_selection(all_masks, all_ious, debug=return_intermediate)  # (B, H, W)
 
         result = {
             'masks': refined_masks,
