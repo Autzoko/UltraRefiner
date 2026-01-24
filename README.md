@@ -1,14 +1,103 @@
 # UltraRefiner: End-to-End Differentiable Segmentation Refinement
 
-A unified framework for breast ultrasound segmentation that combines **TransUNet** for initial coarse segmentation with **SAMRefiner** (based on Segment Anything Model) for mask refinement. The entire pipeline is fully differentiable, enabling end-to-end training with gradient flow from SAM back to TransUNet.
+## Abstract
 
-## Overview
+Accurate segmentation of breast lesions in ultrasound images is critical for computer-aided diagnosis, yet existing deep learning approaches often produce masks with imprecise boundaries, topological errors, or complete failures on challenging cases. We present **UltraRefiner**, an end-to-end differentiable framework that combines a coarse segmentation network with the Segment Anything Model (SAM) for iterative mask refinement. Unlike conventional cascaded approaches where refinement modules are trained independently, UltraRefiner enables gradient flow from the refinement stage back to the coarse segmentation network, allowing joint optimization of the entire pipeline.
 
-UltraRefiner implements a three-phase training pipeline:
+**Key Contributions:**
 
-1. **Phase 1**: Train TransUNet independently on breast ultrasound datasets (per-dataset or combined)
-2. **Phase 2**: Finetune SAM using augmented GT masks that simulate realistic segmentation failures
-3. **Phase 3**: End-to-end training with gradients flowing from SAMRefiner to TransUNet
+1. **Fully Differentiable Prompt Generation**: We introduce differentiable methods for extracting SAM prompts (points, boxes, and masks) from soft probability maps using soft-argmax for centroid extraction and soft-min/max with temperature scaling for bounding box computation. This enables end-to-end gradient flow through the entire pipeline.
+
+2. **SDF-Based Failure Simulation**: We propose a signed distance function (SDF) based data augmentation strategy that generates realistic segmentation failures—including boundary erosion, dilation, topological errors, and small-lesion disappearance—with controlled Dice score distribution. This enables training the refinement module on diverse failure patterns without requiring actual model predictions.
+
+3. **Quality-Aware Training Loss**: We design a change-penalty loss that learns "when not to modify" by penalizing unnecessary changes to already-good predictions while encouraging strong corrections on poor inputs. This prevents the refinement module from degrading high-quality inputs.
+
+4. **Differentiable ROI Cropping**: We implement fully differentiable region-of-interest cropping using grid sampling, allowing SAM to process lesion regions at full resolution while maintaining gradient flow for end-to-end training.
+
+5. **Phase-Consistent Distribution Matching**: We ensure that the coarse mask distribution seen during SAM finetuning matches the distribution during end-to-end training through soft probability maps and consistent resolution paths (224×224 → 1024×1024).
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           UltraRefiner Architecture                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Input Image ──────────────────────────────────────────────────────────    │
+│        │                                                                     │
+│        ▼                                                                     │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                    TransUNet (224×224)                               │   │
+│   │   ┌──────────┐     ┌──────────────┐     ┌──────────────┐            │   │
+│   │   │ ResNet50 │ ──► │  ViT-B/16    │ ──► │ CNN Decoder  │            │   │
+│   │   │ Encoder  │     │ Transformer  │     │ + Skip Conn  │            │   │
+│   │   └──────────┘     └──────────────┘     └──────────────┘            │   │
+│   └──────────────────────────────┬──────────────────────────────────────┘   │
+│                                  │                                           │
+│                                  ▼                                           │
+│                    ┌─────────────────────────────┐                          │
+│                    │     Coarse Mask (Soft)      │                          │
+│                    │   P(lesion) ∈ [0, 1]        │                          │
+│                    └─────────────┬───────────────┘                          │
+│                                  │                                           │
+│         ┌────────────────────────┼────────────────────────┐                 │
+│         │                        │                        │                 │
+│         ▼                        ▼                        ▼                 │
+│   ┌───────────┐          ┌───────────────┐         ┌───────────┐           │
+│   │  Points   │          │    Boxes      │         │   Mask    │           │
+│   │ soft-argmax│         │ soft-min/max  │         │  direct   │           │
+│   └─────┬─────┘          └───────┬───────┘         └─────┬─────┘           │
+│         │                        │                        │                 │
+│         └────────────────────────┼────────────────────────┘                 │
+│                                  │                                           │
+│                                  ▼                                           │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                      SAMRefiner (1024×1024)                          │   │
+│   │   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐          │   │
+│   │   │    Image     │    │   Prompt     │    │     Mask     │          │   │
+│   │   │   Encoder    │    │   Encoder    │ ─► │    Decoder   │          │   │
+│   │   │  (frozen)    │    │ (trainable)  │    │  (trainable) │          │   │
+│   │   └──────────────┘    └──────────────┘    └──────────────┘          │   │
+│   └──────────────────────────────┬──────────────────────────────────────┘   │
+│                                  │                                           │
+│                                  ▼                                           │
+│                    ┌─────────────────────────────┐                          │
+│                    │     Refined Mask            │                          │
+│                    │   (High-resolution output)  │                          │
+│                    └─────────────────────────────┘                          │
+│                                                                              │
+│   Gradient Flow: L_refined ──► SAMRefiner ──► Prompts ──► TransUNet        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Training Pipeline
+
+UltraRefiner employs a three-phase training strategy:
+
+| Phase | Description | What's Trained | Data Used |
+|-------|-------------|----------------|-----------|
+| **Phase 1** | Train TransUNet independently | TransUNet | Original images + GT masks |
+| **Phase 2** | Finetune SAM with failure simulation | SAM (prompt encoder + mask decoder) | Augmented coarse masks |
+| **Phase 3** | End-to-end joint optimization | TransUNet + SAM | Original images + GT masks |
+
+**Phase 1: Coarse Segmentation Training**
+- Train TransUNet at 224×224 resolution using standard segmentation losses
+- Per-dataset training with 5-fold cross-validation
+- Produces baseline coarse segmentation capability
+
+**Phase 2: Refinement Module Training**
+- Generate large-scale augmented data (~100K samples) from GT masks
+- SDF-based failure simulation creates realistic segmentation errors
+- Quality distribution: 25% good (Dice 0.9-0.99), 40% medium (0.8-0.9), 35% poor (0.6-0.8)
+- No perfect masks (Dice=1.0) to ensure the refiner learns to modify
+- Quality-aware loss penalizes changes to already-good inputs
+
+**Phase 3: End-to-End Training**
+- Load Phase 1 TransUNet and Phase 2 SAM checkpoints
+- Joint optimization with gradients flowing through differentiable prompts
+- Combined loss: L = 0.3 × L_coarse + 0.7 × L_refined
+- Lower learning rate for TransUNet to prevent destabilization
 
 ## Resolution Design
 
