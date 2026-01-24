@@ -99,6 +99,97 @@ UltraRefiner employs a three-phase training strategy:
 - Combined loss: L = 0.3 × L_coarse + 0.7 × L_refined
 - Lower learning rate for TransUNet to prevent destabilization
 
+## Phase 2 ↔ Phase 3 Distribution Consistency
+
+For the finetuned SAM from Phase 2 to work correctly in Phase 3, the input distributions must match exactly. Here's how consistency is maintained:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    DISTRIBUTION CONSISTENCY DIAGRAM                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  PHASE 2 (SAM Finetuning)              PHASE 3 (E2E Training)               │
+│  ─────────────────────────             ─────────────────────────             │
+│                                                                              │
+│  Original Image                        Original Image                        │
+│       │                                     │                                │
+│       ▼                                     ▼                                │
+│  ┌─────────────┐                      ┌─────────────┐                       │
+│  │ Resize 224  │ ◄─── SAME ───────►   │ Resize 224  │ (for TransUNet)       │
+│  └──────┬──────┘                      └──────┬──────┘                       │
+│         │                                    │                               │
+│         ▼                                    ▼                               │
+│  ┌─────────────┐                      ┌─────────────┐                       │
+│  │ Resize 1024 │ ◄─── SAME ───────►   │ Resize 1024 │ (for SAM)             │
+│  └──────┬──────┘                      └──────┬──────┘                       │
+│         │                                    │                               │
+│         ▼                                    ▼                               │
+│  ┌─────────────┐                      ┌─────────────┐                       │
+│  │ SAM Normalize│ ◄─── SAME ───────►  │ SAM Normalize│                       │
+│  │ (mean/std)  │                      │ (mean/std)  │                       │
+│  └──────┬──────┘                      └──────┬──────┘                       │
+│         │                                    │                               │
+│         ▼                                    ▼                               │
+│  ═══════════════                      ═══════════════                       │
+│   IMAGE: 1024²                         IMAGE: 1024²                          │
+│   Normalized                           Normalized                            │
+│  ═══════════════                      ═══════════════                       │
+│                                                                              │
+│  Soft Mask (NPY)                      TransUNet Output                       │
+│  (Gaussian blur)                      (Softmax prob)                         │
+│       │                                     │                                │
+│       ▼                                     ▼                                │
+│  ┌─────────────┐                      ┌─────────────┐                       │
+│  │ Resize 224  │ ◄─── SAME ───────►   │ Output 224  │                       │
+│  └──────┬──────┘                      └──────┬──────┘                       │
+│         │                                    │                               │
+│         ▼                                    ▼                               │
+│  ┌─────────────┐                      ┌─────────────┐                       │
+│  │ Resize 1024 │ ◄─── SAME ───────►   │ Resize 1024 │ (F.interpolate)       │
+│  │ (Bilinear)  │                      │ (Bilinear)  │                       │
+│  └──────┬──────┘                      └──────┬──────┘                       │
+│         │                                    │                               │
+│         ▼                                    ▼                               │
+│  ═══════════════                      ═══════════════                       │
+│   MASK: 1024²                          MASK: 1024²                           │
+│   Soft [0,1]                           Soft [0,1]                            │
+│  ═══════════════                      ═══════════════                       │
+│         │                                    │                               │
+│         └──────────────┬─────────────────────┘                              │
+│                        ▼                                                     │
+│              ┌─────────────────────┐                                        │
+│              │  PROMPT EXTRACTION  │                                        │
+│              │  (Same Code)        │                                        │
+│              ├─────────────────────┤                                        │
+│              │ • soft-argmax point │                                        │
+│              │ • soft-min/max box  │                                        │
+│              │ • direct mask       │                                        │
+│              └─────────────────────┘                                        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Consistency Requirements:**
+
+| Aspect | Phase 2 | Phase 3 | Status |
+|--------|---------|---------|--------|
+| Image resolution | 1024×1024 | 1024×1024 | ✓ Same |
+| Image normalization | SAM pixel mean/std | SAM pixel mean/std | ✓ Same |
+| Resolution path | 224→1024 (bilinear) | 224→1024 (bilinear) | ✓ Same |
+| Coarse mask format | Soft probability [0,1] | Softmax probability [0,1] | ✓ Same |
+| Coarse mask resolution | 1024×1024 | 1024×1024 | ✓ Same |
+| Prompt extraction | DifferentiableSAMRefiner | DifferentiableSAMRefiner | ✓ Same code |
+| Coordinate space | 1024×1024 pixels | 1024×1024 pixels | ✓ Same |
+| mask_prompt_style | 'direct' (default) | 'direct' (default) | ✓ Same |
+| ROI cropping | Configurable | Configurable | Must match |
+
+**Ensuring Consistency (Checklist):**
+1. ✅ Generate Phase 2 data with `--soft_masks` flag (matches TransUNet's smooth output)
+2. ✅ Use `--transunet_img_size 224` in Phase 2 (matches Phase 3 resolution path)
+3. ✅ Use `--mask_prompt_style direct` in both phases
+4. ✅ Use same `--use_roi_crop` and `--roi_expand_ratio` in both phases
+5. ✅ Use `best_sam.pth` checkpoint (SAM-native format) for Phase 3
+
 ## Resolution Design
 
 | Component | Resolution | Reason |
