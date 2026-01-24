@@ -10,6 +10,26 @@ UltraRefiner implements a three-phase training pipeline:
 2. **Phase 2**: Finetune SAM using augmented GT masks that simulate realistic segmentation failures
 3. **Phase 3**: End-to-end training with gradients flowing from SAMRefiner to TransUNet
 
+## Resolution Design
+
+| Component | Resolution | Reason |
+|-----------|------------|--------|
+| **TransUNet** | 224×224 | Matches ViT-B/16 pretrained resolution; memory efficient |
+| **SAM** | 1024×1024 | SAM's native resolution; captures fine boundary details |
+
+**Why this design?**
+- TransUNet at 224×224 provides fast, coarse segmentation with global context
+- SAM at 1024×1024 refines boundaries with high precision
+- The coarse-to-fine approach is more efficient than running everything at high resolution
+- SAM's refinement recovers boundary details lost at lower resolution
+
+**Changing TransUNet resolution** (e.g., to 384 or 512) requires:
+1. Retraining Phase 1 with `--img_size <new_size>`
+2. Updating Phase 2 with `--transunet_img_size <new_size>`
+3. Updating Phase 3 with `--img_size <new_size>`
+
+The default 224×224 is recommended as SAM's high-resolution refinement compensates for TransUNet's lower resolution.
+
 ## Training Pipeline Flow Chart
 
 ```
