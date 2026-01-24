@@ -94,6 +94,12 @@ def get_args():
                         help='Freeze SAM image encoder')
     parser.add_argument('--freeze_sam_prompt_encoder', action='store_true', default=False,
                         help='Freeze SAM prompt encoder')
+    parser.add_argument('--freeze_sam_mask_decoder', action='store_true', default=False,
+                        help='Freeze SAM mask decoder')
+    parser.add_argument('--freeze_sam_all', action='store_true', default=False,
+                        help='Freeze entire SAM (only train TransUNet)')
+    parser.add_argument('--unfreeze_sam_epoch', type=int, default=0,
+                        help='Epoch to unfreeze SAM (0=never freeze, >0=two-stage training)')
 
     # Output arguments
     parser.add_argument('--output_dir', type=str, default='./checkpoints/ultra_refiner',
@@ -371,6 +377,18 @@ def main():
 
     logging.info('Built UltraRefiner model')
 
+    # Additional SAM freezing options
+    if args.freeze_sam_all:
+        # Freeze entire SAM (only train TransUNet)
+        for param in model.sam.parameters():
+            param.requires_grad = False
+        logging.info('Frozen entire SAM - only training TransUNet')
+    elif args.freeze_sam_mask_decoder:
+        # Freeze mask decoder specifically
+        for param in model.sam.mask_decoder.parameters():
+            param.requires_grad = False
+        logging.info('Frozen SAM mask decoder')
+
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -417,7 +435,24 @@ def main():
 
     # Training loop
     best_epoch = 0
+    sam_unfrozen = not (args.freeze_sam_all or args.freeze_sam_mask_decoder)
+
     for epoch in range(start_epoch, args.max_epochs):
+        # Two-stage training: unfreeze SAM at specified epoch
+        if args.unfreeze_sam_epoch > 0 and epoch == args.unfreeze_sam_epoch and not sam_unfrozen:
+            logging.info(f'Epoch {epoch}: Unfreezing SAM for joint training')
+            for param in model.sam.mask_decoder.parameters():
+                param.requires_grad = True
+            if not args.freeze_sam_prompt_encoder:
+                for param in model.sam.prompt_encoder.parameters():
+                    param.requires_grad = True
+            sam_unfrozen = True
+
+            # Update optimizer to include SAM params
+            sam_params = list(model.get_sam_params())
+            optimizer.add_param_group({'params': sam_params, 'lr': args.sam_lr})
+            logging.info(f'Added {len(sam_params)} SAM parameters to optimizer')
+
         # Train
         train_metrics = train_one_epoch(
             model, train_loader, optimizer, criterion,
