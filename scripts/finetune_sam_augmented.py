@@ -137,6 +137,14 @@ def get_args():
                              'This ensures Phase 2 has the SAME distribution as Phase 3. '
                              'Set to 0 to disable (legacy behavior).')
 
+    # ROI cropping (focuses SAM on lesion area)
+    parser.add_argument('--use_roi_crop', action='store_true',
+                        help='Enable ROI cropping: crop to lesion bounding box, process at full '
+                             'SAM resolution, paste back. Focuses computation on lesion area '
+                             'for higher effective resolution. Fully differentiable.')
+    parser.add_argument('--roi_expand_ratio', type=float, default=0.2,
+                        help='Ratio to expand ROI bounding box (0.2 = 20%% on each side)')
+
     return parser.parse_args()
 
 
@@ -465,9 +473,13 @@ def main():
         freeze_image_encoder=True,  # Always freeze for efficiency
         freeze_prompt_encoder=False,
         mask_prompt_style=args.mask_prompt_style,
+        use_roi_crop=args.use_roi_crop,
+        roi_expand_ratio=args.roi_expand_ratio,
     )
     print(f'Mask prompt style: {args.mask_prompt_style}')
     print(f'TransUNet resolution path: {args.transunet_img_size}x{args.transunet_img_size} -> 1024x1024')
+    if args.use_roi_crop:
+        print(f'ROI cropping enabled: expand_ratio={args.roi_expand_ratio}')
     model = model.to(device)
 
     # Get dataloaders

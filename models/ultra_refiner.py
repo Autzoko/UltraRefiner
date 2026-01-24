@@ -41,6 +41,8 @@ class UltraRefiner(nn.Module):
         mask_prompt_style: str = 'direct',  # 'direct' for E2E (TransUNet outputs are smooth)
         sharpen_coarse_mask: bool = False,  # Sharpen soft masks to be more binary-like
         sharpen_temperature: float = 10.0,  # Temperature for sharpening (higher = sharper)
+        use_roi_crop: bool = False,  # Whether to crop to ROI before SAM processing
+        roi_expand_ratio: float = 0.2,  # Ratio to expand ROI box
     ):
         """
         Args:
@@ -59,6 +61,8 @@ class UltraRefiner(nn.Module):
             mask_prompt_style: Style for mask prompt ('direct' for E2E, 'gaussian' for SAM finetuning)
             sharpen_coarse_mask: Whether to sharpen soft masks to match Phase 2 training distribution
             sharpen_temperature: Temperature for sharpening (higher = more binary-like)
+            use_roi_crop: Whether to crop to ROI before SAM processing. Focuses SAM on lesion area.
+            roi_expand_ratio: Ratio to expand ROI box (0.2 = 20% expansion on each side)
         """
         super().__init__()
 
@@ -104,6 +108,8 @@ class UltraRefiner(nn.Module):
             freeze_image_encoder=freeze_sam_image_encoder,
             freeze_prompt_encoder=freeze_sam_prompt_encoder,
             mask_prompt_style=mask_prompt_style,
+            use_roi_crop=use_roi_crop,
+            roi_expand_ratio=roi_expand_ratio,
         )
 
         # SAM normalization parameters

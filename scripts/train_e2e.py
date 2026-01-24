@@ -135,6 +135,13 @@ def get_args():
                         help='Mask prompt style: direct (RECOMMENDED, matches Phase 2 with soft masks), '
                              'gaussian (use if Phase 2 was trained with binary masks)')
 
+    # ROI cropping (focuses SAM on lesion area)
+    parser.add_argument('--use_roi_crop', action='store_true',
+                        help='Enable ROI cropping: crop to lesion bounding box, process at full '
+                             'SAM resolution, paste back. Must match Phase 2 setting.')
+    parser.add_argument('--roi_expand_ratio', type=float, default=0.2,
+                        help='Ratio to expand ROI bounding box (0.2 = 20%% on each side)')
+
     # Output arguments
     parser.add_argument('--output_dir', type=str, default='./checkpoints/ultra_refiner',
                         help='Output directory for checkpoints')
@@ -410,9 +417,13 @@ def main():
         sharpen_coarse_mask=args.sharpen_coarse_mask,
         sharpen_temperature=args.sharpen_temperature,
         mask_prompt_style=args.mask_prompt_style,
+        use_roi_crop=args.use_roi_crop,
+        roi_expand_ratio=args.roi_expand_ratio,
     ).to(device)
 
     logging.info('Built UltraRefiner model')
+    if args.use_roi_crop:
+        logging.info(f'ROI cropping enabled: expand_ratio={args.roi_expand_ratio}')
 
     # Additional SAM freezing options
     if args.freeze_sam_all:

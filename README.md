@@ -30,6 +30,53 @@ UltraRefiner implements a three-phase training pipeline:
 
 The default 224×224 is recommended as SAM's high-resolution refinement compensates for TransUNet's lower resolution.
 
+## ROI Cropping Mode (Optional)
+
+UltraRefiner supports **ROI (Region of Interest) cropping** that focuses SAM computation on the lesion area:
+
+```
+Standard Mode:                          ROI Cropping Mode:
+┌─────────────────┐                     ┌─────────────────┐
+│  Full image     │                     │     ┌─────┐     │
+│  1024×1024      │         →           │     │ ROI │     │  → Crop → Process → Paste
+│    ┌───┐        │                     │     └─────┘     │
+│    │ L │        │                     │                 │
+│    └───┘        │                     └─────────────────┘
+└─────────────────┘                     Full 1024×1024 res on lesion
+```
+
+**Benefits:**
+- Higher effective resolution on the lesion area
+- SAM learns to focus specifically on lesion refinement
+- Reduces distraction from background regions
+- Fully differentiable (gradients flow through crop/paste operations)
+
+**Usage:**
+```bash
+# Phase 2 with ROI cropping
+python scripts/finetune_sam_augmented.py \
+    --data_root ./dataset/augmented_soft \
+    --dataset BUSI \
+    --sam_checkpoint ./checkpoints/sam/sam_vit_b_01ec64.pth \
+    --use_roi_crop \
+    --roi_expand_ratio 0.2
+
+# Phase 3 with ROI cropping (must match Phase 2 setting)
+python scripts/train_e2e.py \
+    --data_root ./dataset/processed \
+    --datasets BUSI \
+    --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
+    --sam_checkpoint ./checkpoints/sam_finetuned/BUSI/best_sam.pth \
+    --use_roi_crop \
+    --roi_expand_ratio 0.2
+```
+
+**Parameters:**
+- `--use_roi_crop`: Enable ROI cropping mode
+- `--roi_expand_ratio`: Ratio to expand the bounding box (0.2 = 20% expansion on each side)
+
+**IMPORTANT:** Phase 2 and Phase 3 must use the same ROI setting for distribution consistency.
+
 ## Training Pipeline Flow Chart
 
 ```
@@ -403,6 +450,7 @@ transunet/BUSBRA/fold_0/best.pth → ultra_refiner/BUSBRA/fold_0/best.pth
 3. ✅ Train Phase 2 with `--transunet_img_size 224` (default) to match Phase 3 resolution path
 4. ✅ Train Phase 3 with `--mask_prompt_style direct`
 5. ✅ Use `best_sam.pth` (not `best.pth`) for Phase 3
+6. ✅ Use same `--use_roi_crop` and `--roi_expand_ratio` settings in both phases
 
 **Why Resolution Path Matters:**
 In Phase 3, TransUNet outputs at 224×224, which is then upscaled to 1024×1024 for SAM.

@@ -12,6 +12,288 @@ from typing import Optional, Tuple, List, Dict
 import numpy as np
 
 
+class DifferentiableROICropper(nn.Module):
+    """
+    Differentiable ROI (Region of Interest) cropping for focused SAM processing.
+
+    This module extracts the ROI from an image/mask based on the coarse mask's
+    bounding box, processes at full SAM resolution (1024x1024), and pastes
+    the result back. All operations are fully differentiable.
+
+    Benefits:
+    - Focuses SAM computation on the lesion area
+    - Higher effective resolution for the lesion
+    - Consistent distribution between Phase 2 and Phase 3
+    """
+
+    def __init__(
+        self,
+        target_size: int = 1024,
+        expand_ratio: float = 0.2,
+        box_temperature: float = 0.01,
+        min_roi_size: int = 64,
+    ):
+        """
+        Args:
+            target_size: Size to resize ROI to (SAM's expected input size)
+            expand_ratio: Ratio to expand the ROI box (0.2 = 20% expansion on each side)
+            box_temperature: Temperature for soft bounding box extraction
+            min_roi_size: Minimum ROI size in pixels (prevents too small crops)
+        """
+        super().__init__()
+        self.target_size = target_size
+        self.expand_ratio = expand_ratio
+        self.box_temperature = box_temperature
+        self.min_roi_size = min_roi_size
+
+    def extract_roi_box(self, soft_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Extract ROI bounding box from soft mask using differentiable soft-min/max.
+
+        Args:
+            soft_mask: Soft probability mask (B, H, W)
+
+        Returns:
+            boxes: (B, 4) as [x1, y1, x2, y2] with expansion applied
+        """
+        B, H, W = soft_mask.shape
+        device = soft_mask.device
+        tau = self.box_temperature
+
+        # Create coordinate grids
+        y_coords = torch.arange(H, device=device, dtype=torch.float32)
+        x_coords = torch.arange(W, device=device, dtype=torch.float32)
+
+        # Soft projection to axes
+        y_proj = torch.logsumexp(soft_mask / tau, dim=2) * tau
+        x_proj = torch.logsumexp(soft_mask / tau, dim=1) * tau
+
+        # Normalize to get weights
+        y_weights = F.softmax(y_proj / tau, dim=1)
+        x_weights = F.softmax(x_proj / tau, dim=1)
+
+        # Soft-min/max
+        y_min_weights = F.softmax(-y_coords.unsqueeze(0) * y_weights / tau, dim=1)
+        y_max_weights = F.softmax(y_coords.unsqueeze(0) * y_weights / tau, dim=1)
+        x_min_weights = F.softmax(-x_coords.unsqueeze(0) * x_weights / tau, dim=1)
+        x_max_weights = F.softmax(x_coords.unsqueeze(0) * x_weights / tau, dim=1)
+
+        y1 = (y_coords.unsqueeze(0) * y_min_weights).sum(dim=1)
+        y2 = (y_coords.unsqueeze(0) * y_max_weights).sum(dim=1)
+        x1 = (x_coords.unsqueeze(0) * x_min_weights).sum(dim=1)
+        x2 = (x_coords.unsqueeze(0) * x_max_weights).sum(dim=1)
+
+        # Expand box by ratio
+        box_h = y2 - y1
+        box_w = x2 - x1
+        expand_h = box_h * self.expand_ratio
+        expand_w = box_w * self.expand_ratio
+
+        y1 = y1 - expand_h
+        y2 = y2 + expand_h
+        x1 = x1 - expand_w
+        x2 = x2 + expand_w
+
+        # Ensure minimum size
+        center_y = (y1 + y2) / 2
+        center_x = (x1 + x2) / 2
+        half_size = max(self.min_roi_size, 1) / 2
+
+        # Soft minimum size enforcement
+        box_h = y2 - y1
+        box_w = x2 - x1
+        y1 = torch.where(box_h < self.min_roi_size, center_y - half_size, y1)
+        y2 = torch.where(box_h < self.min_roi_size, center_y + half_size, y2)
+        x1 = torch.where(box_w < self.min_roi_size, center_x - half_size, x1)
+        x2 = torch.where(box_w < self.min_roi_size, center_x + half_size, x2)
+
+        # Clamp to image bounds
+        y1 = torch.clamp(y1, min=0)
+        y2 = torch.clamp(y2, max=H - 1)
+        x1 = torch.clamp(x1, min=0)
+        x2 = torch.clamp(x2, max=W - 1)
+
+        return torch.stack([x1, y1, x2, y2], dim=1)
+
+    def crop_and_resize(
+        self,
+        tensor: torch.Tensor,
+        boxes: torch.Tensor,
+        is_mask: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Differentiable crop and resize using grid_sample.
+
+        Args:
+            tensor: Input tensor (B, C, H, W) or (B, H, W)
+            boxes: ROI boxes (B, 4) as [x1, y1, x2, y2]
+            is_mask: If True, use nearest interpolation for masks
+
+        Returns:
+            cropped: Cropped and resized tensor (B, C, target_size, target_size)
+            crop_info: Information needed for pasting back
+        """
+        if tensor.dim() == 3:
+            tensor = tensor.unsqueeze(1)
+            squeeze_output = True
+        else:
+            squeeze_output = False
+
+        B, C, H, W = tensor.shape
+        device = tensor.device
+
+        # Normalize box coordinates to [-1, 1] for grid_sample
+        x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+
+        # Create sampling grid
+        # grid_sample expects coordinates in [-1, 1] where -1 is left/top, 1 is right/bottom
+        theta = torch.zeros(B, 2, 3, device=device)
+
+        # Scale factors
+        scale_x = (x2 - x1) / W
+        scale_y = (y2 - y1) / H
+
+        # Translation (center of ROI in normalized coords)
+        trans_x = (x1 + x2) / W - 1
+        trans_y = (y1 + y2) / H - 1
+
+        theta[:, 0, 0] = scale_x
+        theta[:, 1, 1] = scale_y
+        theta[:, 0, 2] = trans_x
+        theta[:, 1, 2] = trans_y
+
+        # Generate grid
+        grid = F.affine_grid(theta, [B, C, self.target_size, self.target_size], align_corners=False)
+
+        # Sample
+        mode = 'nearest' if is_mask else 'bilinear'
+        cropped = F.grid_sample(tensor, grid, mode=mode, padding_mode='zeros', align_corners=False)
+
+        if squeeze_output:
+            cropped = cropped.squeeze(1)
+
+        crop_info = {
+            'boxes': boxes,
+            'original_size': (H, W),
+            'theta': theta,
+        }
+
+        return cropped, crop_info
+
+    def paste_back(
+        self,
+        cropped: torch.Tensor,
+        crop_info: Dict,
+        background: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Differentiable paste cropped region back to full size.
+
+        Uses a soft blending approach for differentiability.
+
+        Args:
+            cropped: Cropped tensor (B, C, target_size, target_size) or (B, target_size, target_size)
+            crop_info: Information from crop_and_resize
+            background: Optional background tensor. If None, uses zeros.
+
+        Returns:
+            full: Full-size tensor with ROI pasted (B, C, H, W)
+        """
+        if cropped.dim() == 3:
+            cropped = cropped.unsqueeze(1)
+            squeeze_output = True
+        else:
+            squeeze_output = False
+
+        B, C, _, _ = cropped.shape
+        H, W = crop_info['original_size']
+        boxes = crop_info['boxes']
+        device = cropped.device
+
+        # Create inverse affine transform
+        x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+
+        # Inverse transformation: from full image coords to cropped coords
+        inv_theta = torch.zeros(B, 2, 3, device=device)
+
+        # Inverse scale
+        inv_scale_x = W / (x2 - x1 + 1e-6)
+        inv_scale_y = H / (y2 - y1 + 1e-6)
+
+        # Inverse translation
+        inv_trans_x = -((x1 + x2) / W - 1) * inv_scale_x
+        inv_trans_y = -((y1 + y2) / H - 1) * inv_scale_y
+
+        inv_theta[:, 0, 0] = inv_scale_x
+        inv_theta[:, 1, 1] = inv_scale_y
+        inv_theta[:, 0, 2] = inv_trans_x
+        inv_theta[:, 1, 2] = inv_trans_y
+
+        # Generate grid for full size
+        grid = F.affine_grid(inv_theta, [B, C, H, W], align_corners=False)
+
+        # Sample from cropped to get full size
+        full = F.grid_sample(cropped, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+
+        # Create soft ROI mask for blending
+        # This ensures gradients flow properly
+        roi_mask = self._create_soft_roi_mask(boxes, H, W, device)
+
+        if background is not None:
+            if background.dim() == 3:
+                background = background.unsqueeze(1)
+            full = full * roi_mask + background * (1 - roi_mask)
+        else:
+            # Keep only ROI region, zero elsewhere
+            full = full * roi_mask
+
+        if squeeze_output:
+            full = full.squeeze(1)
+
+        return full
+
+    def _create_soft_roi_mask(
+        self,
+        boxes: torch.Tensor,
+        H: int,
+        W: int,
+        device: torch.device,
+        edge_softness: float = 5.0
+    ) -> torch.Tensor:
+        """
+        Create a soft ROI mask with smooth edges for differentiable blending.
+
+        Args:
+            boxes: ROI boxes (B, 4) as [x1, y1, x2, y2]
+            H, W: Output size
+            device: Device
+            edge_softness: Softness of edges (higher = sharper)
+
+        Returns:
+            mask: Soft ROI mask (B, 1, H, W)
+        """
+        B = boxes.shape[0]
+        x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+
+        # Create coordinate grids
+        y_coords = torch.arange(H, device=device, dtype=torch.float32)
+        x_coords = torch.arange(W, device=device, dtype=torch.float32)
+        y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
+
+        # Expand for batch
+        y_grid = y_grid.unsqueeze(0).expand(B, -1, -1)
+        x_grid = x_grid.unsqueeze(0).expand(B, -1, -1)
+
+        # Soft boundaries using sigmoid
+        left = torch.sigmoid(edge_softness * (x_grid - x1.view(B, 1, 1)))
+        right = torch.sigmoid(edge_softness * (x2.view(B, 1, 1) - x_grid))
+        top = torch.sigmoid(edge_softness * (y_grid - y1.view(B, 1, 1)))
+        bottom = torch.sigmoid(edge_softness * (y2.view(B, 1, 1) - y_grid))
+
+        mask = left * right * top * bottom
+        return mask.unsqueeze(1)  # (B, 1, H, W)
+
+
 class DifferentiableSAMRefiner(nn.Module):
     """
     Differentiable SAM Refiner for end-to-end training.
@@ -43,6 +325,8 @@ class DifferentiableSAMRefiner(nn.Module):
         selection_temperature=0.1,
         box_temperature=0.01,
         mask_prompt_style='gaussian',
+        use_roi_crop=False,
+        roi_expand_ratio=0.2,
     ):
         """
         Args:
@@ -60,6 +344,10 @@ class DifferentiableSAMRefiner(nn.Module):
                 - 'gaussian': Apply Gaussian blur (softer boundaries, recommended)
                 - 'direct': Direct conversion (sharp boundaries)
                 - 'distance': Distance-weighted confidence (SDF-like)
+            use_roi_crop: Whether to crop to ROI before SAM processing.
+                         This focuses SAM computation on the lesion area and
+                         provides higher effective resolution. Fully differentiable.
+            roi_expand_ratio: Ratio to expand ROI box (0.2 = 20% on each side)
         """
         super().__init__()
 
@@ -72,6 +360,8 @@ class DifferentiableSAMRefiner(nn.Module):
         self.selection_temperature = selection_temperature
         self.box_temperature = box_temperature
         self.mask_prompt_style = mask_prompt_style
+        self.use_roi_crop = use_roi_crop
+        self.roi_expand_ratio = roi_expand_ratio
 
         # Freeze components if specified
         if freeze_image_encoder:
@@ -81,6 +371,14 @@ class DifferentiableSAMRefiner(nn.Module):
         if freeze_prompt_encoder:
             for param in self.sam.prompt_encoder.parameters():
                 param.requires_grad = False
+
+        # ROI cropper for focused processing
+        if use_roi_crop:
+            self.roi_cropper = DifferentiableROICropper(
+                target_size=self.sam.image_encoder.img_size,
+                expand_ratio=roi_expand_ratio,
+                box_temperature=box_temperature,
+            )
 
         # Learnable temperature for soft argmax (optional)
         self.register_buffer('_dummy', torch.tensor(0.0))  # For device tracking
@@ -385,11 +683,19 @@ class DifferentiableSAMRefiner(nn.Module):
                 - 'iou_predictions': IoU predictions (B, 3)
                 - 'low_res_masks': Low resolution masks (B, 3, 256, 256)
                 - 'prompts': Dictionary of prompts used (if return_intermediate)
+                - 'roi_boxes': ROI boxes used (if use_roi_crop=True and return_intermediate)
         """
         B = image.shape[0]
         device = image.device
         original_size = coarse_mask.shape[-2:]
 
+        # ROI Cropping Mode: Focus SAM computation on lesion area
+        if self.use_roi_crop:
+            return self._forward_with_roi(
+                image, coarse_mask, return_intermediate, image_already_normalized
+            )
+
+        # Standard full-image mode
         # Get image embeddings (frozen, but keep in graph for proper device handling)
         with torch.set_grad_enabled(self.sam.image_encoder.training):
             if image_already_normalized:
@@ -516,6 +822,160 @@ class DifferentiableSAMRefiner(nn.Module):
         if return_intermediate:
             result['prompts'] = prompts
             result['image_embeddings'] = image_embeddings
+
+        return result
+
+    def _forward_with_roi(
+        self,
+        image: torch.Tensor,
+        coarse_mask: torch.Tensor,
+        return_intermediate: bool = False,
+        image_already_normalized: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass with ROI cropping for focused SAM processing.
+
+        This method:
+        1. Extracts ROI bounding box from coarse mask
+        2. Crops image and mask to ROI at full SAM resolution
+        3. Processes through SAM
+        4. Pastes result back to full image size
+
+        All operations are fully differentiable.
+
+        Args:
+            Same as forward()
+
+        Returns:
+            Same as forward(), plus 'roi_boxes' if return_intermediate=True
+        """
+        B = image.shape[0]
+        device = image.device
+        original_size = coarse_mask.shape[-2:]
+        target_size = self.sam.image_encoder.img_size
+
+        # Step 1: Extract ROI boxes from coarse mask
+        roi_boxes = self.roi_cropper.extract_roi_box(coarse_mask)
+
+        # Step 2: Crop and resize image and mask to ROI
+        # The cropped regions will be at full SAM resolution (1024x1024)
+        image_cropped, crop_info = self.roi_cropper.crop_and_resize(
+            image, roi_boxes, is_mask=False
+        )
+        mask_cropped, _ = self.roi_cropper.crop_and_resize(
+            coarse_mask, roi_boxes, is_mask=False  # Use bilinear for soft masks
+        )
+
+        # Step 3: Get image embeddings for cropped region
+        with torch.set_grad_enabled(self.sam.image_encoder.training):
+            if image_already_normalized:
+                input_images = image_cropped
+            else:
+                input_images = torch.stack([self.sam.preprocess(img) for img in image_cropped])
+
+            image_embeddings = self.sam.image_encoder(input_images)
+
+        # Step 4: Extract prompts from CROPPED mask (coordinates are in cropped space)
+        prompts = {}
+        cropped_size = (target_size, target_size)
+
+        # Box prompts - in cropped space, the box should roughly fill the image
+        if self.use_box_prompt:
+            boxes = self.extract_soft_box(mask_cropped)
+            prompts['boxes'] = boxes
+
+        # Point prompts
+        if self.use_point_prompt:
+            point_coords, point_labels = self.extract_soft_points(mask_cropped, self.num_points)
+
+            if self.add_negative_point and self.use_box_prompt:
+                neg_coords, neg_labels = self.extract_soft_negative_points(mask_cropped, boxes)
+                point_coords = torch.cat([point_coords, neg_coords], dim=1)
+                point_labels = torch.cat([point_labels, neg_labels], dim=1)
+
+            prompts['point_coords'] = point_coords
+            prompts['point_labels'] = point_labels
+
+        # Mask prompts
+        if self.use_mask_prompt:
+            mask_input = self.prepare_mask_input(mask_cropped, style=self.mask_prompt_style)
+            prompts['mask_inputs'] = mask_input
+
+        # Step 5: Run through SAM decoder
+        all_masks = []
+        all_ious = []
+        all_low_res = []
+
+        for b in range(B):
+            curr_embedding = image_embeddings[b].unsqueeze(0)
+
+            point_input = None
+            if self.use_point_prompt:
+                point_input = (
+                    prompts['point_coords'][b:b + 1],
+                    prompts['point_labels'][b:b + 1]
+                )
+
+            box_input = prompts.get('boxes', None)
+            if box_input is not None:
+                box_input = box_input[b:b + 1]
+
+            mask_input = prompts.get('mask_inputs', None)
+            if mask_input is not None:
+                mask_input = mask_input[b:b + 1]
+
+            sparse_embeddings, dense_embeddings = self.sam.prompt_encoder(
+                points=point_input,
+                boxes=box_input,
+                masks=mask_input,
+            )
+
+            low_res_masks, iou_predictions = self.sam.mask_decoder(
+                image_embeddings=curr_embedding,
+                image_pe=self.sam.prompt_encoder.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=True,
+            )
+
+            # Upscale to cropped size (1024x1024)
+            masks = F.interpolate(
+                low_res_masks,
+                size=cropped_size,
+                mode='bilinear',
+                align_corners=False
+            )
+
+            all_masks.append(masks.squeeze(0))
+            all_ious.append(iou_predictions.squeeze(0))
+            all_low_res.append(low_res_masks.squeeze(0))
+
+        all_masks = torch.stack(all_masks)  # (B, 3, 1024, 1024)
+        all_ious = torch.stack(all_ious)  # (B, 3)
+        all_low_res = torch.stack(all_low_res)  # (B, 3, 256, 256)
+
+        # Step 6: Soft mask selection in cropped space
+        refined_masks_cropped = self.soft_mask_selection(all_masks, all_ious)  # (B, 1024, 1024)
+
+        # Step 7: Paste back to original size
+        # Create zero background for areas outside ROI
+        background = torch.zeros(B, *original_size, device=device)
+        refined_masks = self.roi_cropper.paste_back(
+            refined_masks_cropped, crop_info, background=None
+        )
+
+        result = {
+            'masks': refined_masks,
+            'masks_all': all_masks,  # In cropped space
+            'iou_predictions': all_ious,
+            'low_res_masks': all_low_res,
+        }
+
+        if return_intermediate:
+            result['prompts'] = prompts
+            result['image_embeddings'] = image_embeddings
+            result['roi_boxes'] = roi_boxes
+            result['crop_info'] = crop_info
 
         return result
 
