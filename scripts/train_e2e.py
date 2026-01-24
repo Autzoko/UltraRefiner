@@ -247,8 +247,9 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, writ
         image = batch['image'].to(device)
         label = batch['label'].to(device)
 
-        # Forward pass
-        outputs = model(image)
+        # Forward pass (return_all=True for first batch to debug SAM masks)
+        return_all = (batch_idx == 0 and epoch == 0)
+        outputs = model(image, return_all=return_all)
 
         # DEBUG: Print mask statistics for first batch of first epoch
         if batch_idx == 0 and epoch == 0:
@@ -262,6 +263,17 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, writ
                 print(f"  ├── Refined prob:   min={refined_prob.min():.4f}, max={refined_prob.max():.4f}, mean={refined_prob.mean():.4f}")
                 print(f"  ├── Refined > 0.5:  {(refined_prob > 0.5).float().mean():.4f} of pixels")
                 print(f"  └── Label > 0.5:    {(label > 0.5).float().mean():.4f} of pixels")
+
+                # Check SAM's 3 candidate masks and IoU predictions
+                if 'sam_masks_all' in outputs:
+                    masks_all = outputs['sam_masks_all']  # (B, 3, H, W)
+                    iou_preds = outputs['iou_predictions']  # (B, 3)
+                    print(f"\n  [DEBUG] SAM's 3 Candidate Masks:")
+                    for i in range(3):
+                        mask_i = torch.sigmoid(masks_all[0, i])
+                        area = (mask_i > 0.5).float().mean()
+                        print(f"  ├── Mask {i}: area={area:.4f}, IoU_pred={iou_preds[0, i]:.4f}")
+                    print(f"  └── SAM prefers mask with highest IoU prediction")
 
         # Compute loss
         loss, loss_dict = criterion(outputs, label)
