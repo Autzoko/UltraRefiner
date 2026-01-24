@@ -39,6 +39,8 @@ class UltraRefiner(nn.Module):
         use_box_prompt: bool = True,
         use_mask_prompt: bool = True,
         mask_prompt_style: str = 'direct',  # 'direct' for E2E (TransUNet outputs are smooth)
+        sharpen_coarse_mask: bool = False,  # Sharpen soft masks to be more binary-like
+        sharpen_temperature: float = 10.0,  # Temperature for sharpening (higher = sharper)
     ):
         """
         Args:
@@ -55,12 +57,16 @@ class UltraRefiner(nn.Module):
             use_box_prompt: Whether to use box prompts in refinement
             use_mask_prompt: Whether to use mask prompts in refinement
             mask_prompt_style: Style for mask prompt ('direct' for E2E, 'gaussian' for SAM finetuning)
+            sharpen_coarse_mask: Whether to sharpen soft masks to match Phase 2 training distribution
+            sharpen_temperature: Temperature for sharpening (higher = more binary-like)
         """
         super().__init__()
 
         self.img_size = img_size
         self.sam_img_size = sam_img_size
         self.num_classes = num_classes
+        self.sharpen_coarse_mask = sharpen_coarse_mask
+        self.sharpen_temperature = sharpen_temperature
 
         # Build TransUNet
         transunet_config.n_classes = num_classes
@@ -214,6 +220,12 @@ class UltraRefiner(nn.Module):
             coarse_mask_prob = torch.softmax(transunet_output, dim=1)[:, 1]  # (B, H, W)
         else:
             coarse_mask_prob = torch.sigmoid(transunet_output[:, 1:].sum(dim=1))  # (B, H, W)
+
+        # Optional: Sharpen soft mask to be more binary-like (matches Phase 2 training distribution)
+        # This uses a differentiable soft-threshold: sigmoid((x - 0.5) * temperature)
+        # Higher temperature = sharper (more binary-like)
+        if self.sharpen_coarse_mask:
+            coarse_mask_prob = torch.sigmoid((coarse_mask_prob - 0.5) * self.sharpen_temperature)
 
         # Step 2: Prepare image for SAM
         sam_image = self.prepare_sam_input(image)

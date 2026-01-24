@@ -101,6 +101,15 @@ def get_args():
     parser.add_argument('--unfreeze_sam_epoch', type=int, default=0,
                         help='Epoch to unfreeze SAM (0=never freeze, >0=two-stage training)')
 
+    # Coarse mask processing (to match Phase 2 training distribution)
+    parser.add_argument('--sharpen_coarse_mask', action='store_true', default=False,
+                        help='Sharpen soft TransUNet outputs to be more binary-like (matches Phase 2)')
+    parser.add_argument('--sharpen_temperature', type=float, default=10.0,
+                        help='Temperature for sharpening (higher = more binary-like)')
+    parser.add_argument('--mask_prompt_style', type=str, default='gaussian',
+                        choices=['gaussian', 'direct', 'distance'],
+                        help='Mask prompt style (use gaussian to match Phase 2 training)')
+
     # Output arguments
     parser.add_argument('--output_dir', type=str, default='./checkpoints/ultra_refiner',
                         help='Output directory for checkpoints')
@@ -373,6 +382,9 @@ def main():
         n_skip=args.n_skip,
         freeze_sam_image_encoder=args.freeze_sam_image_encoder,
         freeze_sam_prompt_encoder=args.freeze_sam_prompt_encoder,
+        sharpen_coarse_mask=args.sharpen_coarse_mask,
+        sharpen_temperature=args.sharpen_temperature,
+        mask_prompt_style=args.mask_prompt_style,
     ).to(device)
 
     logging.info('Built UltraRefiner model')
