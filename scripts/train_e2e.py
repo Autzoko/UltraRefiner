@@ -761,6 +761,13 @@ def main():
         logging.info(f'Epoch {epoch} Val Coarse: {val_metrics["coarse"]}')
         logging.info(f'Epoch {epoch} Val Refined: {val_metrics["refined"]}')
 
+        # Extract metrics for comparison (define early for use in tensorboard and printing)
+        coarse_dice = val_metrics['coarse']['dice']
+        refined_dice = val_metrics['refined']['dice']
+        baseline_dice = baseline_metrics['dice']
+        coarse_vs_baseline = coarse_dice - baseline_dice
+        refined_vs_coarse = refined_dice - coarse_dice
+
         # Update scheduler
         scheduler.step()
 
@@ -771,7 +778,7 @@ def main():
             writer.add_scalar(f'val/refined_{key}', value, epoch)
 
         # Log TransUNet performance vs baseline
-        writer.add_scalar('val/transunet_vs_baseline', coarse_dice - baseline_dice, epoch)
+        writer.add_scalar('val/transunet_vs_baseline', coarse_vs_baseline, epoch)
         writer.add_scalar('val/baseline_dice', baseline_dice, epoch)
 
         current_lr = scheduler.get_last_lr()[0]
@@ -779,7 +786,6 @@ def main():
         writer.add_scalar('train/lr_sam', scheduler.get_last_lr()[1], epoch)
 
         # Save checkpoint (based on refined dice)
-        refined_dice = val_metrics['refined']['dice']
         is_best = refined_dice > best_dice
         if is_best:
             best_dice = refined_dice
@@ -793,15 +799,6 @@ def main():
             lr=current_lr,
             is_best=is_best
         )
-
-        # Print coarse vs refined comparison (with baseline comparison)
-        coarse_dice = val_metrics['coarse']['dice']
-        refined_dice = val_metrics['refined']['dice']
-        baseline_dice = baseline_metrics['dice']
-
-        # Calculate changes from baseline
-        coarse_vs_baseline = coarse_dice - baseline_dice
-        refined_vs_coarse = refined_dice - coarse_dice
 
         print(f"\n  Performance Comparison:")
         print(f"  ├── Baseline (Phase 1):  {baseline_dice:.4f}")
