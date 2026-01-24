@@ -43,47 +43,229 @@ SAM input requirements:
 2. DIFFERENTIABLE PROMPT GENERATION (Key Innovation)
 ================================================================================
 
-The core technical contribution is our differentiable prompt generator that converts TransUNet's soft probability outputs into SAM-compatible prompts while maintaining gradient flow.
+The core technical contribution is our differentiable prompt generator that converts
+TransUNet's soft probability outputs into SAM-compatible prompts while maintaining
+gradient flow. All three prompt types are fully differentiable.
 
-2.1 Soft-Argmax Point Extraction
---------------------------------
-Instead of hard argmax (non-differentiable), we compute the expected centroid:
+2.1 Point Prompts via Soft-Argmax
+---------------------------------
+Instead of hard argmax (non-differentiable), we compute expected coordinates using
+probability-weighted averages.
 
-  Given soft mask M of shape (H, W) with values in [0, 1]:
+**Positive Point (Foreground Centroid):**
+Given soft mask P of shape (H, W) with values in [0, 1]:
 
-  mask_sum = sum(M) + epsilon                    # Normalization factor
-  x_center = sum(M * X_grid) / mask_sum          # Weighted x-coordinate
-  y_center = sum(M * Y_grid) / mask_sum          # Weighted y-coordinate
+  mask_sum = Σ P(i,j) + ε                        # Normalization factor
+  x_center = Σ (P(i,j) × x_j) / mask_sum         # Weighted x-coordinate
+  y_center = Σ (P(i,j) × y_i) / mask_sum         # Weighted y-coordinate
 
-  point_coords = (x_center, y_center)            # Shape: (B, 1, 2)
-  point_labels = 1                               # Positive point
+  point_pos = (x_center, y_center)               # Foreground centroid
+  label_pos = 1                                  # Positive label
 
-For negative points (background), we compute centroid of inverse mask within bounding box:
-  inv_mask = (1 - M) * box_mask
-  neg_point = soft_argmax(inv_mask)
-  neg_label = 0
+**Negative Point (Background Centroid within Bounding Box):**
+To provide a meaningful background point, we compute the centroid of the inverse
+mask restricted to the bounding box region:
 
-2.2 Differentiable Bounding Box Extraction
-------------------------------------------
-We derive box coordinates from mask projections:
+  # Create soft bounding box mask using sigmoid boundaries
+  soft_box = σ((x - x1)/τ) × σ((x2 - x)/τ) × σ((y - y1)/τ) × σ((y2 - y)/τ)
 
-  binary_mask = (M > 0.5)                        # Threshold for boundary detection
-  y_proj = max(binary_mask, dim=1)              # Project to y-axis
-  x_proj = max(binary_mask, dim=0)              # Project to x-axis
+  # Inverse mask within box region
+  inv_mask = (1 - P) × soft_box
+  inv_sum = Σ inv_mask + ε
 
-  y_indices = nonzero(y_proj)
-  x_indices = nonzero(x_proj)
+  x_neg = Σ (inv_mask × x) / inv_sum
+  y_neg = Σ (inv_mask × y) / inv_sum
 
-  box = (x_min, y_min, x_max, y_max)            # Shape: (B, 4)
+  point_neg = (x_neg, y_neg)                     # Background centroid
+  label_neg = 0                                  # Negative label
 
-2.3 Continuous Mask Prompt Encoding
------------------------------------
-We preserve the full probability distribution:
+**Combined Points:**
+  point_coords = [(x_center, y_center), (x_neg, y_neg)]   # Shape: (B, 2, 2)
+  point_labels = [1, 0]                                    # Shape: (B, 2)
 
-  mask_logits = (M * 2 - 1) * 10                 # Scale [0,1] to [-10, 10]
-  mask_input = Resize(mask_logits, (256, 256))  # SAM's expected size
+2.2 Box Prompts via Weighted Statistics
+---------------------------------------
+Traditional bounding box extraction uses hard thresholding (non-differentiable).
+We instead compute box coordinates from mask-weighted coordinate statistics.
 
+**Weighted Centroid:**
+  mask_sum = Σ P(i,j) + ε
+  center_x = Σ (P × x) / mask_sum                # Weighted mean x
+  center_y = Σ (P × y) / mask_sum                # Weighted mean y
+
+**Weighted Standard Deviation:**
+  x_diff = x - center_x
+  y_diff = y - center_y
+
+  var_x = Σ (P × x_diff²) / mask_sum             # Weighted variance x
+  var_y = Σ (P × y_diff²) / mask_sum             # Weighted variance y
+
+  std_x = √(var_x + ε)
+  std_y = √(var_y + ε)
+
+**Box Bounds (Center ± k×std, where k=2.5 covers ~99% of probability mass):**
+  x1 = center_x - 2.5 × std_x
+  x2 = center_x + 2.5 × std_x
+  y1 = center_y - 2.5 × std_y
+  y2 = center_y + 2.5 × std_y
+
+  # Clamp to image boundaries
+  box = (clamp(x1, 0, W), clamp(y1, 0, H), clamp(x2, 0, W), clamp(y2, 0, H))
+
+**Why Weighted Statistics Instead of Soft-Min/Max?**
+Soft-min/max approaches (e.g., using softmax over coordinates) can be dominated
+by background pixels when the mask is sparse. Our weighted statistics approach
+correctly restricts computation to the mask region by using P as weights.
+
+2.3 Mask Prompts via Direct/Gaussian Conversion
+-----------------------------------------------
+The soft probability mask is converted to SAM's expected logit format.
+
+**Logit Conversion:**
+  mask_logits = (P × 2 - 1) × 10                 # Maps [0,1] → [-10, +10]
+
+**Two Styles for Different SAM Checkpoints:**
+
+1. **Gaussian Style** (for unfinetuned SAM/MedSAM):
+   - Applies Gaussian blur (σ=3) before logit conversion
+   - Creates softer boundaries matching SAM's original training distribution
+   - Recommended when skipping Phase 2 (SAM finetuning)
+
+   mask_blurred = GaussianBlur(P, kernel=7, sigma=3)
+   mask_logits = (mask_blurred × 2 - 1) × 10
+
+2. **Direct Style** (for Phase 2-finetuned SAM):
+   - Passes soft mask directly without blur
+   - Preserves TransUNet's output distribution
+   - Must match Phase 2 training setting for consistency
+
+   mask_logits = (P × 2 - 1) × 10
+
+**Downsampling to SAM's Expected Size:**
+  mask_input = Resize(mask_logits, (256, 256), mode='bilinear')
   # Shape: (B, 1, 256, 256)
+
+================================================================================
+2.4 ROI CROPPING MODE (Optional Advanced Feature)
+================================================================================
+
+ROI (Region of Interest) cropping focuses SAM's computation on the lesion area
+at full 1024×1024 resolution, improving detail preservation for small lesions.
+
+**Motivation:**
+When processing the full image at 1024×1024, small lesions may occupy only a
+tiny fraction of pixels, limiting SAM's ability to capture fine boundary details.
+ROI cropping extracts the lesion region, processes it at full SAM resolution,
+then pastes the result back.
+
+**2.4.1 Differentiable ROI Box Extraction**
+-------------------------------------------
+We use the same weighted statistics approach as box prompts:
+
+  center_x = Σ (P × x) / Σ P
+  center_y = Σ (P × y) / Σ P
+  std_x = √(Σ (P × (x - center_x)²) / Σ P)
+  std_y = √(Σ (P × (y - center_y)²) / Σ P)
+
+  # Expand box by roi_expand_ratio (default 0.2 = 20% on each side)
+  expand = roi_expand_ratio
+  roi_x1 = center_x - (1 + expand) × 2.5 × std_x
+  roi_x2 = center_x + (1 + expand) × 2.5 × std_x
+  roi_y1 = center_y - (1 + expand) × 2.5 × std_y
+  roi_y2 = center_y + (1 + expand) × 2.5 × std_y
+
+**2.4.2 Differentiable ROI Cropping via grid_sample**
+-----------------------------------------------------
+Instead of hard indexing (non-differentiable), we use PyTorch's grid_sample
+for differentiable spatial transformation:
+
+  # Compute normalized coordinates for grid_sample
+  # grid_sample expects coordinates in [-1, 1] range
+  grid_x = linspace(roi_x1/W × 2 - 1, roi_x2/W × 2 - 1, 1024)
+  grid_y = linspace(roi_y1/H × 2 - 1, roi_y2/H × 2 - 1, 1024)
+  grid = meshgrid(grid_x, grid_y)                # Shape: (1024, 1024, 2)
+
+  # Crop image and mask to ROI at full SAM resolution
+  image_roi = grid_sample(image, grid, mode='bilinear', align_corners=False)
+  mask_roi = grid_sample(coarse_mask, grid, mode='bilinear', align_corners=False)
+  # Both shapes: (B, C, 1024, 1024)
+
+**2.4.3 Prompt Generation in ROI Coordinate Space**
+---------------------------------------------------
+With ROI mode, prompts are generated in the ROI's local coordinate system:
+
+  # Points are extracted from mask_roi (1024×1024 ROI space)
+  point_coords_roi = extract_soft_points(mask_roi)   # In [0, 1024] range
+
+  # Box prompt covers the mask within ROI (already full-resolution)
+  box_roi = extract_soft_box(mask_roi)               # In [0, 1024] range
+
+  # Mask prompt from ROI mask
+  mask_input = prepare_mask(mask_roi)                # Shape: (B, 1, 256, 256)
+
+**2.4.4 SAM Processing in ROI Space**
+-------------------------------------
+SAM processes the cropped ROI image at full 1024×1024 resolution:
+
+  img_embedding = sam.image_encoder(image_roi)       # Full resolution encoding
+
+  sparse_emb, dense_emb = sam.prompt_encoder(
+      points=(point_coords_roi, point_labels),       # ROI coordinates
+      boxes=box_roi,                                  # ROI coordinates
+      masks=mask_input
+  )
+
+  refined_mask_roi = sam.mask_decoder(img_embedding, sparse_emb, dense_emb)
+  # Shape: (B, 1024, 1024) in ROI space
+
+**2.4.5 Differentiable ROI Paste-Back**
+---------------------------------------
+The refined mask is pasted back to the original image space using inverse grid_sample:
+
+  # Create output canvas (zeros = background)
+  refined_full = zeros(B, H_original, W_original)
+
+  # Compute inverse grid (from original space to ROI space)
+  inv_grid_x = (x - roi_x1) / (roi_x2 - roi_x1) × 2 - 1
+  inv_grid_y = (y - roi_y1) / (roi_y2 - roi_y1) × 2 - 1
+
+  # Sample from ROI result using inverse grid
+  # Only pixels within ROI bounds get valid values
+  refined_full = grid_sample(refined_mask_roi, inv_grid, mode='bilinear')
+
+  # Mask out regions outside ROI (set to background)
+  roi_mask = (x >= roi_x1) & (x <= roi_x2) & (y >= roi_y1) & (y <= roi_y2)
+  refined_full = refined_full × roi_mask
+
+**2.4.6 Complete ROI Pipeline**
+-------------------------------
+  INPUT: image (B, 3, 1024, 1024), coarse_mask (B, 1024, 1024)
+
+  Step 1: Extract ROI box from coarse_mask
+          roi_box = extract_roi_box(coarse_mask, expand_ratio=0.2)
+
+  Step 2: Crop image and mask to ROI
+          image_roi = differentiable_crop(image, roi_box, size=1024)
+          mask_roi = differentiable_crop(coarse_mask, roi_box, size=1024)
+
+  Step 3: Generate prompts in ROI space
+          points_roi = extract_soft_points(mask_roi)     # ROI coordinates
+          box_roi = extract_soft_box(mask_roi)           # ROI coordinates
+          mask_prompt = prepare_mask(mask_roi)           # 256×256 logits
+
+  Step 4: SAM forward pass on ROI
+          img_emb = sam.image_encoder(image_roi)
+          refined_roi = sam.mask_decoder(img_emb, points_roi, box_roi, mask_prompt)
+
+  Step 5: Paste refined mask back to original space
+          refined_full = differentiable_paste(refined_roi, roi_box, original_size)
+
+  OUTPUT: refined_full (B, 1024, 1024)
+
+**Phase 2 ↔ Phase 3 ROI Consistency:**
+If ROI mode is used in Phase 3, it MUST also be used in Phase 2 with the same
+roi_expand_ratio. This ensures SAM sees the same input distribution during
+finetuning and end-to-end training.
 
 ================================================================================
 3. THREE-PHASE TRAINING PIPELINE
@@ -311,21 +493,29 @@ POINT PROMPTS (Foreground + Background):
   scale = 1024 / 224
   point_coords_scaled = point_coords * scale         # Shape: (B, 2, 2)
 
-BOX PROMPTS:
-  # Threshold mask to find boundaries
-  binary_mask = (coarse_mask > 0.5)
+BOX PROMPTS (Weighted Statistics - Fully Differentiable):
+  # Compute weighted centroid
+  mask_sum = coarse_mask.sum() + 1e-6
+  center_x = (coarse_mask * X_grid).sum() / mask_sum
+  center_y = (coarse_mask * Y_grid).sum() / mask_sum
 
-  # Project to axes and find extent
-  y_proj = binary_mask.any(dim=1)                    # Which rows have foreground
-  x_proj = binary_mask.any(dim=0)                    # Which cols have foreground
+  # Compute weighted standard deviation
+  x_diff = X_grid - center_x
+  y_diff = Y_grid - center_y
+  var_x = (coarse_mask * x_diff**2).sum() / mask_sum
+  var_y = (coarse_mask * y_diff**2).sum() / mask_sum
+  std_x = sqrt(var_x + 1e-6)
+  std_y = sqrt(var_y + 1e-6)
 
-  y_indices = nonzero(y_proj)
-  x_indices = nonzero(x_proj)
+  # Box from center ± 2.5*std (covers ~99% of probability mass)
+  x_min = center_x - 2.5 * std_x
+  x_max = center_x + 2.5 * std_x
+  y_min = center_y - 2.5 * std_y
+  y_max = center_y + 2.5 * std_y
 
-  y_min, y_max = y_indices.min(), y_indices.max()
-  x_min, x_max = x_indices.min(), x_indices.max()
-
-  box = (x_min, y_min, x_max, y_max)                 # Shape: (B, 4)
+  # Clamp to image boundaries
+  box = (clamp(x_min, 0, W), clamp(y_min, 0, H),
+         clamp(x_max, 0, W), clamp(y_max, 0, H))    # Shape: (B, 4)
 
   # Scale to SAM coordinate system
   box_scaled = box * scale                           # Shape: (B, 4)
