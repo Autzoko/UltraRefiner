@@ -795,9 +795,18 @@ def main():
         writer.add_scalar('val/transunet_vs_baseline', coarse_vs_baseline, epoch)
         writer.add_scalar('val/baseline_dice', baseline_dice, epoch)
 
-        current_lr = scheduler.get_last_lr()[0]
-        writer.add_scalar('train/lr_transunet', current_lr, epoch)
-        writer.add_scalar('train/lr_sam', scheduler.get_last_lr()[1], epoch)
+        # Log learning rates (handle variable number of param groups)
+        lrs = scheduler.get_last_lr()
+        if len(lrs) == 1:
+            # Only one param group (either TransUNet or SAM is frozen)
+            if transunet_frozen:
+                writer.add_scalar('train/lr_sam', lrs[0], epoch)
+            else:
+                writer.add_scalar('train/lr_transunet', lrs[0], epoch)
+        else:
+            # Both param groups present
+            writer.add_scalar('train/lr_transunet', lrs[0], epoch)
+            writer.add_scalar('train/lr_sam', lrs[1], epoch)
 
         # Save checkpoint (based on refined dice)
         is_best = refined_dice > best_dice
