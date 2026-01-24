@@ -797,6 +797,7 @@ def main():
 
         # Log learning rates (handle variable number of param groups)
         lrs = scheduler.get_last_lr()
+        current_lr = lrs[0]  # Use first param group's LR for display
         if len(lrs) == 1:
             # Only one param group (either TransUNet or SAM is frozen)
             if transunet_frozen:
