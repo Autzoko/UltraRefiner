@@ -154,10 +154,49 @@ Two checkpoints are saved:
 
 ### Phase 3: End-to-End Training
 
-Joint optimization with gradients flowing through differentiable prompts:
+Joint optimization with gradients flowing through differentiable prompts.
+
+#### Recommended Command (with TransUNet Protection)
+
+During E2E training, gradients from SAM can destabilize TransUNet. Use these protection mechanisms:
 
 ```bash
-# With Phase 2-finetuned SAM (RECOMMENDED)
+# RECOMMENDED: Full E2E training with TransUNet protection
+python scripts/train_e2e.py \
+    --data_root ./dataset/processed \
+    --datasets BUSI \
+    --fold 0 \
+    --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
+    --sam_checkpoint ./checkpoints/sam_finetuned/COMBINED/best_sam.pth \
+    --mask_prompt_style direct \
+    --max_epochs 100 \
+    --transunet_lr 1e-6 \
+    --sam_lr 1e-5 \
+    --coarse_loss_weight 0.7 \
+    --refined_loss_weight 0.3 \
+    --transunet_grad_scale 0.1 \
+    --transunet_weight_reg 0.01 \
+    --grad_clip 1.0
+```
+
+#### TransUNet Protection Options
+
+| Flag | Recommended | Purpose |
+|------|-------------|---------|
+| `--transunet_lr` | `1e-6` | Lower learning rate prevents large weight updates |
+| `--coarse_loss_weight` | `0.7` | Higher weight maintains TransUNet quality |
+| `--transunet_grad_scale` | `0.1` | Scales gradients from SAM to 10% (reduces SAM's influence) |
+| `--transunet_weight_reg` | `0.01` | L2 penalty anchors weights to Phase 1 checkpoint |
+| `--freeze_transunet_epochs` | `5-10` | Optional: let SAM adapt first before joint training |
+
+The script automatically:
+1. **Evaluates TransUNet baseline** before training starts
+2. **Compares performance** at each epoch (warns if TransUNet degrades)
+3. **Logs to TensorBoard** for monitoring
+
+#### Basic Command (without protection)
+
+```bash
 python scripts/train_e2e.py \
     --data_root ./dataset/processed \
     --datasets BUSI \
@@ -189,6 +228,8 @@ python scripts/train_e2e.py \
     --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
     --sam_checkpoint ./pretrained/medsam_vit_b.pth \
     --mask_prompt_style gaussian \
+    --transunet_grad_scale 0.1 \
+    --transunet_weight_reg 0.01 \
     --max_epochs 100
 ```
 
@@ -284,13 +325,16 @@ python scripts/finetune_sam_augmented.py \
     --sam_checkpoint ./pretrained/medsam_vit_b.pth \
     --mask_prompt_style direct --transunet_img_size 224
 
-# 4. Phase 3: End-to-end training
+# 4. Phase 3: End-to-end training (RECOMMENDED with protection)
 python scripts/train_e2e.py \
     --data_root ./dataset/processed \
     --datasets BUSI --fold 0 \
     --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
     --sam_checkpoint ./checkpoints/sam_finetuned/COMBINED/best_sam.pth \
-    --mask_prompt_style direct
+    --mask_prompt_style direct \
+    --transunet_lr 1e-6 --sam_lr 1e-5 \
+    --coarse_loss_weight 0.7 --refined_loss_weight 0.3 \
+    --transunet_grad_scale 0.1 --transunet_weight_reg 0.01
 ```
 
 ---
