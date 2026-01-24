@@ -12,10 +12,12 @@ Key Design Principles:
 4. Mix perfect, mildly corrupted, and heavily corrupted masks
 
 Target Distribution:
-- Dice 1.0 (Perfect): 10% of samples - Teaches preservation of good predictions
-- Dice 0.9-1.0 (Good): 15% of samples - Minor artifacts, should mostly preserve
+- Dice 0.9-0.99 (Good): 25% of samples - Minor artifacts, mostly preserve
 - Dice 0.8-0.9 (Medium): 40% of samples - Moderate errors, needs refinement
 - Dice 0.6-0.8 (Poor): 35% of samples - Severe failures, needs strong correction
+
+Note: No Dice=1.0 (perfect/unchanged) masks are generated. This prevents the model
+from learning to simply copy the input when it sees high-quality masks.
 
 Augmentation Types (mimicking real segmentation model failures):
 
@@ -52,6 +54,11 @@ Augmentation Backends:
 2. SDF-based (--use_sdf): Mathematically grounded operations in signed distance
    function domain, producing smoother and more anatomically plausible deformations
 
+Soft Mask Mode (--soft_masks):
+    When enabled, coarse masks are saved as soft probability maps (NPY float files)
+    with Gaussian-blurred boundaries, matching the output distribution of TransUNet.
+    This is CRITICAL for Phase 2 -> Phase 3 compatibility in end-to-end training.
+
 Usage:
     # Single dataset
     python scripts/generate_augmented_data.py \
@@ -74,6 +81,14 @@ Usage:
         --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
         --target_samples 100000 \
         --use_sdf
+
+    # Soft masks for Phase 3 compatibility (RECOMMENDED for E2E training)
+    python scripts/generate_augmented_data.py \
+        --data_root ./dataset/processed \
+        --output_dir ./dataset/augmented_soft \
+        --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
+        --target_samples 100000 \
+        --soft_masks
 """
 
 import argparse
@@ -110,6 +125,60 @@ def compute_dice(pred, gt, threshold=0.5):
         return 1.0 if np.sum(gt_binary) == 0 else 0.0
 
     return 2.0 * intersection / union
+
+
+def create_soft_mask(binary_mask, blur_sigma=None, boundary_noise_std=0.1):
+    """
+    Convert a binary mask to a soft probability mask that matches TransUNet output distribution.
+
+    TransUNet produces soft probability maps with:
+    1. Smooth boundaries (due to bilinear upsampling and softmax)
+    2. High confidence in core regions
+    3. Gradual transitions at edges
+
+    This function simulates this distribution by:
+    1. Applying Gaussian blur to create smooth boundaries
+    2. Adding slight noise to simulate prediction uncertainty
+    3. Ensuring values stay in [0, 1] range
+
+    Args:
+        binary_mask: Binary mask (H, W) with values in {0, 1} or [0, 1]
+        blur_sigma: Gaussian blur sigma. If None, auto-computed based on mask size.
+                   Larger sigma = smoother boundaries.
+        boundary_noise_std: Standard deviation of noise added at boundaries.
+
+    Returns:
+        soft_mask: Soft probability mask (H, W) with values in [0, 1]
+    """
+    H, W = binary_mask.shape
+
+    # Ensure binary
+    binary = (binary_mask > 0.5).astype(np.float32)
+
+    # Auto-compute blur sigma based on mask size (similar to TransUNet's upsampling effect)
+    if blur_sigma is None:
+        # TransUNet uses 16x upsampling from 14x14 to 224x224
+        # The effective blur is proportional to image size / patch_grid_size
+        blur_sigma = max(2.0, min(H, W) / 56.0)  # Typical range: 2-10 for 224-512 images
+
+    # Step 1: Apply Gaussian blur to create smooth boundaries
+    soft_mask = gaussian_filter(binary, sigma=blur_sigma)
+
+    # Step 2: Find boundary region and add slight uncertainty noise
+    # Boundary is where the soft mask is between 0.1 and 0.9
+    boundary_mask = (soft_mask > 0.1) & (soft_mask < 0.9)
+
+    if boundary_noise_std > 0 and np.any(boundary_mask):
+        noise = np.random.randn(H, W) * boundary_noise_std
+        # Only add noise in boundary region, scaled by distance from 0.5
+        # This simulates TransUNet's uncertainty at boundaries
+        uncertainty_weight = 1.0 - 2.0 * np.abs(soft_mask - 0.5)
+        soft_mask = soft_mask + noise * uncertainty_weight * boundary_mask
+
+    # Step 3: Ensure valid probability range
+    soft_mask = np.clip(soft_mask, 0.0, 1.0)
+
+    return soft_mask
 
 
 class SegmentationFailureSimulator:
@@ -1049,7 +1118,7 @@ class SegmentationFailureSimulator:
 
         Args:
             mask: Ground truth mask (H, W)
-            target_dice: Target Dice score range (min, max), or 'perfect' for no augmentation
+            target_dice: Target Dice score range (min, max)
             max_attempts: Maximum attempts to hit target range
 
         Returns:
@@ -1057,11 +1126,10 @@ class SegmentationFailureSimulator:
             actual_dice: Achieved Dice score
             augmentation_info: Description of applied augmentations
         """
-        # Handle perfect mask case (for preservation learning)
-        if target_dice == 'perfect' or (isinstance(target_dice, tuple) and target_dice[0] >= 0.99):
-            return mask.copy(), 1.0, ['perfect']
-
         target_min, target_max = target_dice
+
+        # Clamp max to 0.99 to avoid generating Dice=1.0 (unchanged) masks
+        target_max = min(target_max, 0.99)
 
         # Analyze lesion properties for size/shape conditioning
         props = self.analyze_lesion(mask)
@@ -1252,7 +1320,7 @@ class SegmentationFailureSimulator:
             return mask
 
 
-def process_single_augmentation(task, use_sdf=False):
+def process_single_augmentation(task, use_sdf=False, soft_masks=False, blur_sigma=None):
     """
     Worker function to process a single augmentation task.
 
@@ -1260,6 +1328,9 @@ def process_single_augmentation(task, use_sdf=False):
         task: tuple of (file_idx, within_level_idx, dataset_name, name, image_path, mask_path,
                        dice_range, level, aug_seed, out_dirs)
         use_sdf: Whether to use SDF-based augmentation
+        soft_masks: Whether to save coarse masks as soft probability maps (NPY)
+                   for Phase 3 E2E training compatibility
+        blur_sigma: Gaussian blur sigma for soft masks (None = auto)
 
     Returns:
         dict with result info or None if skipped
@@ -1277,7 +1348,9 @@ def process_single_augmentation(task, use_sdf=False):
     out_name = f"{dataset_name}_{name}_{level}_{within_level_idx:04d}"
 
     # Check if already exists (for resume)
-    out_coarse_path = os.path.join(out_coarse_dir, f"{out_name}.png")
+    # For soft masks, check for .npy file; for binary masks, check for .png
+    coarse_ext = '.npy' if soft_masks else '.png'
+    out_coarse_path = os.path.join(out_coarse_dir, f"{out_name}{coarse_ext}")
     if os.path.exists(out_coarse_path):
         return None  # Skip, already processed
 
@@ -1321,8 +1394,15 @@ def process_single_augmentation(task, use_sdf=False):
     Image.fromarray(gt_save).save(os.path.join(out_mask_dir, f"{out_name}.png"))
 
     # Save coarse mask
-    coarse_save = (coarse_mask * 255).astype(np.uint8)
-    Image.fromarray(coarse_save).save(os.path.join(out_coarse_dir, f"{out_name}.png"))
+    if soft_masks:
+        # Convert to soft probability map matching TransUNet output distribution
+        # This is CRITICAL for Phase 2 -> Phase 3 compatibility
+        soft_coarse = create_soft_mask(coarse_mask, blur_sigma=blur_sigma)
+        np.save(os.path.join(out_coarse_dir, f"{out_name}.npy"), soft_coarse.astype(np.float32))
+    else:
+        # Save as binary PNG (legacy mode)
+        coarse_save = (coarse_mask * 255).astype(np.uint8)
+        Image.fromarray(coarse_save).save(os.path.join(out_coarse_dir, f"{out_name}.png"))
 
     return {
         'name': out_name,
@@ -1330,7 +1410,8 @@ def process_single_augmentation(task, use_sdf=False):
         'source_dataset': dataset_name,
         'dice': float(actual_dice),
         'augmentations': aug_info,
-        'level': level
+        'level': level,
+        'soft_masks': soft_masks,
     }
 
 
@@ -1342,7 +1423,9 @@ def generate_augmented_dataset(
     seed: int = 42,
     use_sdf: bool = False,
     num_workers: int = None,
-    resume: bool = True
+    resume: bool = True,
+    soft_masks: bool = False,
+    blur_sigma: float = None,
 ):
     """
     Generate augmented dataset with controlled Dice distribution.
@@ -1356,6 +1439,9 @@ def generate_augmented_dataset(
         use_sdf: If True, use SDF-based augmentation (smoother deformations)
         num_workers: Number of parallel workers (default: CPU count)
         resume: If True, skip already generated samples (default: True)
+        soft_masks: If True, save coarse masks as soft probability maps (NPY)
+                   matching TransUNet output distribution. RECOMMENDED for E2E training.
+        blur_sigma: Gaussian blur sigma for soft masks (None = auto-compute based on image size)
     """
     # Set number of workers
     if num_workers is None:
@@ -1363,6 +1449,7 @@ def generate_augmented_dataset(
 
     print(f"Using {num_workers} parallel workers")
     print(f"Augmentation backend: {'SDF-based' if use_sdf else 'Pixel-level'}")
+    print(f"Mask output format: {'Soft (NPY float, TransUNet-like)' if soft_masks else 'Binary (PNG uint8)'}")
 
     # Set random seeds for reproducibility
     random.seed(seed)
@@ -1421,19 +1508,16 @@ def generate_augmented_dataset(
 
     print(f"Augmentations per sample: {augs_per_sample} (+ {remainder} extra)")
 
-    # Distribution targets per sample (including PERFECT masks for preservation learning)
-    # Perfect (Dice=1.0): 10% - Teaches Refiner when NOT to modify
-    # Good (0.9-1.0): 15% - Minor artifacts, should mostly preserve
+    # Distribution targets per sample (NO Dice=1.0 perfect masks)
+    # Good (0.9-0.99): 25% - Minor artifacts, should mostly preserve
     # Medium (0.8-0.9): 40% - Moderate errors, needs refinement
     # Low (0.6-0.8): 35% - Severe failures, needs strong correction
-    perfect_count = int(augs_per_sample * 0.10)     # Dice 1.0 (unchanged)
-    high_count = int(augs_per_sample * 0.15)        # Dice 0.9-1.0
+    high_count = int(augs_per_sample * 0.25)        # Dice 0.9-0.99
     medium_count = int(augs_per_sample * 0.40)      # Dice 0.8-0.9
-    low_count = augs_per_sample - perfect_count - high_count - medium_count  # Dice 0.6-0.8
+    low_count = augs_per_sample - high_count - medium_count  # Dice 0.6-0.8
 
-    print(f"\nPer-sample distribution:")
-    print(f"  Perfect (1.0):    {perfect_count} (preservation learning)")
-    print(f"  High (0.9-1.0):   {high_count}")
+    print(f"\nPer-sample distribution (no Dice=1.0 perfect masks):")
+    print(f"  High (0.9-0.99):  {high_count}")
     print(f"  Medium (0.8-0.9): {medium_count}")
     print(f"  Low (0.6-0.8):    {low_count}")
 
@@ -1460,16 +1544,14 @@ def generate_augmented_dataset(
         extra = 1 if file_idx < remainder else 0
         total_augs = augs_per_sample + extra
 
-        # Distribution with PERFECT masks for preservation learning
-        perfect_n = int(total_augs * 0.10)
-        high_n = int(total_augs * 0.15)
+        # Distribution (NO Dice=1.0 perfect masks)
+        high_n = int(total_augs * 0.25)
         medium_n = int(total_augs * 0.40)
-        low_n = total_augs - perfect_n - high_n - medium_n
+        low_n = total_augs - high_n - medium_n
 
-        # Generate augmentations for each Dice range
+        # Generate augmentations for each Dice range (max 0.99, no 1.0)
         augmentation_configs = [
-            ('perfect', perfect_n, 'perfect'),
-            ((0.90, 1.00), high_n, 'high'),
+            ((0.90, 0.99), high_n, 'high'),
             ((0.80, 0.90), medium_n, 'medium'),
             ((0.60, 0.80), low_n, 'low'),
         ]
@@ -1489,6 +1571,7 @@ def generate_augmented_dataset(
     print(f"Total tasks to process: {total_tasks}")
 
     # Check for existing files (resume capability)
+    coarse_ext = '.npy' if soft_masks else '.png'
     if resume:
         existing_count = 0
         tasks_to_process = []
@@ -1496,7 +1579,7 @@ def generate_augmented_dataset(
             file_idx, within_level_idx, dataset_name, name, _, _, _, level, _, _ = task
             # Stable naming: uses original sample name + level + index within that level
             out_name = f"{dataset_name}_{name}_{level}_{within_level_idx:04d}"
-            out_coarse_path = os.path.join(out_coarse_dir, f"{out_name}.png")
+            out_coarse_path = os.path.join(out_coarse_dir, f"{out_name}{coarse_ext}")
             if os.path.exists(out_coarse_path):
                 existing_count += 1
             else:
@@ -1516,7 +1599,8 @@ def generate_augmented_dataset(
     start_time = time.time()
 
     # Use multiprocessing Pool
-    worker_fn = partial(process_single_augmentation, use_sdf=use_sdf)
+    worker_fn = partial(process_single_augmentation, use_sdf=use_sdf,
+                        soft_masks=soft_masks, blur_sigma=blur_sigma)
 
     results = []
     with Pool(num_workers) as pool:
@@ -1532,14 +1616,12 @@ def generate_augmented_dataset(
 
     # Compute statistics from results
     dice_scores = [r['dice'] for r in results]
-    dice_distribution = {'perfect': 0, 'high': 0, 'medium': 0, 'low': 0}
+    dice_distribution = {'high': 0, 'medium': 0, 'low': 0}
     augmentation_stats = defaultdict(int)
 
     for r in results:
         actual_dice = r['dice']
-        if actual_dice >= 0.99:
-            dice_distribution['perfect'] += 1
-        elif actual_dice >= 0.9:
+        if actual_dice >= 0.9:
             dice_distribution['high'] += 1
         elif actual_dice >= 0.8:
             dice_distribution['medium'] += 1
@@ -1556,6 +1638,8 @@ def generate_augmented_dataset(
         'original_samples': num_original,
         'target_samples': target_samples,
         'seed': seed,
+        'soft_masks': soft_masks,  # Important: tells dataset loader which format to expect
+        'blur_sigma': blur_sigma,
         'samples': results
     }
 
@@ -1566,11 +1650,10 @@ def generate_augmented_dataset(
 
     print(f"\nTotal samples generated: {len(results)}")
 
-    print(f"\nDice Score Distribution:")
+    print(f"\nDice Score Distribution (no Dice=1.0 perfect masks):")
     total = sum(dice_distribution.values())
     if total > 0:
-        print(f"  Perfect (1.0):    {dice_distribution['perfect']:6d} ({100*dice_distribution['perfect']/total:.1f}%) <- preservation learning")
-        print(f"  High (0.9-1.0):   {dice_distribution['high']:6d} ({100*dice_distribution['high']/total:.1f}%)")
+        print(f"  High (0.9-0.99):  {dice_distribution['high']:6d} ({100*dice_distribution['high']/total:.1f}%)")
         print(f"  Medium (0.8-0.9): {dice_distribution['medium']:6d} ({100*dice_distribution['medium']/total:.1f}%)")
         print(f"  Low (0.6-0.8):    {dice_distribution['low']:6d} ({100*dice_distribution['low']/total:.1f}%)")
     else:
@@ -1623,6 +1706,11 @@ def main():
                         help='Number of parallel workers (default: CPU count - 1)')
     parser.add_argument('--no_resume', action='store_true',
                         help='Disable resume mode (regenerate all samples)')
+    parser.add_argument('--soft_masks', action='store_true',
+                        help='Save coarse masks as soft probability maps (NPY float) matching '
+                             'TransUNet output distribution. RECOMMENDED for Phase 3 E2E training.')
+    parser.add_argument('--blur_sigma', type=float, default=None,
+                        help='Gaussian blur sigma for soft masks (default: auto-compute based on image size)')
 
     args = parser.parse_args()
 
@@ -1631,6 +1719,9 @@ def main():
     print(f"Output directory: {args.output_dir}")
     print(f"Augmentation backend: {'SDF-based' if args.use_sdf else 'Pixel-level'}")
     print(f"Resume mode: {'Disabled' if args.no_resume else 'Enabled'}")
+    print(f"Mask format: {'Soft (NPY, TransUNet-like)' if args.soft_masks else 'Binary (PNG)'}")
+    if args.soft_masks:
+        print(f"  Blur sigma: {'auto' if args.blur_sigma is None else args.blur_sigma}")
 
     generate_augmented_dataset(
         data_root=args.data_root,
@@ -1640,7 +1731,9 @@ def main():
         seed=args.seed,
         use_sdf=args.use_sdf,
         num_workers=args.num_workers,
-        resume=not args.no_resume
+        resume=not args.no_resume,
+        soft_masks=args.soft_masks,
+        blur_sigma=args.blur_sigma,
     )
 
 

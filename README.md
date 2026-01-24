@@ -206,34 +206,46 @@ Augmentation intensity and failure type selection are conditioned on lesion char
 Mask perturbations are modeled in the continuous signed distance function (SDF) domain, where the zero level-set defines the contour. Boundary shifts are expressed as additive fields (global offsets for uniform erosion/dilation, low-frequency Gaussian random fields for spatially varying deformation), ensuring smooth, anatomically plausible results. This formulation provides explicit control over boundary displacement magnitude, smoothness, and topological constraints.
 
 **Quality-Aware Training:**
-Training mixes perfect masks (10%), mildly corrupted masks (55%), and heavily corrupted masks (35%). A change-penalty term weighted by input mask quality encourages the Refiner to preserve already-good predictions while strongly correcting poor ones.
+Training uses a controlled distribution with NO perfect (Dice=1.0) masks:
+- **25%** Dice 0.9-0.99 (good, minor artifacts)
+- **40%** Dice 0.8-0.9 (moderate errors)
+- **35%** Dice 0.6-0.8 (severe failures)
+
+A change-penalty term weighted by input mask quality encourages the Refiner to preserve already-good predictions while strongly correcting poor ones.
+
+**IMPORTANT: Soft Masks for Phase 3 Compatibility**
+
+For the finetuned SAM to work correctly in Phase 3 E2E training, the coarse mask distribution must match TransUNet's soft probability outputs. Use `--soft_masks` flag when generating augmented data:
 
 ```bash
-# Step 1: Generate augmented training data from all datasets combined
+# Step 1: Generate augmented training data with SOFT MASKS (RECOMMENDED)
+# Soft masks have smooth boundaries matching TransUNet's output distribution
 python scripts/generate_augmented_data.py \
     --data_root ./dataset/processed \
-    --output_dir ./dataset/augmented \
+    --output_dir ./dataset/augmented_soft \
     --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
     --target_samples 100000 \
     --use_sdf \
+    --soft_masks \
     --num_workers 8
 
-# Step 2: Finetune SAM with augmented data
-# Note: --dataset should match the combined folder name (sorted alphabetically, joined by _)
+# Step 2: Finetune SAM with soft augmented data
+# Use --mask_prompt_style direct (default) since soft masks already have smooth boundaries
 python scripts/finetune_sam_augmented.py \
-    --data_root ./dataset/augmented \
+    --data_root ./dataset/augmented_soft \
     --dataset BUS_BUSBRA_BUSI_BUS_UC_BUS_UCLM \
     --sam_checkpoint ./pretrained/medsam_vit_b.pth \
     --sam_model_type vit_b \
     --epochs 50 \
     --batch_size 4 \
     --lr 1e-4 \
+    --mask_prompt_style direct \
     --change_penalty_weight 0.1 \
     --output_dir ./checkpoints/sam_finetuned
 
 # Optional: Use curriculum learning (easy to hard)
 python scripts/finetune_sam_augmented.py \
-    --data_root ./dataset/augmented \
+    --data_root ./dataset/augmented_soft \
     --dataset BUS_BUSBRA_BUSI_BUS_UC_BUS_UCLM \
     --sam_checkpoint ./pretrained/medsam_vit_b.pth \
     --epochs 50 \
@@ -244,7 +256,7 @@ python scripts/finetune_sam_augmented.py \
 
 # Resume training from checkpoint (if interrupted)
 python scripts/finetune_sam_augmented.py \
-    --data_root ./dataset/augmented \
+    --data_root ./dataset/augmented_soft \
     --dataset BUS_BUSBRA_BUSI_BUS_UC_BUS_UCLM \
     --sam_checkpoint ./pretrained/medsam_vit_b.pth \
     --epochs 50 \
@@ -252,6 +264,14 @@ python scripts/finetune_sam_augmented.py \
     --output_dir ./checkpoints/sam_finetuned \
     --resume ./checkpoints/sam_finetuned/BUS_BUSBRA_BUSI_BUS_UC_BUS_UCLM/best.pth
 ```
+
+**Soft Masks vs Binary Masks:**
+| Feature | Binary Masks (Legacy) | Soft Masks (Recommended) |
+|---------|----------------------|--------------------------|
+| Format | PNG (0/255) | NPY (float 0.0-1.0) |
+| Boundaries | Sharp edges | Smooth, Gaussian-blurred |
+| Phase 3 compatibility | Requires `--sharpen_coarse_mask` | Direct compatibility |
+| mask_prompt_style | `gaussian` (adds blur) | `direct` (no extra blur needed) |
 
 **Option B: Use Actual TransUNet Predictions (Alternative)**
 
@@ -304,11 +324,12 @@ sbatch sbatch/sbatch_phase3_e2e_single.sh BUSI 0
 bash sbatch/sbatch_phase3_e2e_all.sh
 ```
 
-**Option B: With Phase 2 Finetuned SAM**
+**Option B: With Phase 2 Finetuned SAM (Recommended)**
 
-Use `best_sam.pth` from Phase 2 (contains SAM weights in correct format):
+Use `best_sam.pth` from Phase 2 (contains SAM weights in correct format). **Important**: Use the same `--mask_prompt_style` as Phase 2 training:
 
 ```bash
+# If Phase 2 was trained with soft masks (recommended)
 python scripts/train_e2e.py \
     --data_root ./dataset/processed \
     --datasets BUSI \
@@ -318,8 +339,24 @@ python scripts/train_e2e.py \
     --output_dir ./checkpoints/ultra_refiner/BUSI \
     --max_epochs 100 \
     --batch_size 8 \
-    --transunet_lr 1e-4 \
-    --sam_lr 1e-5
+    --transunet_lr 1e-5 \
+    --sam_lr 1e-5 \
+    --mask_prompt_style direct
+
+# If Phase 2 was trained with binary masks (legacy)
+python scripts/train_e2e.py \
+    --data_root ./dataset/processed \
+    --datasets BUSI \
+    --fold 0 \
+    --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
+    --sam_checkpoint ./checkpoints/sam_finetuned/{dataset}/best_sam.pth \
+    --output_dir ./checkpoints/ultra_refiner/BUSI \
+    --max_epochs 100 \
+    --batch_size 8 \
+    --transunet_lr 1e-5 \
+    --sam_lr 1e-5 \
+    --mask_prompt_style gaussian \
+    --sharpen_coarse_mask
 ```
 
 **Per-Dataset Training Structure:**
@@ -339,6 +376,12 @@ transunet/BUSBRA/fold_0/best.pth → ultra_refiner/BUSBRA/fold_0/best.pth
   - `best.pth`: Full SAMRefiner state (for resuming training)
   - `best_sam.pth`: SAM-only weights (for Phase 3 loading)
 - Phase 3 expects the SAM-native format, so always use `best_sam.pth`
+
+**Phase 2 → Phase 3 Compatibility Checklist:**
+1. ✅ Generate augmented data with `--soft_masks` flag
+2. ✅ Train Phase 2 with `--mask_prompt_style direct`
+3. ✅ Train Phase 3 with `--mask_prompt_style direct`
+4. ✅ Use `best_sam.pth` (not `best.pth`) for Phase 3
 
 ## Project Structure
 

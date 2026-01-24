@@ -1,23 +1,41 @@
 """
-Finetune SAM with Augmented Training Data
+Finetune SAM with Augmented Training Data (Phase 2)
 
 This script finetunes SAM's mask decoder using pre-generated augmented data
 where coarse masks simulate various segmentation failure patterns with
 controlled Dice score distribution.
 
-The augmented data provides:
-- 30% samples with Dice 0.6-0.8 (severe failures)
-- 50% samples with Dice 0.8-0.9 (moderate errors)
-- 20% samples with Dice 0.9+ (minor artifacts)
+The augmented data provides (no Dice=1.0 perfect masks):
+- 25% samples with Dice 0.9-0.99 (good, minor artifacts)
+- 40% samples with Dice 0.8-0.9 (moderate errors)
+- 35% samples with Dice 0.6-0.8 (severe failures)
+
+IMPORTANT: For Phase 3 (E2E training) compatibility:
+1. Generate augmented data with --soft_masks flag to create soft probability
+   maps that match TransUNet's output distribution
+2. Use --mask_prompt_style direct (default) since soft masks already have
+   smooth boundaries
 
 Usage:
+    # Standard finetuning with soft masks (RECOMMENDED)
+    python scripts/finetune_sam_augmented.py \
+        --data_root ./dataset/augmented_soft \
+        --dataset BUSI \
+        --sam_checkpoint ./checkpoints/sam/sam_vit_b_01ec64.pth \
+        --output_dir ./checkpoints/sam_finetuned \
+        --epochs 50 \
+        --batch_size 4 \
+        --mask_prompt_style direct
+
+    # Legacy finetuning with binary masks
     python scripts/finetune_sam_augmented.py \
         --data_root ./dataset/augmented \
         --dataset BUSI \
         --sam_checkpoint ./checkpoints/sam/sam_vit_b_01ec64.pth \
         --output_dir ./checkpoints/sam_finetuned \
         --epochs 50 \
-        --batch_size 4
+        --batch_size 4 \
+        --mask_prompt_style gaussian
 """
 
 import argparse
@@ -74,9 +92,11 @@ def get_args():
                         help='Use box prompts')
     parser.add_argument('--use_mask_prompt', action='store_true', default=True,
                         help='Use mask prompts')
-    parser.add_argument('--mask_prompt_style', type=str, default='gaussian',
+    parser.add_argument('--mask_prompt_style', type=str, default='direct',
                         choices=['gaussian', 'direct', 'distance'],
-                        help='Mask prompt style: gaussian (soft boundaries), direct (sharp), distance (SDF-like)')
+                        help='Mask prompt style: direct (RECOMMENDED for soft masks), '
+                             'gaussian (adds blur), distance (SDF-like). '
+                             'Use "direct" when using soft augmented masks for Phase 3 compatibility.')
 
     # Quality-aware loss arguments
     parser.add_argument('--change_penalty_weight', type=float, default=0.5,

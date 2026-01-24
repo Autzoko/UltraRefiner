@@ -6,11 +6,34 @@ from the SAM refinement back to TransUNet. Both models are jointly optimized.
 
 Uses K-fold cross-validation within the training set for validation.
 
+IMPORTANT: Phase 2 -> Phase 3 Compatibility
+============================================
+For the finetuned SAM from Phase 2 to work correctly in Phase 3, the input
+distribution must match:
+
+1. Phase 2 should be trained with --soft_masks augmented data (soft probability
+   maps matching TransUNet's output distribution)
+2. Phase 2 should use --mask_prompt_style direct (default)
+3. Phase 3 should use --mask_prompt_style direct (default) to match
+
+If Phase 2 was trained with binary masks and gaussian prompt style, you may need to:
+- Use --sharpen_coarse_mask to make TransUNet outputs more binary-like
+- Use --mask_prompt_style gaussian to match Phase 2
+
 Usage:
+    # Standard E2E training (Phase 2 trained with soft masks)
     python scripts/train_e2e.py \
         --data_root ./dataset/processed \
         --transunet_checkpoint ./checkpoints/transunet/best.pth \
-        --sam_checkpoint ./checkpoints/sam_finetuned/best.pth \
+        --sam_checkpoint ./checkpoints/sam_finetuned/best_sam.pth \
+        --fold 0 \
+        --mask_prompt_style direct
+
+    # E2E training without Phase 2 (using original SAM)
+    python scripts/train_e2e.py \
+        --data_root ./dataset/processed \
+        --transunet_checkpoint ./checkpoints/transunet/best.pth \
+        --sam_checkpoint ./checkpoints/medsam_vit_b.pth \
         --fold 0
 """
 import argparse
@@ -103,12 +126,14 @@ def get_args():
 
     # Coarse mask processing (to match Phase 2 training distribution)
     parser.add_argument('--sharpen_coarse_mask', action='store_true', default=False,
-                        help='Sharpen soft TransUNet outputs to be more binary-like (matches Phase 2)')
+                        help='Sharpen soft TransUNet outputs to be more binary-like '
+                             '(only needed if Phase 2 was trained with binary masks)')
     parser.add_argument('--sharpen_temperature', type=float, default=10.0,
                         help='Temperature for sharpening (higher = more binary-like)')
-    parser.add_argument('--mask_prompt_style', type=str, default='gaussian',
+    parser.add_argument('--mask_prompt_style', type=str, default='direct',
                         choices=['gaussian', 'direct', 'distance'],
-                        help='Mask prompt style (use gaussian to match Phase 2 training)')
+                        help='Mask prompt style: direct (RECOMMENDED, matches Phase 2 with soft masks), '
+                             'gaussian (use if Phase 2 was trained with binary masks)')
 
     # Output arguments
     parser.add_argument('--output_dir', type=str, default='./checkpoints/ultra_refiner',

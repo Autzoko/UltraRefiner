@@ -6,10 +6,15 @@ This dataset loads:
 - Ground truth masks
 - Pre-generated coarse masks (simulated segmentation failures)
 
-The coarse masks have controlled Dice score distribution:
-- 0.6-0.8 (Poor): 30% of samples
-- 0.8-0.9 (Medium): 50% of samples
-- 0.9+ (Good): 20% of samples
+The coarse masks have controlled Dice score distribution (no Dice=1.0):
+- Dice 0.9-0.99 (Good): 25% of samples - minor artifacts
+- Dice 0.8-0.9 (Medium): 40% of samples - moderate errors
+- Dice 0.6-0.8 (Poor): 35% of samples - severe failures
+
+Coarse Mask Formats:
+- Binary (PNG): Legacy format, hard 0/255 masks
+- Soft (NPY): Soft probability maps matching TransUNet output distribution
+  (RECOMMENDED for Phase 3 E2E training compatibility)
 """
 
 import os
@@ -76,6 +81,10 @@ class AugmentedSAMDataset(Dataset):
         with open(metadata_path, 'r') as f:
             self.metadata = json.load(f)
 
+        # Check if soft masks are used (NPY format matching TransUNet output distribution)
+        # This is CRITICAL for Phase 2 -> Phase 3 compatibility
+        self.soft_masks = self.metadata.get('soft_masks', False)
+
         # Get sample list
         self.samples = self.metadata['samples']
 
@@ -110,6 +119,7 @@ class AugmentedSAMDataset(Dataset):
         self.pixel_std = torch.tensor([58.395, 57.12, 57.375]).view(3, 1, 1)
 
         print(f"Loaded {len(self.samples)} samples from {dataset_name}")
+        print(f"  Coarse mask format: {'Soft (NPY, TransUNet-like)' if self.soft_masks else 'Binary (PNG)'}")
         if dice_range:
             print(f"  Dice range filter: {dice_range}")
 
@@ -134,15 +144,32 @@ class AugmentedSAMDataset(Dataset):
         mask_path = os.path.join(self.mask_dir, f"{name}.png")
         gt_mask = np.array(Image.open(mask_path).convert('L'))
 
-        # Load coarse mask
-        coarse_path = os.path.join(self.coarse_dir, f"{name}.png")
-        coarse_mask = np.array(Image.open(coarse_path).convert('L'))
+        # Load coarse mask (soft NPY or binary PNG depending on metadata)
+        if self.soft_masks:
+            # Soft probability map (NPY float) - matches TransUNet output distribution
+            coarse_path = os.path.join(self.coarse_dir, f"{name}.npy")
+            if os.path.exists(coarse_path):
+                coarse_mask = np.load(coarse_path).astype(np.float32)
+            else:
+                # Fallback to PNG if NPY not found (backward compatibility)
+                coarse_path = os.path.join(self.coarse_dir, f"{name}.png")
+                coarse_mask = np.array(Image.open(coarse_path).convert('L'))
+                if coarse_mask.max() > 1:
+                    coarse_mask = coarse_mask.astype(np.float32) / 255.0
+        else:
+            # Binary mask (PNG uint8) - legacy format
+            coarse_path = os.path.join(self.coarse_dir, f"{name}.png")
+            coarse_mask = np.array(Image.open(coarse_path).convert('L'))
+            if coarse_mask.max() > 1:
+                coarse_mask = coarse_mask.astype(np.float32) / 255.0
+            else:
+                coarse_mask = coarse_mask.astype(np.float32)
 
-        # Normalize masks to [0, 1]
+        # Normalize GT mask to [0, 1]
         if gt_mask.max() > 1:
             gt_mask = gt_mask.astype(np.float32) / 255.0
-        if coarse_mask.max() > 1:
-            coarse_mask = coarse_mask.astype(np.float32) / 255.0
+        else:
+            gt_mask = gt_mask.astype(np.float32)
 
         # Convert to tensors
         image = torch.from_numpy(image).float()
