@@ -998,8 +998,7 @@ class DifferentiableSAMRefiner(nn.Module):
         refined_masks_cropped = self.soft_mask_selection(all_masks, all_ious)  # (B, 1024, 1024)
 
         # Step 7: Paste back to original size
-        # Create zero background for areas outside ROI
-        background = torch.zeros(B, *original_size, device=device)
+        # Areas outside ROI will be zero (background)
         refined_masks = self.roi_cropper.paste_back(
             refined_masks_cropped, crop_info, background=None
         )
