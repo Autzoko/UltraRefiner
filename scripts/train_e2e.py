@@ -250,6 +250,19 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, writ
         # Forward pass
         outputs = model(image)
 
+        # DEBUG: Print mask statistics for first batch of first epoch
+        if batch_idx == 0 and epoch == 0:
+            with torch.no_grad():
+                refined_logits = outputs['refined_mask']
+                refined_prob = torch.sigmoid(refined_logits)
+                coarse_mask = outputs['coarse_mask']
+                print(f"\n  [DEBUG] Mask Statistics:")
+                print(f"  ├── Coarse mask:  min={coarse_mask.min():.4f}, max={coarse_mask.max():.4f}, mean={coarse_mask.mean():.4f}")
+                print(f"  ├── Refined logits: min={refined_logits.min():.4f}, max={refined_logits.max():.4f}, mean={refined_logits.mean():.4f}")
+                print(f"  ├── Refined prob:   min={refined_prob.min():.4f}, max={refined_prob.max():.4f}, mean={refined_prob.mean():.4f}")
+                print(f"  ├── Refined > 0.5:  {(refined_prob > 0.5).float().mean():.4f} of pixels")
+                print(f"  └── Label > 0.5:    {(label > 0.5).float().mean():.4f} of pixels")
+
         # Compute loss
         loss, loss_dict = criterion(outputs, label)
         loss = loss / args.gradient_accumulation
