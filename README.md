@@ -257,6 +257,59 @@ python scripts/train_e2e.py \
 
 **IMPORTANT:** Phase 2 and Phase 3 must use the same ROI setting for distribution consistency.
 
+**ROI Mode Distribution Consistency:**
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        ROI MODE DATA FLOW                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Phase 2 (ROI Mode)                    Phase 3 (ROI Mode)                   │
+│  ─────────────────────                 ─────────────────────                 │
+│                                                                              │
+│  Image: 1024×1024 ────┐               Image: 224→1024 ─────┐                │
+│  Mask:  1024×1024 ────┤               Mask:  224→1024 ─────┤                │
+│                       ▼                                    ▼                │
+│              ┌──────────────────────────────────────────────────┐           │
+│              │           ROI Box Extraction                      │           │
+│              │    soft-min/max from 1024×1024 mask               │           │
+│              │    coords in [0, 1024] range                      │           │
+│              └─────────────────┬────────────────────────────────┘           │
+│                                │                                             │
+│                                ▼                                             │
+│              ┌──────────────────────────────────────────────────┐           │
+│              │           Crop & Resize                           │           │
+│              │    ROI region → 1024×1024                         │           │
+│              │    (grid_sample, differentiable)                  │           │
+│              └─────────────────┬────────────────────────────────┘           │
+│                                │                                             │
+│                                ▼                                             │
+│              ┌──────────────────────────────────────────────────┐           │
+│              │           Prompt Extraction                       │           │
+│              │    From 1024×1024 CROPPED mask                    │           │
+│              │    coords in [0, 1024] (no scaling needed)        │           │
+│              └─────────────────┬────────────────────────────────┘           │
+│                                │                                             │
+│                                ▼                                             │
+│              ┌──────────────────────────────────────────────────┐           │
+│              │           SAM Processing                          │           │
+│              │    1024×1024 cropped image                        │           │
+│              │    Full resolution on lesion area                 │           │
+│              └─────────────────┬────────────────────────────────┘           │
+│                                │                                             │
+│                                ▼                                             │
+│              ┌──────────────────────────────────────────────────┐           │
+│              │           Paste Back                              │           │
+│              │    1024×1024 → original size                      │           │
+│              │    (inverse affine, differentiable)               │           │
+│              └──────────────────────────────────────────────────┘           │
+│                                                                              │
+│  KEY: All operations at 1024×1024, same coordinate space                    │
+│       Prompts extracted from cropped mask (no scaling needed)               │
+│       Gradients flow through crop/paste operations                          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
 ## Training Pipeline Flow Chart
 
 ```
