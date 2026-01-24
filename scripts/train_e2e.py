@@ -678,13 +678,27 @@ def main():
     )
 
     # Optimizer with different learning rates
+    # Only include params that are not frozen initially
+    # Frozen params will be added when unfreezing
     transunet_params = list(model.get_transunet_params())
     sam_params = list(model.get_sam_params())
 
-    optimizer = optim.AdamW([
-        {'params': transunet_params, 'lr': args.transunet_lr},
-        {'params': sam_params, 'lr': args.sam_lr}
-    ], weight_decay=args.weight_decay)
+    # Check if SAM is initially frozen
+    sam_frozen = args.freeze_sam_all or args.freeze_sam_mask_decoder
+
+    # Build optimizer param groups based on what's trainable
+    param_groups = []
+    if not transunet_frozen and transunet_params:
+        param_groups.append({'params': transunet_params, 'lr': args.transunet_lr})
+        logging.info(f'Optimizer: Added {len(transunet_params)} TransUNet params')
+    if not sam_frozen and sam_params:
+        param_groups.append({'params': sam_params, 'lr': args.sam_lr})
+        logging.info(f'Optimizer: Added {len(sam_params)} SAM params')
+
+    if not param_groups:
+        raise ValueError('No trainable parameters! Both TransUNet and SAM are frozen.')
+
+    optimizer = optim.AdamW(param_groups, weight_decay=args.weight_decay)
 
     # Learning rate scheduler
     scheduler = optim.lr_scheduler.CosineAnnealingLR(

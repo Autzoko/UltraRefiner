@@ -15,49 +15,82 @@ Medical image segmentation, particularly for breast lesions in ultrasound, remai
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                         UltraRefiner Pipeline                             │
-├──────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
-│   Input Image (224×224)                                                   │
-│         │                                                                 │
-│         ▼                                                                 │
-│   ┌─────────────────────────────────────────────────────────────────┐    │
-│   │                    TransUNet                                     │    │
-│   │   ResNet50 ──► ViT-B/16 Transformer ──► CNN Decoder + Skip      │    │
-│   └─────────────────────────────┬───────────────────────────────────┘    │
-│                                 │                                         │
-│                                 ▼                                         │
-│                    Coarse Mask (Soft Probability)                         │
-│                         P(lesion) ∈ [0, 1]                                │
-│                                 │                                         │
-│              ┌──────────────────┼──────────────────┐                     │
-│              │                  │                  │                      │
-│              ▼                  ▼                  ▼                      │
-│        ┌──────────┐      ┌───────────┐      ┌──────────┐                 │
-│        │  Points  │      │    Box    │      │   Mask   │                 │
-│        │ soft-    │      │ weighted  │      │ gaussian │                 │
-│        │ argmax   │      │ mean±std  │      │ /direct  │                 │
-│        └────┬─────┘      └─────┬─────┘      └────┬─────┘                 │
-│             │                  │                  │                       │
-│             └──────────────────┼──────────────────┘                      │
-│                                │                                          │
-│                    Resize to 1024×1024                                    │
-│                                │                                          │
-│                                ▼                                          │
-│   ┌─────────────────────────────────────────────────────────────────┐    │
-│   │                      SAM Refiner                                 │    │
-│   │   Image Encoder ──► Prompt Encoder ──► Mask Decoder             │    │
-│   │     (frozen)         (trainable)        (trainable)             │    │
-│   └─────────────────────────────┬───────────────────────────────────┘    │
-│                                 │                                         │
-│                                 ▼                                         │
-│                         Refined Mask                                      │
-│                                                                           │
-│   ◄─── Gradient Flow: L_refined → SAM → Prompts → TransUNet ───►         │
-│                                                                           │
-└──────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                    UltraRefiner Pipeline (with ROI Cropping)                   │
+├───────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│   Input Image (224×224)                                                        │
+│         │                                                                      │
+│         ▼                                                                      │
+│   ┌─────────────────────────────────────────────────────────────────────┐     │
+│   │                         TransUNet                                    │     │
+│   │     ResNet50 ──► ViT-B/16 Transformer ──► CNN Decoder + Skip        │     │
+│   └─────────────────────────────┬───────────────────────────────────────┘     │
+│                                 │                                              │
+│                                 ▼                                              │
+│                    Coarse Mask (Soft Probability)                              │
+│                          P(lesion) ∈ [0, 1]                                    │
+│                                 │                                              │
+│              ┌──────────────────┼──────────────────┐                          │
+│              │                  │                  │                           │
+│              ▼                  ▼                  ▼                           │
+│        ┌──────────┐      ┌───────────┐      ┌──────────┐                      │
+│        │  Points  │      │    Box    │      │   Mask   │                      │
+│        │ soft-    │      │ weighted  │      │  direct  │                      │
+│        │ argmax   │      │ mean±std  │      │ (logits) │                      │
+│        └────┬─────┘      └─────┬─────┘      └────┬─────┘                      │
+│             │                  │                  │                            │
+│             └──────────────────┼──────────────────┘                           │
+│                                │                                               │
+│   ┌────────────────────────────┼────────────────────────────────────────┐     │
+│   │              Differentiable ROI Cropper (Default)                    │     │
+│   ├──────────────────────────────────────────────────────────────────────┤     │
+│   │                                                                      │     │
+│   │   1. Compute soft bounding box from mask (center ± 2.5σ)            │     │
+│   │   2. Expand box by 20% (roi_expand_ratio=0.2)                       │     │
+│   │   3. Crop image & mask via grid_sample (differentiable)             │     │
+│   │   4. Resize ROI to 1024×1024 (full SAM resolution)                  │     │
+│   │                                                                      │     │
+│   │         ┌─────────────────────────────────────┐                     │     │
+│   │         │   ROI Region at 1024×1024           │                     │     │
+│   │         │   ┌───────────────────────────┐     │                     │     │
+│   │         │   │  Lesion at full resolution │     │                     │     │
+│   │         │   │  (higher detail for SAM)   │     │                     │     │
+│   │         │   └───────────────────────────┘     │                     │     │
+│   │         └─────────────────────────────────────┘                     │     │
+│   │                                                                      │     │
+│   └──────────────────────────────┬───────────────────────────────────────┘     │
+│                                  │                                             │
+│                                  ▼                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐     │
+│   │                        SAM Refiner                                   │     │
+│   │     Image Encoder ──► Prompt Encoder ──► Mask Decoder               │     │
+│   │       (frozen)         (trainable)        (trainable)               │     │
+│   └─────────────────────────────┬───────────────────────────────────────┘     │
+│                                 │                                              │
+│                                 ▼                                              │
+│                     Refined Mask (ROI space)                                   │
+│                                 │                                              │
+│   ┌─────────────────────────────┼───────────────────────────────────────┐     │
+│   │              Differentiable Paste Back                               │     │
+│   │   grid_sample inverse: ROI mask → Original image space              │     │
+│   └─────────────────────────────┬───────────────────────────────────────┘     │
+│                                 │                                              │
+│                                 ▼                                              │
+│                         Final Refined Mask                                     │
+│                                                                                │
+│   ◄─── Gradient Flow: L_refined → Paste → SAM → Crop → Prompts → TransUNet    │
+│                                                                                │
+└───────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Why ROI Cropping is Default
+
+ROI cropping provides several advantages:
+1. **Higher effective resolution**: The lesion region is processed at full 1024×1024 SAM resolution
+2. **Better boundary refinement**: SAM sees more detail in the lesion area
+3. **Fully differentiable**: Both crop and paste-back use `grid_sample` for gradient flow
+4. **Consistent training**: Both Phase 2 and Phase 3 use the same ROI pipeline
 
 ## Training Pipeline
 
@@ -127,6 +160,8 @@ python scripts/finetune_sam_augmented.py \
     --output_dir ./checkpoints/sam_finetuned \
     --mask_prompt_style direct \
     --transunet_img_size 224 \
+    --use_roi_crop \
+    --roi_expand_ratio 0.2 \
     --epochs 50 \
     --batch_size 4 \
     --lr 1e-4
@@ -138,6 +173,8 @@ python scripts/finetune_sam_augmented.py \
 |------|-------|---------|
 | `--mask_prompt_style` | `direct` | Since soft masks already have smooth boundaries, no extra blur needed. **Must match Phase 3 setting.** |
 | `--transunet_img_size` | `224` | **CRITICAL**: Simulates Phase 3 resolution path. Coarse masks are first resized to 224×224, then upscaled to 1024×1024. This bilinear interpolation creates additional smoothing that Phase 3 naturally has. |
+| `--use_roi_crop` | flag | **DEFAULT**: Enables ROI cropping mode. Crops lesion region and processes at full 1024×1024 resolution. |
+| `--roi_expand_ratio` | `0.2` | Expands bounding box by 20% to include context around lesion. |
 
 **What SAM learns in Phase 2:**
 1. Refine boundaries from soft probability inputs
@@ -156,12 +193,12 @@ Two checkpoints are saved:
 
 Joint optimization with gradients flowing through differentiable prompts.
 
-#### Recommended Command (with TransUNet Protection)
+#### Recommended Command (with ROI + TransUNet Protection)
 
-During E2E training, gradients from SAM can destabilize TransUNet. Use these protection mechanisms:
+During E2E training with ROI mode, gradients from SAM create stronger coupling and can destabilize TransUNet. Use these protection mechanisms:
 
 ```bash
-# RECOMMENDED: Full E2E training with TransUNet protection
+# RECOMMENDED: Full E2E training with ROI + TransUNet protection
 python scripts/train_e2e.py \
     --data_root ./dataset/processed \
     --datasets BUSI \
@@ -169,32 +206,37 @@ python scripts/train_e2e.py \
     --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
     --sam_checkpoint ./checkpoints/sam_finetuned/COMBINED/best_sam.pth \
     --mask_prompt_style direct \
+    --use_roi_crop \
+    --roi_expand_ratio 0.2 \
     --max_epochs 100 \
     --transunet_lr 1e-6 \
     --sam_lr 1e-5 \
-    --coarse_loss_weight 0.7 \
-    --refined_loss_weight 0.3 \
-    --transunet_grad_scale 0.1 \
-    --transunet_weight_reg 0.01 \
+    --coarse_loss_weight 0.8 \
+    --refined_loss_weight 0.2 \
+    --transunet_grad_scale 0.01 \
+    --transunet_weight_reg 0.1 \
     --grad_clip 1.0
 ```
 
-#### TransUNet Protection Options
+#### TransUNet Protection Options (Stronger for ROI Mode)
 
-| Flag | Recommended | Purpose |
-|------|-------------|---------|
-| `--transunet_lr` | `1e-6` | Lower learning rate prevents large weight updates |
-| `--coarse_loss_weight` | `0.7` | Higher weight maintains TransUNet quality |
-| `--transunet_grad_scale` | `0.1` | Scales gradients from SAM to 10% (reduces SAM's influence) |
-| `--transunet_weight_reg` | `0.01` | L2 penalty anchors weights to Phase 1 checkpoint |
-| `--freeze_transunet_epochs` | `5-10` | Optional: let SAM adapt first before joint training |
+ROI mode creates stronger gradient coupling because the crop coordinates depend on the mask. Use these stronger protection values:
+
+| Flag | ROI Mode | Non-ROI Mode | Purpose |
+|------|----------|--------------|---------|
+| `--transunet_lr` | `1e-6` | `1e-6` | Lower learning rate prevents large weight updates |
+| `--coarse_loss_weight` | `0.8` | `0.7` | Higher weight maintains TransUNet quality |
+| `--refined_loss_weight` | `0.2` | `0.3` | Lower SAM influence on total loss |
+| `--transunet_grad_scale` | `0.01` | `0.1` | Scales gradients from SAM (1% for ROI, 10% for non-ROI) |
+| `--transunet_weight_reg` | `0.1` | `0.01` | L2 penalty anchors weights to Phase 1 checkpoint |
+| `--freeze_transunet_epochs` | `5-10` | `0` | Optional: let SAM adapt first before joint training |
 
 The script automatically:
 1. **Evaluates TransUNet baseline** before training starts
 2. **Compares performance** at each epoch (warns if TransUNet degrades)
 3. **Logs to TensorBoard** for monitoring
 
-#### Basic Command (without protection)
+#### Basic Command (ROI without protection - NOT recommended)
 
 ```bash
 python scripts/train_e2e.py \
@@ -204,6 +246,8 @@ python scripts/train_e2e.py \
     --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
     --sam_checkpoint ./checkpoints/sam_finetuned/COMBINED/best_sam.pth \
     --mask_prompt_style direct \
+    --use_roi_crop \
+    --roi_expand_ratio 0.2 \
     --max_epochs 100
 ```
 
@@ -213,8 +257,8 @@ python scripts/train_e2e.py \
 |---------|---------|---------|-----|
 | `mask_prompt_style` | `direct` | `direct` | Same mask preprocessing |
 | Resolution path | 224→1024 | 224→1024 | Same interpolation smoothing |
-| `use_roi_crop` | match | match | Same cropping behavior |
-| `roi_expand_ratio` | match | match | Same crop boundaries |
+| `use_roi_crop` | `True` | `True` | **DEFAULT**: Same cropping behavior |
+| `roi_expand_ratio` | `0.2` | `0.2` | Same crop boundaries |
 
 #### Alternative: Skip Phase 2 (Use Unfinetuned SAM)
 
@@ -228,8 +272,10 @@ python scripts/train_e2e.py \
     --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
     --sam_checkpoint ./pretrained/medsam_vit_b.pth \
     --mask_prompt_style gaussian \
-    --transunet_grad_scale 0.1 \
-    --transunet_weight_reg 0.01 \
+    --use_roi_crop \
+    --roi_expand_ratio 0.2 \
+    --transunet_grad_scale 0.01 \
+    --transunet_weight_reg 0.1 \
     --max_epochs 100
 ```
 
@@ -284,21 +330,50 @@ mask_logits = (P × 2 - 1) × 10      # Maps [0,1] → [-10, +10]
 
 ---
 
-## ROI Cropping Mode (Optional)
+## ROI Cropping Mode (Default)
 
-Focuses SAM computation on the lesion region at full 1024×1024 resolution:
+ROI cropping is the **default and recommended** mode. It focuses SAM computation on the lesion region at full 1024×1024 resolution.
+
+### How ROI Cropping Works
+
+1. **Compute soft bounding box** from the coarse mask using weighted statistics (center ± 2.5σ)
+2. **Expand box by 20%** (`roi_expand_ratio=0.2`) to include surrounding context
+3. **Crop image and mask** via `grid_sample` (fully differentiable)
+4. **Resize ROI to 1024×1024** for SAM processing at full resolution
+5. **SAM refines** the cropped mask
+6. **Paste back** the refined mask to original image space via inverse `grid_sample`
+
+### ROI Flags
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--use_roi_crop` | **Recommended** | Enable ROI cropping mode |
+| `--roi_expand_ratio` | `0.2` | Expand bounding box by this ratio (20% = include context) |
+
+### Disabling ROI (Not Recommended)
+
+If you want to disable ROI and use full-image processing:
 
 ```bash
-# Phase 2 with ROI
+# Phase 2 without ROI
 python scripts/finetune_sam_augmented.py \
-    --use_roi_crop --roi_expand_ratio 0.2 ...
+    --data_root ./dataset/augmented_soft \
+    --dataset COMBINED \
+    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
+    --mask_prompt_style direct --transunet_img_size 224
+    # Note: no --use_roi_crop flag
 
-# Phase 3 with ROI (must match Phase 2)
+# Phase 3 without ROI (must match Phase 2)
 python scripts/train_e2e.py \
-    --use_roi_crop --roi_expand_ratio 0.2 ...
+    --data_root ./dataset/processed \
+    --datasets BUSI --fold 0 \
+    --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
+    --sam_checkpoint ./checkpoints/sam_finetuned/COMBINED/best_sam.pth \
+    --mask_prompt_style direct \
+    --transunet_lr 1e-6 --sam_lr 1e-5 \
+    --coarse_loss_weight 0.7 --refined_loss_weight 0.3 \
+    --transunet_grad_scale 0.1 --transunet_weight_reg 0.01
 ```
-
-All ROI operations are fully differentiable via `grid_sample`.
 
 ---
 
@@ -318,23 +393,25 @@ python scripts/generate_augmented_data.py \
     --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
     --target_samples 100000 --soft_masks --use_sdf
 
-# 3. Phase 2b: Finetune SAM
+# 3. Phase 2b: Finetune SAM (with ROI - default)
 python scripts/finetune_sam_augmented.py \
     --data_root ./dataset/augmented_soft \
     --dataset COMBINED \
     --sam_checkpoint ./pretrained/medsam_vit_b.pth \
-    --mask_prompt_style direct --transunet_img_size 224
+    --mask_prompt_style direct --transunet_img_size 224 \
+    --use_roi_crop --roi_expand_ratio 0.2
 
-# 4. Phase 3: End-to-end training (RECOMMENDED with protection)
+# 4. Phase 3: End-to-end training (with ROI + protection - RECOMMENDED)
 python scripts/train_e2e.py \
     --data_root ./dataset/processed \
     --datasets BUSI --fold 0 \
     --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
     --sam_checkpoint ./checkpoints/sam_finetuned/COMBINED/best_sam.pth \
     --mask_prompt_style direct \
+    --use_roi_crop --roi_expand_ratio 0.2 \
     --transunet_lr 1e-6 --sam_lr 1e-5 \
-    --coarse_loss_weight 0.7 --refined_loss_weight 0.3 \
-    --transunet_grad_scale 0.1 --transunet_weight_reg 0.01
+    --coarse_loss_weight 0.8 --refined_loss_weight 0.2 \
+    --transunet_grad_scale 0.01 --transunet_weight_reg 0.1
 ```
 
 ---
