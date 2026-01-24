@@ -515,10 +515,12 @@ A change-penalty term weighted by input mask quality encourages the Refiner to p
 
 **IMPORTANT: Soft Masks for Phase 3 Compatibility**
 
-For the finetuned SAM to work correctly in Phase 3 E2E training, the coarse mask distribution must match TransUNet's soft probability outputs. Use `--soft_masks` flag when generating augmented data:
+For the finetuned SAM to work correctly in Phase 3 E2E training, the coarse mask distribution must match TransUNet's soft probability outputs. Use `--soft_masks` flag when generating augmented data.
+
+#### Step 2a: Generate Augmented Data
 
 ```bash
-# Step 1: Generate augmented training data with SOFT MASKS (RECOMMENDED)
+# Generate augmented training data with SOFT MASKS
 # Soft masks have smooth boundaries matching TransUNet's output distribution
 python scripts/generate_augmented_data.py \
     --data_root ./dataset/processed \
@@ -528,42 +530,89 @@ python scripts/generate_augmented_data.py \
     --use_sdf \
     --soft_masks \
     --num_workers 8
+```
 
-# Step 2: Finetune SAM with soft augmented data
-# Use --mask_prompt_style direct (default) since soft masks already have smooth boundaries
+#### Step 2b: Finetune SAM (RECOMMENDED Commands)
+
+**Standard Mode (Full Image Processing):**
+```bash
+# RECOMMENDED: Phase 2 with aligned distribution
 python scripts/finetune_sam_augmented.py \
     --data_root ./dataset/augmented_soft \
-    --dataset BUS_BUSBRA_BUSI_BUS_UC_BUS_UCLM \
+    --dataset COMBINED \
     --sam_checkpoint ./pretrained/medsam_vit_b.pth \
     --sam_model_type vit_b \
     --epochs 50 \
     --batch_size 4 \
     --lr 1e-4 \
     --mask_prompt_style direct \
+    --transunet_img_size 224 \
     --change_penalty_weight 0.1 \
     --output_dir ./checkpoints/sam_finetuned
-
-# Optional: Use curriculum learning (easy to hard)
-python scripts/finetune_sam_augmented.py \
-    --data_root ./dataset/augmented_soft \
-    --dataset BUS_BUSBRA_BUSI_BUS_UC_BUS_UCLM \
-    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
-    --epochs 50 \
-    --batch_size 4 \
-    --change_penalty_weight 0.1 \
-    --curriculum \
-    --output_dir ./checkpoints/sam_finetuned
-
-# Resume training from checkpoint (if interrupted)
-python scripts/finetune_sam_augmented.py \
-    --data_root ./dataset/augmented_soft \
-    --dataset BUS_BUSBRA_BUSI_BUS_UC_BUS_UCLM \
-    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
-    --epochs 50 \
-    --batch_size 4 \
-    --output_dir ./checkpoints/sam_finetuned \
-    --resume ./checkpoints/sam_finetuned/BUS_BUSBRA_BUSI_BUS_UC_BUS_UCLM/best.pth
 ```
+
+**ROI Mode (Focused Lesion Processing):**
+```bash
+# Phase 2 with ROI cropping for higher effective resolution on lesions
+python scripts/finetune_sam_augmented.py \
+    --data_root ./dataset/augmented_soft \
+    --dataset COMBINED \
+    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
+    --sam_model_type vit_b \
+    --epochs 50 \
+    --batch_size 4 \
+    --lr 1e-4 \
+    --mask_prompt_style direct \
+    --transunet_img_size 224 \
+    --use_roi_crop \
+    --roi_expand_ratio 0.2 \
+    --change_penalty_weight 0.1 \
+    --output_dir ./checkpoints/sam_finetuned_roi
+```
+
+**With Curriculum Learning:**
+```bash
+# Curriculum learning: start with easy samples (high Dice), gradually include harder ones
+python scripts/finetune_sam_augmented.py \
+    --data_root ./dataset/augmented_soft \
+    --dataset COMBINED \
+    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
+    --sam_model_type vit_b \
+    --epochs 50 \
+    --batch_size 4 \
+    --lr 1e-4 \
+    --mask_prompt_style direct \
+    --transunet_img_size 224 \
+    --curriculum \
+    --change_penalty_weight 0.1 \
+    --output_dir ./checkpoints/sam_finetuned
+```
+
+**Resume Training:**
+```bash
+# Resume from checkpoint if interrupted
+python scripts/finetune_sam_augmented.py \
+    --data_root ./dataset/augmented_soft \
+    --dataset COMBINED \
+    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
+    --sam_model_type vit_b \
+    --epochs 50 \
+    --batch_size 4 \
+    --lr 1e-4 \
+    --mask_prompt_style direct \
+    --transunet_img_size 224 \
+    --output_dir ./checkpoints/sam_finetuned \
+    --resume ./checkpoints/sam_finetuned/COMBINED/best.pth
+```
+
+**Phase 2 Key Parameters:**
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| `--mask_prompt_style` | `direct` | No extra blur (soft masks already smooth) |
+| `--transunet_img_size` | `224` | Match Phase 3 resolution path |
+| `--use_roi_crop` | (optional) | Focus on lesion area |
+| `--roi_expand_ratio` | `0.2` | 20% expansion on each side |
+| `--change_penalty_weight` | `0.1` | Penalize changes to good inputs |
 
 **Soft Masks vs Binary Masks:**
 | Feature | Binary Masks (Legacy) | Soft Masks (Recommended) |
@@ -573,90 +622,123 @@ python scripts/finetune_sam_augmented.py \
 | Phase 3 compatibility | Requires `--sharpen_coarse_mask` | Direct compatibility |
 | mask_prompt_style | `gaussian` (adds blur) | `direct` (no extra blur needed) |
 
-**Option B: Use Actual TransUNet Predictions (Alternative)**
-
-Alternatively, finetune SAM using actual TransUNet predictions from Phase 1. This requires generating predictions first:
-
-```bash
-# Step 1: Generate TransUNet predictions
-python scripts/inference_transunet.py \
-    --data_root ./dataset/processed \
-    --dataset BUSI \
-    --checkpoint_root ./checkpoints/transunet \
-    --output_dir ./predictions/transunet \
-    --n_splits 5
-
-# Step 2: Finetune SAM with predictions
-python scripts/finetune_sam_with_preds.py \
-    --data_root ./dataset/processed \
-    --pred_root ./predictions/transunet \
-    --medsam_checkpoint ./pretrained/medsam_vit_b.pth \
-    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
-    --fold 0
-```
-
 ### 4. Phase 3: End-to-End Training
 
-Since TransUNet is trained per-dataset in Phase 1, E2E training should also be per-dataset.
+**IMPORTANT:** Phase 3 settings MUST match Phase 2 for distribution consistency!
 
-**Option A: Skip Phase 2 (Direct E2E with Original SAM)**
+#### RECOMMENDED Commands
 
-Use original MedSAM/SAM checkpoint directly without Phase 2 finetuning:
-
+**Standard Mode (matches Phase 2 standard mode):**
 ```bash
-# Single dataset, single fold
+# Phase 3 E2E training with aligned distribution
+python scripts/train_e2e.py \
+    --data_root ./dataset/processed \
+    --datasets BUSI \
+    --fold 0 \
+    --n_splits 5 \
+    --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
+    --sam_checkpoint ./checkpoints/sam_finetuned/COMBINED/best_sam.pth \
+    --mask_prompt_style direct \
+    --max_epochs 100 \
+    --batch_size 8 \
+    --transunet_lr 1e-5 \
+    --sam_lr 1e-5 \
+    --coarse_loss_weight 0.3 \
+    --refined_loss_weight 0.7 \
+    --grad_clip 1.0 \
+    --output_dir ./checkpoints/ultra_refiner/BUSI
+```
+
+**ROI Mode (matches Phase 2 ROI mode):**
+```bash
+# Phase 3 E2E training with ROI cropping (MUST match Phase 2 ROI settings)
+python scripts/train_e2e.py \
+    --data_root ./dataset/processed \
+    --datasets BUSI \
+    --fold 0 \
+    --n_splits 5 \
+    --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
+    --sam_checkpoint ./checkpoints/sam_finetuned_roi/COMBINED/best_sam.pth \
+    --mask_prompt_style direct \
+    --use_roi_crop \
+    --roi_expand_ratio 0.2 \
+    --max_epochs 100 \
+    --batch_size 8 \
+    --transunet_lr 1e-5 \
+    --sam_lr 1e-5 \
+    --coarse_loss_weight 0.3 \
+    --refined_loss_weight 0.7 \
+    --grad_clip 1.0 \
+    --output_dir ./checkpoints/ultra_refiner_roi/BUSI
+```
+
+**Two-Stage Training (freeze SAM initially):**
+```bash
+# Stage 1: Train TransUNet with frozen SAM (stabilize coarse predictions)
+# Stage 2: Unfreeze SAM for joint optimization
+python scripts/train_e2e.py \
+    --data_root ./dataset/processed \
+    --datasets BUSI \
+    --fold 0 \
+    --n_splits 5 \
+    --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
+    --sam_checkpoint ./checkpoints/sam_finetuned/COMBINED/best_sam.pth \
+    --mask_prompt_style direct \
+    --freeze_sam_all \
+    --unfreeze_sam_epoch 20 \
+    --max_epochs 100 \
+    --batch_size 8 \
+    --transunet_lr 1e-4 \
+    --sam_lr 1e-5 \
+    --output_dir ./checkpoints/ultra_refiner/BUSI
+```
+
+**Without Phase 2 (Direct E2E with Original SAM):**
+```bash
+# Skip Phase 2, use original MedSAM directly
 python scripts/train_e2e.py \
     --data_root ./dataset/processed \
     --datasets BUSI \
     --fold 0 \
     --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
     --sam_checkpoint ./pretrained/medsam_vit_b.pth \
-    --output_dir ./checkpoints/ultra_refiner/BUSI \
+    --mask_prompt_style direct \
     --max_epochs 100 \
     --batch_size 8 \
     --transunet_lr 1e-4 \
-    --sam_lr 1e-5
-
-# Or use sbatch for cluster (single job)
-sbatch sbatch/sbatch_phase3_e2e_single.sh BUSI 0
-
-# Submit all 25 jobs (5 datasets × 5 folds)
-bash sbatch/sbatch_phase3_e2e_all.sh
+    --sam_lr 1e-5 \
+    --output_dir ./checkpoints/ultra_refiner/BUSI
 ```
 
-**Option B: With Phase 2 Finetuned SAM (Recommended)**
+**Phase 3 Key Parameters:**
+| Parameter | Value | Must Match Phase 2? |
+|-----------|-------|---------------------|
+| `--mask_prompt_style` | `direct` | ✓ YES |
+| `--use_roi_crop` | `True/False` | ✓ YES |
+| `--roi_expand_ratio` | `0.2` | ✓ YES (if ROI enabled) |
+| `--transunet_lr` | `1e-5` | No (typically lower than sam_lr) |
+| `--sam_lr` | `1e-5` | No |
+| `--coarse_loss_weight` | `0.3` | No |
+| `--refined_loss_weight` | `0.7` | No |
 
-Use `best_sam.pth` from Phase 2 (contains SAM weights in correct format). **Important**: Use the same `--mask_prompt_style` as Phase 2 training:
-
+**Batch Training Script (All Folds):**
 ```bash
-# If Phase 2 was trained with soft masks (recommended)
-python scripts/train_e2e.py \
-    --data_root ./dataset/processed \
-    --datasets BUSI \
-    --fold 0 \
-    --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
-    --sam_checkpoint ./checkpoints/sam_finetuned/{dataset}/best_sam.pth \
-    --output_dir ./checkpoints/ultra_refiner/BUSI \
-    --max_epochs 100 \
-    --batch_size 8 \
-    --transunet_lr 1e-5 \
-    --sam_lr 1e-5 \
-    --mask_prompt_style direct
-
-# If Phase 2 was trained with binary masks (legacy)
-python scripts/train_e2e.py \
-    --data_root ./dataset/processed \
-    --datasets BUSI \
-    --fold 0 \
-    --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
-    --sam_checkpoint ./checkpoints/sam_finetuned/{dataset}/best_sam.pth \
-    --output_dir ./checkpoints/ultra_refiner/BUSI \
-    --max_epochs 100 \
-    --batch_size 8 \
-    --transunet_lr 1e-5 \
-    --sam_lr 1e-5 \
-    --mask_prompt_style gaussian \
-    --sharpen_coarse_mask
+# Train all 5 folds for a dataset
+for fold in 0 1 2 3 4; do
+    python scripts/train_e2e.py \
+        --data_root ./dataset/processed \
+        --datasets BUSI \
+        --fold $fold \
+        --n_splits 5 \
+        --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_${fold}/best.pth \
+        --sam_checkpoint ./checkpoints/sam_finetuned/COMBINED/best_sam.pth \
+        --mask_prompt_style direct \
+        --max_epochs 100 \
+        --batch_size 8 \
+        --transunet_lr 1e-5 \
+        --sam_lr 1e-5 \
+        --output_dir ./checkpoints/ultra_refiner/BUSI
+done
 ```
 
 **Per-Dataset Training Structure:**
@@ -677,13 +759,43 @@ transunet/BUSBRA/fold_0/best.pth → ultra_refiner/BUSBRA/fold_0/best.pth
   - `best_sam.pth`: SAM-only weights (for Phase 3 loading)
 - Phase 3 expects the SAM-native format, so always use `best_sam.pth`
 
-**Phase 2 → Phase 3 Compatibility Checklist:**
-1. ✅ Generate augmented data with `--soft_masks` flag
-2. ✅ Train Phase 2 with `--mask_prompt_style direct`
-3. ✅ Train Phase 2 with `--transunet_img_size 224` (default) to match Phase 3 resolution path
-4. ✅ Train Phase 3 with `--mask_prompt_style direct`
-5. ✅ Use `best_sam.pth` (not `best.pth`) for Phase 3
-6. ✅ Use same `--use_roi_crop` and `--roi_expand_ratio` settings in both phases
+### Phase 2 → Phase 3 Compatibility Checklist
+
+| Step | Setting | Phase 2 | Phase 3 | Notes |
+|------|---------|---------|---------|-------|
+| 1 | Augmented data | `--soft_masks` | N/A | Generate soft probability masks |
+| 2 | Mask prompt style | `--mask_prompt_style direct` | `--mask_prompt_style direct` | Must match |
+| 3 | Resolution path | `--transunet_img_size 224` | Auto (224→1024) | Phase 2 simulates Phase 3 path |
+| 4 | ROI cropping | `--use_roi_crop` | `--use_roi_crop` | Must match (both on or both off) |
+| 5 | ROI expand ratio | `--roi_expand_ratio 0.2` | `--roi_expand_ratio 0.2` | Must match if ROI enabled |
+| 6 | SAM checkpoint | Output: `best_sam.pth` | Input: `best_sam.pth` | Use SAM-native format |
+
+**Quick Reference - Matching Configurations:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    STANDARD MODE (No ROI)                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Phase 2:                           Phase 3:                                │
+│  --mask_prompt_style direct         --mask_prompt_style direct              │
+│  --transunet_img_size 224           (auto)                                  │
+│  (no --use_roi_crop)                (no --use_roi_crop)                     │
+│                                                                              │
+│  Output: best_sam.pth ──────────────► Input: best_sam.pth                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    ROI MODE (Focused Processing)                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Phase 2:                           Phase 3:                                │
+│  --mask_prompt_style direct         --mask_prompt_style direct              │
+│  --transunet_img_size 224           (auto)                                  │
+│  --use_roi_crop                     --use_roi_crop                          │
+│  --roi_expand_ratio 0.2             --roi_expand_ratio 0.2                  │
+│                                                                              │
+│  Output: best_sam.pth ──────────────► Input: best_sam.pth                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
 **Why Resolution Path Matters:**
 In Phase 3, TransUNet outputs at 224×224, which is then upscaled to 1024×1024 for SAM.
