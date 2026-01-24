@@ -163,6 +163,19 @@ def get_args():
     parser.add_argument('--grad_clip', type=float, default=1.0,
                         help='Gradient clipping max norm (0 to disable)')
 
+    # TransUNet protection options (prevent performance degradation)
+    parser.add_argument('--transunet_grad_scale', type=float, default=1.0,
+                        help='Scale factor for gradients flowing to TransUNet from refined loss. '
+                             'Values < 1.0 reduce SAM\'s influence on TransUNet. '
+                             'Recommended: 0.1-0.5 to prevent TransUNet degradation.')
+    parser.add_argument('--transunet_weight_reg', type=float, default=0.0,
+                        help='L2 regularization weight to anchor TransUNet to Phase 1 weights. '
+                             'Penalizes deviation from initial checkpoint. '
+                             'Recommended: 0.001-0.01 to prevent drift.')
+    parser.add_argument('--freeze_transunet_epochs', type=int, default=0,
+                        help='Number of epochs to freeze TransUNet at the start. '
+                             'Allows SAM to adapt first before joint training.')
+
     return parser.parse_args()
 
 
@@ -236,12 +249,13 @@ class EndToEndLoss(nn.Module):
         return total_loss, loss_dict
 
 
-def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, writer, args):
+def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, writer, args, weight_regularizer=None):
     """Train for one epoch."""
     model.train()
     metric_tracker_coarse = MetricTracker()
     metric_tracker_refined = MetricTracker()
     iter_num = epoch * len(dataloader)
+    total_weight_reg_loss = 0.0
 
     optimizer.zero_grad()
     pbar = tqdm(dataloader, desc=f'  Train', leave=False)
@@ -318,6 +332,14 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, writ
 
         # Compute loss
         loss, loss_dict = criterion(outputs, label)
+
+        # Add weight regularization loss (anchors TransUNet to Phase 1 weights)
+        if weight_regularizer is not None:
+            weight_reg_loss = weight_regularizer.compute_loss(model)
+            loss = loss + weight_reg_loss
+            loss_dict['weight_reg'] = weight_reg_loss.item()
+            total_weight_reg_loss += weight_reg_loss.item()
+
         loss = loss / args.gradient_accumulation
 
         # Backward pass
@@ -403,6 +425,114 @@ def validate(model, dataloader, criterion, device):
         'coarse': metric_tracker_coarse.get_average(),
         'refined': metric_tracker_refined.get_average()
     }
+
+
+def evaluate_transunet_baseline(model, dataloader, device):
+    """
+    Evaluate TransUNet performance BEFORE E2E training starts.
+    This provides a baseline to compare against during training.
+    """
+    model.eval()
+    metric_tracker = MetricTracker(
+        metrics=['dice', 'iou', 'precision', 'recall', 'accuracy']
+    )
+
+    print("\n" + "=" * 70)
+    print("  TRANSUNET BASELINE EVALUATION (Before E2E Training)")
+    print("=" * 70)
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc='  Evaluating TransUNet', leave=False):
+            image = batch['image'].to(device)
+            label = batch['label'].to(device)
+
+            # Forward through TransUNet only
+            transunet_output = model.forward_transunet_only(image)
+
+            # Get soft mask (probability) for the foreground class
+            if model.num_classes == 2:
+                coarse_pred = torch.softmax(transunet_output, dim=1)[:, 1]
+            else:
+                coarse_pred = torch.sigmoid(transunet_output[:, 1:].sum(dim=1))
+
+            metric_tracker.update(coarse_pred, label)
+
+    metrics = metric_tracker.get_average()
+
+    print(f"\n  TransUNet Baseline Performance:")
+    print(f"  ├── Dice:      {metrics['dice']:.4f}")
+    print(f"  ├── IoU:       {metrics['iou']:.4f}")
+    print(f"  ├── Precision: {metrics['precision']:.4f}")
+    print(f"  ├── Recall:    {metrics['recall']:.4f}")
+    print(f"  └── Accuracy:  {metrics['accuracy']:.4f}")
+    print("=" * 70 + "\n")
+
+    return metrics
+
+
+class TransUNetWeightRegularizer:
+    """
+    Regularization loss that penalizes TransUNet weights deviating from Phase 1 checkpoint.
+    This prevents TransUNet from drifting too far during E2E training.
+    """
+
+    def __init__(self, model, weight=0.01):
+        """
+        Args:
+            model: UltraRefiner model
+            weight: Regularization weight (0.001-0.01 recommended)
+        """
+        self.weight = weight
+        # Store initial TransUNet weights (from Phase 1 checkpoint)
+        self.initial_weights = {}
+        for name, param in model.transunet.named_parameters():
+            if param.requires_grad:
+                self.initial_weights[name] = param.data.clone()
+
+        print(f"  Weight regularizer initialized with {len(self.initial_weights)} parameters")
+
+    def compute_loss(self, model):
+        """Compute L2 regularization loss for TransUNet weight deviation."""
+        if self.weight == 0:
+            return torch.tensor(0.0, device=next(model.parameters()).device)
+
+        reg_loss = 0.0
+        for name, param in model.transunet.named_parameters():
+            if name in self.initial_weights:
+                reg_loss += torch.sum((param - self.initial_weights[name]) ** 2)
+
+        return self.weight * reg_loss
+
+
+class GradientScaler:
+    """
+    Scales gradients flowing to TransUNet from the refined loss.
+    This reduces SAM's influence on TransUNet, preventing destabilization.
+    """
+
+    def __init__(self, model, scale=0.1):
+        """
+        Args:
+            model: UltraRefiner model
+            scale: Scale factor (0.1 = TransUNet receives 10% of gradients from refined loss)
+        """
+        self.scale = scale
+        self.handles = []
+
+        if scale < 1.0:
+            # Register backward hooks on TransUNet parameters
+            for param in model.transunet.parameters():
+                if param.requires_grad:
+                    handle = param.register_hook(lambda grad: grad * scale)
+                    self.handles.append(handle)
+
+            print(f"  Gradient scaler initialized: TransUNet receives {scale*100:.0f}% of gradients")
+
+    def remove_hooks(self):
+        """Remove all gradient scaling hooks."""
+        for handle in self.handles:
+            handle.remove()
+        self.handles = []
 
 
 def main():
@@ -512,6 +642,34 @@ def main():
     logging.info(f'Total parameters: {total_params:,}')
     logging.info(f'Trainable parameters: {trainable_params:,}')
 
+    # =========================================================================
+    # BASELINE EVALUATION: Evaluate TransUNet before E2E training
+    # =========================================================================
+    baseline_metrics = evaluate_transunet_baseline(model, val_loader, device)
+    logging.info(f'TransUNet Baseline - Dice: {baseline_metrics["dice"]:.4f}, IoU: {baseline_metrics["iou"]:.4f}')
+
+    # =========================================================================
+    # TRANSUNET PROTECTION: Initialize gradient scaler and weight regularizer
+    # =========================================================================
+    gradient_scaler = None
+    weight_regularizer = None
+
+    if args.transunet_grad_scale < 1.0:
+        gradient_scaler = GradientScaler(model, scale=args.transunet_grad_scale)
+        logging.info(f'Gradient scaling enabled: {args.transunet_grad_scale}')
+
+    if args.transunet_weight_reg > 0:
+        weight_regularizer = TransUNetWeightRegularizer(model, weight=args.transunet_weight_reg)
+        logging.info(f'Weight regularization enabled: {args.transunet_weight_reg}')
+
+    # Freeze TransUNet for initial epochs if specified
+    transunet_frozen = False
+    if args.freeze_transunet_epochs > 0:
+        for param in model.transunet.parameters():
+            param.requires_grad = False
+        transunet_frozen = True
+        logging.info(f'TransUNet frozen for first {args.freeze_transunet_epochs} epochs')
+
     # Loss function
     criterion = EndToEndLoss(
         coarse_weight=args.coarse_loss_weight,
@@ -545,6 +703,10 @@ def main():
         scheduler.load_state_dict(checkpoint['scheduler'])
         start_epoch = checkpoint['epoch'] + 1
         best_dice = checkpoint.get('best_dice', 0.0)
+        # Restore baseline metrics if available
+        if 'baseline_metrics' in checkpoint:
+            baseline_metrics = checkpoint['baseline_metrics']
+            logging.info(f'Restored baseline metrics from checkpoint')
         logging.info(f'Resumed from epoch {start_epoch}')
 
     # Tensorboard writer
@@ -555,6 +717,22 @@ def main():
     sam_unfrozen = not (args.freeze_sam_all or args.freeze_sam_mask_decoder)
 
     for epoch in range(start_epoch, args.max_epochs):
+        # Unfreeze TransUNet after specified epochs
+        if transunet_frozen and epoch >= args.freeze_transunet_epochs:
+            logging.info(f'Epoch {epoch}: Unfreezing TransUNet for joint training')
+            for param in model.transunet.parameters():
+                param.requires_grad = True
+            transunet_frozen = False
+
+            # Re-initialize gradient scaler with hooks
+            if args.transunet_grad_scale < 1.0:
+                gradient_scaler = GradientScaler(model, scale=args.transunet_grad_scale)
+
+            # Update optimizer to include TransUNet params
+            transunet_params = list(model.get_transunet_params())
+            optimizer.add_param_group({'params': transunet_params, 'lr': args.transunet_lr})
+            logging.info(f'Added {len(transunet_params)} TransUNet parameters to optimizer')
+
         # Two-stage training: unfreeze SAM at specified epoch
         if args.unfreeze_sam_epoch > 0 and epoch == args.unfreeze_sam_epoch and not sam_unfrozen:
             logging.info(f'Epoch {epoch}: Unfreezing SAM for joint training')
@@ -573,7 +751,7 @@ def main():
         # Train
         train_metrics = train_one_epoch(
             model, train_loader, optimizer, criterion,
-            device, epoch, writer, args
+            device, epoch, writer, args, weight_regularizer
         )
         logging.info(f'Epoch {epoch} Train Coarse: {train_metrics["coarse"]}')
         logging.info(f'Epoch {epoch} Train Refined: {train_metrics["refined"]}')
@@ -591,6 +769,10 @@ def main():
             writer.add_scalar(f'val/coarse_{key}', value, epoch)
         for key, value in val_metrics['refined'].items():
             writer.add_scalar(f'val/refined_{key}', value, epoch)
+
+        # Log TransUNet performance vs baseline
+        writer.add_scalar('val/transunet_vs_baseline', coarse_dice - baseline_dice, epoch)
+        writer.add_scalar('val/baseline_dice', baseline_dice, epoch)
 
         current_lr = scheduler.get_last_lr()[0]
         writer.add_scalar('train/lr_transunet', current_lr, epoch)
@@ -612,11 +794,24 @@ def main():
             is_best=is_best
         )
 
-        # Print coarse vs refined comparison
-        print(f"\n  Coarse vs Refined:")
-        print(f"  ├── Coarse Dice:  {val_metrics['coarse']['dice']:.4f}")
-        print(f"  └── Refined Dice: {val_metrics['refined']['dice']:.4f} "
-              f"(+{val_metrics['refined']['dice'] - val_metrics['coarse']['dice']:.4f})")
+        # Print coarse vs refined comparison (with baseline comparison)
+        coarse_dice = val_metrics['coarse']['dice']
+        refined_dice = val_metrics['refined']['dice']
+        baseline_dice = baseline_metrics['dice']
+
+        # Calculate changes from baseline
+        coarse_vs_baseline = coarse_dice - baseline_dice
+        refined_vs_coarse = refined_dice - coarse_dice
+
+        print(f"\n  Performance Comparison:")
+        print(f"  ├── Baseline (Phase 1):  {baseline_dice:.4f}")
+        print(f"  ├── Coarse (TransUNet):  {coarse_dice:.4f} ({coarse_vs_baseline:+.4f} vs baseline)")
+        print(f"  └── Refined (SAM):       {refined_dice:.4f} ({refined_vs_coarse:+.4f} vs coarse)")
+
+        # Warning if TransUNet performance drops significantly
+        if coarse_vs_baseline < -0.02:
+            print(f"\n  ⚠️  WARNING: TransUNet performance dropped by {-coarse_vs_baseline:.4f}!")
+            print(f"      Consider: --transunet_grad_scale 0.1 or --transunet_weight_reg 0.01")
 
         checkpoint = {
             'epoch': epoch,
@@ -624,6 +819,7 @@ def main():
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict(),
             'best_dice': best_dice,
+            'baseline_metrics': baseline_metrics,
             'config': {
                 'vit_name': args.vit_name,
                 'sam_model_type': args.sam_model_type,
@@ -646,7 +842,18 @@ def main():
 
     writer.close()
     logger.print_training_complete(best_dice, best_epoch)
+
+    # Final summary with baseline comparison
+    print("\n" + "=" * 70)
+    print("  FINAL SUMMARY")
+    print("=" * 70)
+    print(f"  TransUNet Baseline (Phase 1): {baseline_metrics['dice']:.4f}")
+    print(f"  Best Refined Dice (E2E):      {best_dice:.4f}")
+    print(f"  Improvement over baseline:    {best_dice - baseline_metrics['dice']:+.4f}")
+    print("=" * 70)
+
     logging.info(f'Training finished. Best Dice: {best_dice:.4f}')
+    logging.info(f'Baseline Dice: {baseline_metrics["dice"]:.4f}, Improvement: {best_dice - baseline_metrics["dice"]:+.4f}')
 
 
 if __name__ == '__main__':
