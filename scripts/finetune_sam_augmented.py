@@ -15,6 +15,8 @@ IMPORTANT: For Phase 3 (E2E training) compatibility:
    maps that match TransUNet's output distribution
 2. Use --mask_prompt_style direct (default) since soft masks already have
    smooth boundaries
+3. Use --transunet_img_size 224 (default) to simulate the same resolution path
+   as Phase 3 (TransUNet outputs at 224x224, then upscaled to 1024x1024)
 
 Usage:
     # Standard finetuning with soft masks (RECOMMENDED)
@@ -127,6 +129,13 @@ def get_args():
                         help='Checkpoint save interval (epochs)')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from (e.g., best.pth or epoch_X.pth)')
+
+    # Phase 3 compatibility
+    parser.add_argument('--transunet_img_size', type=int, default=224,
+                        help='Intermediate resolution to simulate TransUNet output path. '
+                             'In Phase 3, TransUNet outputs at this resolution before upscaling to 1024. '
+                             'This ensures Phase 2 has the SAME distribution as Phase 3. '
+                             'Set to 0 to disable (legacy behavior).')
 
     return parser.parse_args()
 
@@ -458,6 +467,7 @@ def main():
         mask_prompt_style=args.mask_prompt_style,
     )
     print(f'Mask prompt style: {args.mask_prompt_style}')
+    print(f'TransUNet resolution path: {args.transunet_img_size}x{args.transunet_img_size} -> 1024x1024')
     model = model.to(device)
 
     # Get dataloaders
@@ -472,6 +482,7 @@ def main():
             img_size=1024,
             max_samples=args.max_samples,
             seed=args.seed,
+            transunet_img_size=args.transunet_img_size,
         )
         train_loader = DataLoader(
             train_dataset,
@@ -505,6 +516,7 @@ def main():
             batch_size=args.batch_size,
             img_size=1024,
             num_workers=args.num_workers,
+            transunet_img_size=args.transunet_img_size,
             max_samples=args.max_samples,
             split_ratio=0.9,
             seed=args.seed,

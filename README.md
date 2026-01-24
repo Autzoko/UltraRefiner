@@ -380,8 +380,15 @@ transunet/BUSBRA/fold_0/best.pth → ultra_refiner/BUSBRA/fold_0/best.pth
 **Phase 2 → Phase 3 Compatibility Checklist:**
 1. ✅ Generate augmented data with `--soft_masks` flag
 2. ✅ Train Phase 2 with `--mask_prompt_style direct`
-3. ✅ Train Phase 3 with `--mask_prompt_style direct`
-4. ✅ Use `best_sam.pth` (not `best.pth`) for Phase 3
+3. ✅ Train Phase 2 with `--transunet_img_size 224` (default) to match Phase 3 resolution path
+4. ✅ Train Phase 3 with `--mask_prompt_style direct`
+5. ✅ Use `best_sam.pth` (not `best.pth`) for Phase 3
+
+**Why Resolution Path Matters:**
+In Phase 3, TransUNet outputs at 224×224, which is then upscaled to 1024×1024 for SAM.
+This upscaling creates additional smoothing. Phase 2 must simulate the same path:
+- Phase 2: `original → 224×224 → 1024×1024` (with `--transunet_img_size 224`)
+- Phase 3: `224×224 (TransUNet output) → 1024×1024` (SAM input)
 
 ## Project Structure
 

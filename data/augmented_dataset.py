@@ -51,24 +51,31 @@ class AugmentedSAMDataset(Dataset):
         split_ratio: float = 0.9,
         is_train: bool = True,
         seed: int = 42,
+        transunet_img_size: int = 224,
     ):
         """
         Args:
             data_root: Root directory containing augmented datasets
             dataset_name: Dataset name (e.g., BUSI)
-            img_size: Output image size
+            img_size: Output image size (SAM input size, typically 1024)
             for_sam: Whether to prepare data for SAM (1024x1024, normalized)
             dice_range: Optional (min, max) Dice score filter
             max_samples: Maximum number of samples to use
             split_ratio: Train/val split ratio
             is_train: Whether this is training set
             seed: Random seed for reproducible split
+            transunet_img_size: Intermediate resolution to simulate TransUNet output path.
+                               In Phase 3, TransUNet outputs at this resolution before
+                               upscaling to SAM input size. Setting this ensures Phase 2
+                               has the same resolution path as Phase 3 for consistent
+                               prompt distribution. Set to 0 to disable (legacy behavior).
         """
         self.data_root = data_root
         self.dataset_name = dataset_name
         self.img_size = img_size
         self.for_sam = for_sam
         self.dice_range = dice_range
+        self.transunet_img_size = transunet_img_size
 
         # Setup paths
         self.base_dir = os.path.join(data_root, dataset_name)
@@ -120,6 +127,10 @@ class AugmentedSAMDataset(Dataset):
 
         print(f"Loaded {len(self.samples)} samples from {dataset_name}")
         print(f"  Coarse mask format: {'Soft (NPY, TransUNet-like)' if self.soft_masks else 'Binary (PNG)'}")
+        if self.transunet_img_size > 0 and self.transunet_img_size < self.img_size:
+            print(f"  Resolution path: {self.transunet_img_size}x{self.transunet_img_size} -> {self.img_size}x{self.img_size} (matches Phase 3)")
+        else:
+            print(f"  Resolution path: original -> {self.img_size}x{self.img_size} (legacy)")
         if dice_range:
             print(f"  Dice range filter: {dice_range}")
 
@@ -187,14 +198,35 @@ class AugmentedSAMDataset(Dataset):
         # Resize to target size
         original_size = (image.shape[-2], image.shape[-1])
 
-        image = TF.resize(image, [self.img_size, self.img_size])
+        # CRITICAL: To match Phase 3 distribution, resize through TransUNet resolution first
+        # In Phase 3: TransUNet outputs at transunet_img_size (224), then upscaled to img_size (1024)
+        # This creates additional smoothing that we must replicate in Phase 2
+        if self.transunet_img_size > 0 and self.transunet_img_size < self.img_size:
+            # Step 1: Resize to TransUNet resolution (simulates TransUNet output)
+            image_small = TF.resize(image, [self.transunet_img_size, self.transunet_img_size])
+            coarse_mask_small = TF.resize(
+                coarse_mask.unsqueeze(0), [self.transunet_img_size, self.transunet_img_size],
+                interpolation=TF.InterpolationMode.BILINEAR
+            ).squeeze(0)
+
+            # Step 2: Resize to SAM input size (simulates Phase 3 upscaling)
+            image = TF.resize(image_small, [self.img_size, self.img_size])
+            coarse_mask = TF.resize(
+                coarse_mask_small.unsqueeze(0), [self.img_size, self.img_size],
+                interpolation=TF.InterpolationMode.BILINEAR
+            ).squeeze(0)
+        else:
+            # Legacy behavior: direct resize to SAM input size
+            image = TF.resize(image, [self.img_size, self.img_size])
+            coarse_mask = TF.resize(
+                coarse_mask.unsqueeze(0), [self.img_size, self.img_size],
+                interpolation=TF.InterpolationMode.BILINEAR
+            ).squeeze(0)
+
+        # GT mask: resize directly to SAM size (not through TransUNet resolution)
         gt_mask = TF.resize(
             gt_mask.unsqueeze(0), [self.img_size, self.img_size],
             interpolation=TF.InterpolationMode.NEAREST
-        ).squeeze(0)
-        coarse_mask = TF.resize(
-            coarse_mask.unsqueeze(0), [self.img_size, self.img_size],
-            interpolation=TF.InterpolationMode.BILINEAR
         ).squeeze(0)
 
         # SAM preprocessing
@@ -226,6 +258,7 @@ def get_augmented_dataloaders(
     max_samples: Optional[int] = None,
     split_ratio: float = 0.9,
     seed: int = 42,
+    transunet_img_size: int = 224,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Get train and validation dataloaders for augmented data.
@@ -234,12 +267,15 @@ def get_augmented_dataloaders(
         data_root: Root directory containing augmented datasets
         dataset_name: Dataset name
         batch_size: Batch size
-        img_size: Output image size
+        img_size: Output image size (SAM input size, typically 1024)
         num_workers: Number of data loading workers
         dice_range: Optional Dice score filter
         max_samples: Maximum samples to use
         split_ratio: Train/val split ratio
         seed: Random seed
+        transunet_img_size: Intermediate resolution to simulate TransUNet output path.
+                           This ensures Phase 2 has the same resolution path as Phase 3.
+                           Set to 0 to disable (legacy behavior).
 
     Returns:
         train_loader, val_loader
@@ -253,6 +289,7 @@ def get_augmented_dataloaders(
         split_ratio=split_ratio,
         is_train=True,
         seed=seed,
+        transunet_img_size=transunet_img_size,
     )
 
     val_dataset = AugmentedSAMDataset(
@@ -264,6 +301,7 @@ def get_augmented_dataloaders(
         split_ratio=split_ratio,
         is_train=False,
         seed=seed,
+        transunet_img_size=transunet_img_size,
     )
 
     train_loader = DataLoader(
@@ -301,6 +339,7 @@ class CurriculumAugmentedDataset(AugmentedSAMDataset):
         img_size: int = 1024,
         max_samples: Optional[int] = None,
         seed: int = 42,
+        transunet_img_size: int = 224,
     ):
         # Load all samples without filtering
         super().__init__(
@@ -312,6 +351,7 @@ class CurriculumAugmentedDataset(AugmentedSAMDataset):
             split_ratio=1.0,  # Use all for curriculum
             is_train=True,
             seed=seed,
+            transunet_img_size=transunet_img_size,
         )
 
         # Sort samples by Dice score (high to low for curriculum)
