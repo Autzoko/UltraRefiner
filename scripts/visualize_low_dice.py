@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from data import get_dataloaders
+from data import get_kfold_dataloaders
 
 
 def compute_dice(pred, target, threshold=0.5):
@@ -135,11 +135,11 @@ def main():
     print(f"Loaded TransUNet from {args.transunet_checkpoint}")
 
     # Get dataloader
-    train_loader, val_loader = get_dataloaders(
+    train_loader, val_loader = get_kfold_dataloaders(
         data_root=args.data_root,
-        datasets=[args.dataset],
+        dataset_name=args.dataset,
+        fold_idx=args.fold,
         batch_size=1,
-        fold=args.fold,
         img_size=args.img_size,
     )
 

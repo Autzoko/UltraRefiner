@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models.sam import sam_model_registry
 from models.sam_refiner import DifferentiableSAMRefiner
-from data import get_dataloaders
+from data import get_kfold_dataloaders
 
 
 def compute_dice(pred, target, threshold=0.5):
@@ -77,11 +77,11 @@ def main():
     pixel_std = torch.tensor([58.395, 57.12, 57.375]).view(1, 3, 1, 1).to(device)
 
     # Get dataloader
-    _, val_loader = get_dataloaders(
+    _, val_loader = get_kfold_dataloaders(
         data_root=args.data_root,
-        datasets=[args.dataset],
+        dataset_name=args.dataset,
+        fold_idx=args.fold,
         batch_size=1,
-        fold=args.fold,
         img_size=224,
     )
 
