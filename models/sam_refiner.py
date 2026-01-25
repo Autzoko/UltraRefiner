@@ -1077,3 +1077,412 @@ class SAMRefinerInference(nn.Module):
             ]))
 
         return current_mask
+
+
+# =============================================================================
+# GATED RESIDUAL REFINEMENT
+# =============================================================================
+# These classes implement gated residual refinement where SAM acts as a
+# controlled error corrector instead of directly replacing the coarse prediction.
+#
+# Final output: coarse + gate * (sam_output - coarse)
+#
+# The gate is computed based on uncertainty, limiting corrections to uncertain
+# regions and preventing degradation of already accurate coarse predictions.
+# =============================================================================
+
+
+class UncertaintyGate(nn.Module):
+    """
+    Computes a confidence gate based on coarse mask uncertainty.
+
+    Regions where the coarse mask is uncertain (values near 0.5) get higher
+    gate values, allowing SAM to make corrections. Regions where the coarse
+    mask is confident (near 0 or 1) get lower gate values, preserving the
+    coarse prediction.
+
+    Gate formula: gate = 1 - |2 * coarse - 1|^gamma
+    - When coarse = 0.5 (uncertain): gate = 1 (full correction)
+    - When coarse = 0 or 1 (confident): gate = 0 (no correction)
+    """
+
+    def __init__(self, gamma: float = 1.0, min_gate: float = 0.0, max_gate: float = 1.0):
+        """
+        Args:
+            gamma: Controls the shape of the uncertainty curve.
+                   gamma > 1: More aggressive gating (only very uncertain regions)
+                   gamma < 1: Softer gating (more regions get corrections)
+            min_gate: Minimum gate value (allows some correction everywhere)
+            max_gate: Maximum gate value (caps correction strength)
+        """
+        super().__init__()
+        self.gamma = gamma
+        self.min_gate = min_gate
+        self.max_gate = max_gate
+
+    def forward(self, coarse_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Compute uncertainty-based gate.
+
+        Args:
+            coarse_mask: Soft probability mask (B, H, W) with values in [0, 1]
+
+        Returns:
+            gate: Uncertainty gate (B, H, W) with values in [min_gate, max_gate]
+        """
+        # Confidence = |2 * p - 1|, ranges from 0 (uncertain) to 1 (confident)
+        confidence = torch.abs(2 * coarse_mask - 1)
+
+        # Uncertainty = 1 - confidence^gamma
+        uncertainty = 1 - torch.pow(confidence, self.gamma)
+
+        # Scale to [min_gate, max_gate]
+        gate = self.min_gate + (self.max_gate - self.min_gate) * uncertainty
+
+        return gate
+
+
+class LearnedGate(nn.Module):
+    """
+    Learned gate network that predicts where SAM should make corrections.
+
+    Takes the coarse mask and SAM output as input and learns to predict
+    a spatially-varying gate. This allows the model to learn complex
+    patterns of when to trust SAM vs the coarse prediction.
+    """
+
+    def __init__(self, hidden_channels: int = 32):
+        """
+        Args:
+            hidden_channels: Number of channels in hidden layers
+        """
+        super().__init__()
+
+        # Input: coarse (1) + sam_output (1) + uncertainty (1) = 3 channels
+        self.gate_net = nn.Sequential(
+            nn.Conv2d(3, hidden_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+        # Initialize to produce small gates initially (conservative)
+        self._init_conservative()
+
+    def _init_conservative(self):
+        """Initialize to produce small gate values initially."""
+        for m in self.gate_net.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    # Negative bias for final layer to start with small gates
+                    if m.out_channels == 1:
+                        nn.init.constant_(m.bias, -2.0)  # sigmoid(-2) ≈ 0.12
+                    else:
+                        nn.init.constant_(m.bias, 0)
+
+    def forward(
+        self,
+        coarse_mask: torch.Tensor,
+        sam_output: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Predict spatially-varying gate.
+
+        Args:
+            coarse_mask: Soft probability mask (B, H, W) with values in [0, 1]
+            sam_output: SAM's refined mask (B, H, W) with values in [0, 1]
+
+        Returns:
+            gate: Learned gate (B, H, W) with values in [0, 1]
+        """
+        # Compute uncertainty channel
+        uncertainty = 1 - torch.abs(2 * coarse_mask - 1)
+
+        # Stack inputs: [coarse, sam_output, uncertainty]
+        x = torch.stack([coarse_mask, sam_output, uncertainty], dim=1)  # (B, 3, H, W)
+
+        # Predict gate
+        gate = self.gate_net(x).squeeze(1)  # (B, H, W)
+
+        return gate
+
+
+class GatedResidualRefiner(nn.Module):
+    """
+    Gated residual refinement module.
+
+    Combines coarse prediction and SAM output using a confidence-weighted
+    residual connection:
+
+        final = coarse + gate * (sam_output - coarse)
+               = (1 - gate) * coarse + gate * sam_output
+
+    This ensures:
+    1. When gate ≈ 0: final ≈ coarse (preserve accurate predictions)
+    2. When gate ≈ 1: final ≈ sam_output (trust SAM's correction)
+    3. The residual (sam_output - coarse) is bounded, preventing large errors
+    """
+
+    def __init__(
+        self,
+        gate_type: str = 'uncertainty',
+        gamma: float = 1.0,
+        min_gate: float = 0.0,
+        max_gate: float = 1.0,
+        learned_hidden_channels: int = 32,
+    ):
+        """
+        Args:
+            gate_type: Type of gate to use
+                - 'uncertainty': Based on coarse mask uncertainty (no learnable params)
+                - 'learned': Learned gate network
+                - 'hybrid': Uncertainty gate multiplied by learned gate
+            gamma: Gamma parameter for uncertainty gate
+            min_gate: Minimum gate value for uncertainty gate
+            max_gate: Maximum gate value for uncertainty gate
+            learned_hidden_channels: Hidden channels for learned gate
+        """
+        super().__init__()
+        self.gate_type = gate_type
+
+        if gate_type in ['uncertainty', 'hybrid']:
+            self.uncertainty_gate = UncertaintyGate(gamma, min_gate, max_gate)
+
+        if gate_type in ['learned', 'hybrid']:
+            self.learned_gate = LearnedGate(learned_hidden_channels)
+
+    def forward(
+        self,
+        coarse_mask: torch.Tensor,
+        sam_output: torch.Tensor,
+        return_gate: bool = False
+    ) -> torch.Tensor:
+        """
+        Apply gated residual refinement.
+
+        Args:
+            coarse_mask: Soft probability mask (B, H, W) with values in [0, 1]
+            sam_output: SAM's refined mask (B, H, W) with values in [0, 1]
+            return_gate: Whether to return the gate values
+
+        Returns:
+            refined: Gated refined mask (B, H, W)
+            gate: (optional) Gate values (B, H, W)
+        """
+        if self.gate_type == 'uncertainty':
+            gate = self.uncertainty_gate(coarse_mask)
+        elif self.gate_type == 'learned':
+            gate = self.learned_gate(coarse_mask, sam_output)
+        elif self.gate_type == 'hybrid':
+            uncertainty_gate = self.uncertainty_gate(coarse_mask)
+            learned_gate = self.learned_gate(coarse_mask, sam_output)
+            gate = uncertainty_gate * learned_gate
+        else:
+            raise ValueError(f"Unknown gate type: {self.gate_type}")
+
+        # Gated residual: final = coarse + gate * (sam - coarse)
+        residual = sam_output - coarse_mask
+        refined = coarse_mask + gate * residual
+
+        if return_gate:
+            return refined, gate
+        return refined
+
+
+class GatedResidualSAMRefiner(nn.Module):
+    """
+    SAM Refiner with gated residual refinement.
+
+    This module wraps the DifferentiableSAMRefiner and applies gated residual
+    refinement to the output. Instead of directly using SAM's output, it
+    computes:
+
+        final = coarse + gate * (sigmoid(sam_logits) - coarse)
+
+    This design:
+    1. Constrains SAM to act as a controlled error corrector
+    2. Prevents degradation of already accurate coarse predictions
+    3. Limits corrections to uncertain regions
+    4. Maintains differentiability for end-to-end training
+    """
+
+    def __init__(
+        self,
+        sam_model,
+        gate_type: str = 'uncertainty',
+        gate_gamma: float = 1.0,
+        gate_min: float = 0.0,
+        gate_max: float = 1.0,
+        learned_hidden_channels: int = 32,
+        # DifferentiableSAMRefiner parameters
+        use_point_prompt: bool = True,
+        use_box_prompt: bool = True,
+        use_mask_prompt: bool = True,
+        num_points: int = 1,
+        add_negative_point: bool = True,
+        freeze_image_encoder: bool = True,
+        freeze_prompt_encoder: bool = False,
+        selection_temperature: float = 0.1,
+        box_temperature: float = 0.01,
+        mask_prompt_style: str = 'gaussian',
+        use_roi_crop: bool = False,
+        roi_expand_ratio: float = 0.2,
+    ):
+        """
+        Args:
+            sam_model: Pre-trained SAM model
+            gate_type: Type of gate ('uncertainty', 'learned', 'hybrid')
+            gate_gamma: Gamma for uncertainty gate
+            gate_min: Minimum gate value
+            gate_max: Maximum gate value
+            learned_hidden_channels: Hidden channels for learned gate
+            **kwargs: Arguments passed to DifferentiableSAMRefiner
+        """
+        super().__init__()
+
+        # Base SAM refiner
+        self.sam_refiner = DifferentiableSAMRefiner(
+            sam_model=sam_model,
+            use_point_prompt=use_point_prompt,
+            use_box_prompt=use_box_prompt,
+            use_mask_prompt=use_mask_prompt,
+            num_points=num_points,
+            add_negative_point=add_negative_point,
+            freeze_image_encoder=freeze_image_encoder,
+            freeze_prompt_encoder=freeze_prompt_encoder,
+            selection_temperature=selection_temperature,
+            box_temperature=box_temperature,
+            mask_prompt_style=mask_prompt_style,
+            use_roi_crop=use_roi_crop,
+            roi_expand_ratio=roi_expand_ratio,
+        )
+
+        # Gated residual module
+        self.gated_refiner = GatedResidualRefiner(
+            gate_type=gate_type,
+            gamma=gate_gamma,
+            min_gate=gate_min,
+            max_gate=gate_max,
+            learned_hidden_channels=learned_hidden_channels,
+        )
+
+        self.gate_type = gate_type
+
+    @property
+    def sam(self):
+        """Access to underlying SAM model."""
+        return self.sam_refiner.sam
+
+    def forward(
+        self,
+        image: torch.Tensor,
+        coarse_mask: torch.Tensor,
+        return_intermediate: bool = False,
+        image_already_normalized: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Refine coarse masks using SAM with gated residual refinement.
+
+        Args:
+            image: Input image (B, 3, H, W)
+            coarse_mask: Coarse segmentation mask (B, H, W) with values in [0, 1]
+            return_intermediate: Whether to return intermediate results
+            image_already_normalized: If True, skip SAM preprocessing
+
+        Returns:
+            Dictionary containing:
+                - 'masks': Gated refined masks (B, H, W) - final output
+                - 'masks_sam': Raw SAM output before gating (B, H, W)
+                - 'gate': Gate values (B, H, W)
+                - 'residual': Residual (sam - coarse) (B, H, W)
+                - 'iou_predictions': IoU predictions from SAM
+                - ... (other outputs from DifferentiableSAMRefiner)
+        """
+        # Get SAM's refinement
+        sam_result = self.sam_refiner(
+            image=image,
+            coarse_mask=coarse_mask,
+            return_intermediate=return_intermediate,
+            image_already_normalized=image_already_normalized,
+        )
+
+        # SAM outputs logits, convert to probabilities
+        sam_logits = sam_result['masks']  # (B, H, W) in logit space
+        sam_probs = torch.sigmoid(sam_logits)  # (B, H, W) in [0, 1]
+
+        # Apply gated residual refinement
+        refined, gate = self.gated_refiner(
+            coarse_mask=coarse_mask,
+            sam_output=sam_probs,
+            return_gate=True
+        )
+
+        # Compute residual for analysis
+        residual = sam_probs - coarse_mask
+
+        result = {
+            'masks': refined,  # Final gated output (probabilities)
+            'masks_sam': sam_probs,  # Raw SAM output (probabilities)
+            'masks_logits': sam_logits,  # Raw SAM logits
+            'gate': gate,  # Gate values
+            'residual': residual,  # Residual (sam - coarse)
+            'iou_predictions': sam_result['iou_predictions'],
+            'masks_all': sam_result['masks_all'],
+            'low_res_masks': sam_result['low_res_masks'],
+        }
+
+        if return_intermediate:
+            result['prompts'] = sam_result.get('prompts', {})
+            result['image_embeddings'] = sam_result.get('image_embeddings', None)
+            if 'roi_boxes' in sam_result:
+                result['roi_boxes'] = sam_result['roi_boxes']
+                result['crop_info'] = sam_result['crop_info']
+
+        return result
+
+
+def build_gated_sam_refiner(
+    sam_model,
+    gate_type: str = 'uncertainty',
+    gate_gamma: float = 1.0,
+    gate_min: float = 0.0,
+    gate_max: float = 0.8,
+    use_roi_crop: bool = False,
+    roi_expand_ratio: float = 0.2,
+    mask_prompt_style: str = 'gaussian',
+    **kwargs
+) -> GatedResidualSAMRefiner:
+    """
+    Factory function to build a GatedResidualSAMRefiner with sensible defaults.
+
+    Args:
+        sam_model: Pre-trained SAM model
+        gate_type: Type of gate
+            - 'uncertainty': Simple uncertainty-based (recommended for unfinetuned SAM)
+            - 'learned': Learned gate network
+            - 'hybrid': Combination of both
+        gate_gamma: Controls uncertainty curve shape (default 1.0)
+        gate_min: Minimum gate value (default 0.0 = preserve confident regions)
+        gate_max: Maximum gate value (default 0.8 = cap max correction to 80%)
+        use_roi_crop: Whether to use ROI cropping
+        roi_expand_ratio: ROI expansion ratio
+        mask_prompt_style: Mask prompt style
+        **kwargs: Additional arguments passed to GatedResidualSAMRefiner
+
+    Returns:
+        GatedResidualSAMRefiner instance
+    """
+    return GatedResidualSAMRefiner(
+        sam_model=sam_model,
+        gate_type=gate_type,
+        gate_gamma=gate_gamma,
+        gate_min=gate_min,
+        gate_max=gate_max,
+        use_roi_crop=use_roi_crop,
+        roi_expand_ratio=roi_expand_ratio,
+        mask_prompt_style=mask_prompt_style,
+        **kwargs
+    )
