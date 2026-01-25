@@ -130,24 +130,34 @@ def main():
         print(f"Processing dataset: {dataset_name}")
         print(f"{'='*60}")
 
+        # Try both original name and lowercase for checkpoint directory
+        # (checkpoints may be saved as 'busi' while data is 'BUSI')
+        checkpoint_name_options = [dataset_name, dataset_name.lower()]
+
         # Find checkpoint
+        checkpoint_paths = []
         if args.use_all_folds:
             # Use ensemble of all folds
-            checkpoint_paths = []
-            for fold in range(5):
-                ckpt_path = os.path.join(args.checkpoint_dir, dataset_name, f'fold_{fold}', 'best.pth')
-                if os.path.exists(ckpt_path):
-                    checkpoint_paths.append(ckpt_path)
+            for ckpt_name in checkpoint_name_options:
+                for fold in range(5):
+                    ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name, f'fold_{fold}', 'best.pth')
+                    if os.path.exists(ckpt_path):
+                        checkpoint_paths.append(ckpt_path)
+                if checkpoint_paths:
+                    break  # Found checkpoints with this name
             if not checkpoint_paths:
-                print(f"No checkpoints found for {dataset_name}, skipping...")
+                print(f"No checkpoints found for {dataset_name} (tried: {checkpoint_name_options}), skipping...")
                 continue
             print(f"Using ensemble of {len(checkpoint_paths)} folds")
         else:
-            ckpt_path = os.path.join(args.checkpoint_dir, dataset_name, f'fold_{args.fold}', 'best.pth')
-            if not os.path.exists(ckpt_path):
-                print(f"Checkpoint not found: {ckpt_path}, skipping...")
+            for ckpt_name in checkpoint_name_options:
+                ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name, f'fold_{args.fold}', 'best.pth')
+                if os.path.exists(ckpt_path):
+                    checkpoint_paths = [ckpt_path]
+                    break
+            if not checkpoint_paths:
+                print(f"Checkpoint not found for {dataset_name} (tried: {checkpoint_name_options}), skipping...")
                 continue
-            checkpoint_paths = [ckpt_path]
 
         # Load models
         models = []

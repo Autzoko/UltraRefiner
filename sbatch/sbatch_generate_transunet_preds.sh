@@ -43,6 +43,8 @@ echo ""
 
 # Configuration
 DATA_ROOT="./dataset/processed"
+# Note: Checkpoint dirs use lowercase (busi, busbra, bus, bus_uc, bus_uclm)
+# but dataset dirs use uppercase (BUSI, BUSBRA, BUS, BUS_UC, BUS_UCLM)
 DATASETS="BUSI BUSBRA BUS BUS_UC BUS_UCLM"
 CHECKPOINT_DIR="./checkpoints/transunet"  # Directory with trained TransUNet models
 OUTPUT_DIR="./dataset/transunet_preds"
