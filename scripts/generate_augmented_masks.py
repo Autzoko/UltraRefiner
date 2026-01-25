@@ -49,6 +49,8 @@ def get_args():
                         help='Number of parallel workers')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
+    parser.add_argument('--use_symlinks', action='store_true',
+                        help='Use symlinks instead of copying (saves space but slower on network FS)')
     return parser.parse_args()
 
 
@@ -147,30 +149,35 @@ def main():
         os.makedirs(os.path.join(output_dir, 'masks'), exist_ok=True)
         os.makedirs(os.path.join(output_dir, 'coarse_masks'), exist_ok=True)
 
-        # Create symlinks to original images and masks
-        print("Creating symlinks to original data...")
-        for sample in tqdm(samples, desc="Symlinks"):
-            # For each augmentation, we'll reference the same original image/mask
+        # Copy or symlink original images and masks
+        if args.use_symlinks:
+            print("Creating symlinks to original data (use --no flag for copies)...")
+            action_desc = "Symlinks"
+        else:
+            print("Copying original data (faster on network FS, uses more space)...")
+            action_desc = "Copying"
+            import shutil
+
+        for sample in tqdm(samples, desc=action_desc):
+            # For each augmentation, reference the same original image/mask
             for aug_idx in range(args.num_augmentations):
                 output_name = f"{sample['name']}_aug{aug_idx}"
 
-                # Symlink image
-                src_image = os.path.abspath(sample['image_path'])
+                # Image
                 dst_image = os.path.join(output_dir, 'images', f"{output_name}.png")
                 if not os.path.exists(dst_image):
-                    try:
-                        os.symlink(src_image, dst_image)
-                    except FileExistsError:
-                        pass
+                    if args.use_symlinks:
+                        os.symlink(os.path.abspath(sample['image_path']), dst_image)
+                    else:
+                        shutil.copy2(sample['image_path'], dst_image)
 
-                # Symlink GT mask
-                src_mask = os.path.abspath(sample['mask_path'])
+                # GT mask
                 dst_mask = os.path.join(output_dir, 'masks', f"{output_name}.png")
                 if not os.path.exists(dst_mask):
-                    try:
-                        os.symlink(src_mask, dst_mask)
-                    except FileExistsError:
-                        pass
+                    if args.use_symlinks:
+                        os.symlink(os.path.abspath(sample['mask_path']), dst_mask)
+                    else:
+                        shutil.copy2(sample['mask_path'], dst_mask)
 
         # Prepare tasks for parallel processing
         tasks = []
