@@ -90,6 +90,16 @@ def get_args():
     parser.add_argument('--weight_decay', type=float, default=0.01,
                         help='Weight decay')
 
+    # Speed optimizations
+    parser.add_argument('--use_amp', action='store_true', default=True,
+                        help='Use automatic mixed precision (AMP) for faster training')
+    parser.add_argument('--grad_accum_steps', type=int, default=1,
+                        help='Gradient accumulation steps (effective batch = batch_size * grad_accum_steps)')
+    parser.add_argument('--compile_model', action='store_true',
+                        help='Use torch.compile for faster training (PyTorch 2.0+)')
+    parser.add_argument('--prefetch_factor', type=int, default=4,
+                        help='Number of batches to prefetch per worker')
+
     # Prompt arguments
     parser.add_argument('--use_point_prompt', action='store_true', default=True,
                         help='Use point prompts')
@@ -224,8 +234,9 @@ def quality_aware_loss(pred_masks, gt_masks, coarse_masks, iou_preds=None,
     }
 
 
-def train_epoch(model, dataloader, optimizer, device, epoch, change_penalty_weight=0.5):
-    """Train for one epoch with quality-aware loss."""
+def train_epoch(model, dataloader, optimizer, device, epoch, change_penalty_weight=0.5,
+                scaler=None, grad_accum_steps=1):
+    """Train for one epoch with quality-aware loss and optional AMP."""
     model.train()
 
     total_loss = 0
@@ -233,46 +244,70 @@ def train_epoch(model, dataloader, optimizer, device, epoch, change_penalty_weig
     error_type_counts = {}
     num_batches = 0
 
+    use_amp = scaler is not None
+
     pbar = tqdm(dataloader, desc=f'Epoch {epoch} [Train]')
-    for batch in pbar:
-        image = batch['image'].to(device)
-        gt_mask = batch['label'].to(device)
-        coarse_mask = batch['coarse_mask'].to(device)
+    for batch_idx, batch in enumerate(pbar):
+        # Non-blocking transfer for speed
+        image = batch['image'].to(device, non_blocking=True)
+        gt_mask = batch['label'].to(device, non_blocking=True)
+        coarse_mask = batch['coarse_mask'].to(device, non_blocking=True)
 
         # Track error types for logging
         if 'error_type' in batch:
             for et in batch['error_type']:
                 error_type_counts[et] = error_type_counts.get(et, 0) + 1
 
-        # Forward pass
-        optimizer.zero_grad()
-        result = model(image, coarse_mask, image_already_normalized=True)
+        # Forward pass with AMP
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            result = model(image, coarse_mask, image_already_normalized=True)
+            refined_masks = result['masks']
 
-        refined_masks = result['masks']
+            # Compute quality-aware loss
+            loss, components = quality_aware_loss(
+                refined_masks, gt_mask, coarse_mask,
+                change_penalty_weight=change_penalty_weight
+            )
+            # Scale loss for gradient accumulation
+            loss = loss / grad_accum_steps
 
-        # Compute quality-aware loss
-        loss, components = quality_aware_loss(
-            refined_masks, gt_mask, coarse_mask,
-            change_penalty_weight=change_penalty_weight
-        )
+        # Backward pass with AMP
+        if use_amp:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
-        # Backward pass
-        loss.backward()
-        optimizer.step()
+        # Optimizer step (with gradient accumulation)
+        if (batch_idx + 1) % grad_accum_steps == 0:
+            if use_amp:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad()
 
-        # Track losses
-        total_loss += loss.item()
+        # Track losses (unscaled)
+        total_loss += loss.item() * grad_accum_steps
         for k, v in components.items():
             if k in loss_components:
                 loss_components[k] += v
         num_batches += 1
 
         pbar.set_postfix({
-            'loss': loss.item(),
+            'loss': loss.item() * grad_accum_steps,
             'dice': components['dice'],
             'chg_pen': components['change_penalty'],
             'inp_qual': components['avg_input_quality'],
         })
+
+    # Handle remaining gradients if batch count not divisible by grad_accum_steps
+    if num_batches % grad_accum_steps != 0:
+        if use_amp:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        optimizer.zero_grad()
 
     # Average losses
     avg_loss = total_loss / num_batches
@@ -285,7 +320,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, change_penalty_weig
     return avg_loss, loss_components
 
 
-def validate(model, dataloader, device):
+def validate(model, dataloader, device, use_amp=False):
     """Validate the model."""
     model.eval()
 
@@ -294,13 +329,14 @@ def validate(model, dataloader, device):
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc='Validation'):
-            image = batch['image'].to(device)
-            gt_mask = batch['label'].to(device)
-            coarse_mask = batch['coarse_mask'].to(device)
+            image = batch['image'].to(device, non_blocking=True)
+            gt_mask = batch['label'].to(device, non_blocking=True)
+            coarse_mask = batch['coarse_mask'].to(device, non_blocking=True)
 
-            # Forward pass
-            result = model(image, coarse_mask, image_already_normalized=True)
-            refined_masks = torch.sigmoid(result['masks'])
+            # Forward pass with AMP
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                result = model(image, coarse_mask, image_already_normalized=True)
+                refined_masks = torch.sigmoid(result['masks'])
 
             # Compute metrics for each sample
             for i in range(image.shape[0]):
@@ -405,6 +441,16 @@ def main():
         print(f"ROI cropping enabled: expand_ratio={args.roi_expand_ratio}")
     print("=" * 60 + "\n")
 
+    # Speed optimization settings
+    print("SPEED OPTIMIZATIONS")
+    print("=" * 60)
+    print(f"Mixed precision (AMP): {args.use_amp}")
+    print(f"Gradient accumulation steps: {args.grad_accum_steps}")
+    print(f"Effective batch size: {args.batch_size * args.grad_accum_steps}")
+    print(f"Compile model: {args.compile_model}")
+    print(f"Prefetch factor: {args.prefetch_factor}")
+    print("=" * 60 + "\n")
+
     # Load SAM model
     print(f'Loading SAM model from {args.sam_checkpoint}')
     from segment_anything import sam_model_registry
@@ -425,7 +471,13 @@ def main():
     )
     model = model.to(device)
 
-    # Get dataloaders with online augmentation
+    # Optional: Compile model for faster training (PyTorch 2.0+)
+    if args.compile_model and hasattr(torch, 'compile'):
+        print("Compiling model with torch.compile...")
+        model = torch.compile(model)
+        print("Model compiled successfully")
+
+    # Get dataloaders with online augmentation (with speed optimizations)
     print(f'Loading datasets from {args.data_root}')
     print(f'Datasets: {args.datasets}')
 
@@ -439,6 +491,8 @@ def main():
         num_workers=args.num_workers,
         split_ratio=args.split_ratio,
         seed=args.seed,
+        persistent_workers=True,
+        prefetch_factor=args.prefetch_factor,
     )
 
     print(f'Training samples: {len(train_loader.dataset)}')
@@ -454,6 +508,11 @@ def main():
 
     optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+
+    # Setup AMP scaler for mixed precision training
+    scaler = torch.cuda.amp.GradScaler() if args.use_amp else None
+    if args.use_amp:
+        print("Mixed precision training enabled (AMP)")
 
     # Resume from checkpoint if specified
     start_epoch = 1
@@ -480,10 +539,12 @@ def main():
         print(f'Epoch {epoch}/{args.epochs}')
         print(f'{"="*60}')
 
-        # Train
+        # Train (with AMP and gradient accumulation)
         train_loss, loss_components = train_epoch(
             model, train_loader, optimizer, device, epoch,
-            change_penalty_weight=args.change_penalty_weight
+            change_penalty_weight=args.change_penalty_weight,
+            scaler=scaler,
+            grad_accum_steps=args.grad_accum_steps,
         )
 
         print(f'\nTraining Loss: {train_loss:.4f}')
@@ -506,7 +567,7 @@ def main():
 
         # Validation
         if epoch % args.val_interval == 0:
-            val_result = validate(model, val_loader, device)
+            val_result = validate(model, val_loader, device, use_amp=args.use_amp)
 
             is_best = val_result['refined']['dice'] > best_dice
             if is_best:

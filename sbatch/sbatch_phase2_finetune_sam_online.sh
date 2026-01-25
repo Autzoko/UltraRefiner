@@ -55,9 +55,16 @@ OUTPUT_DIR="./checkpoints/sam_finetuned_online"
 
 # Training parameters
 EPOCHS=300
-BATCH_SIZE=4
+BATCH_SIZE=8
 LR=1e-4
 NUM_WORKERS=8
+
+# Speed optimizations (AMP gives ~2x speedup on A100)
+USE_AMP="--use_amp"
+GRAD_ACCUM_STEPS=2  # Effective batch size = BATCH_SIZE * GRAD_ACCUM_STEPS = 16
+PREFETCH_FACTOR=4
+# Uncomment to use torch.compile (PyTorch 2.0+, may have compatibility issues)
+# COMPILE_MODEL="--compile_model"
 
 # Augmentation parameters
 AUGMENTOR_PRESET="default"  # Options: default, mild, severe, boundary_focus, structural
@@ -85,7 +92,14 @@ echo ""
 echo "Training:"
 echo "  Epochs: ${EPOCHS}"
 echo "  Batch size: ${BATCH_SIZE}"
+echo "  Gradient accumulation: ${GRAD_ACCUM_STEPS}"
+echo "  Effective batch size: $((BATCH_SIZE * GRAD_ACCUM_STEPS))"
 echo "  Learning rate: ${LR}"
+echo ""
+echo "Speed Optimizations:"
+echo "  Mixed Precision (AMP): enabled"
+echo "  Prefetch factor: ${PREFETCH_FACTOR}"
+echo "  Persistent workers: enabled"
 echo ""
 echo "Augmentation:"
 echo "  Preset: ${AUGMENTOR_PRESET}"
@@ -117,7 +131,15 @@ CMD="python scripts/finetune_sam_online.py \
     --mask_prompt_style ${MASK_PROMPT_STYLE} \
     ${USE_ROI_CROP} \
     --roi_expand_ratio ${ROI_EXPAND_RATIO} \
+    ${USE_AMP} \
+    --grad_accum_steps ${GRAD_ACCUM_STEPS} \
+    --prefetch_factor ${PREFETCH_FACTOR} \
     --output_dir ${OUTPUT_DIR}"
+
+# Add compile flag if set
+if [ -n "${COMPILE_MODEL}" ]; then
+    CMD="${CMD} ${COMPILE_MODEL}"
+fi
 
 # Add resume flag if checkpoint exists
 if [ -n "${RESUME_CHECKPOINT}" ] && [ -f "${RESUME_CHECKPOINT}" ]; then

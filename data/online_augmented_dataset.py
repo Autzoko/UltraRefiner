@@ -292,6 +292,8 @@ def get_online_augmented_dataloaders(
     num_workers: int = 4,
     split_ratio: float = 0.9,
     seed: int = 42,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 4,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Get train and validation dataloaders with online augmentation.
@@ -306,6 +308,8 @@ def get_online_augmented_dataloaders(
         num_workers: Data loading workers.
         split_ratio: Train/val split.
         seed: Random seed.
+        persistent_workers: Keep workers alive between epochs (faster).
+        prefetch_factor: Number of batches to prefetch per worker.
 
     Returns:
         train_loader, val_loader
@@ -359,6 +363,9 @@ def get_online_augmented_dataloaders(
             seed=seed,
         )
 
+    # Use persistent workers and prefetch for faster loading
+    use_persistent = persistent_workers and num_workers > 0
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -366,6 +373,8 @@ def get_online_augmented_dataloaders(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
+        persistent_workers=use_persistent,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
 
     val_loader = DataLoader(
@@ -374,6 +383,8 @@ def get_online_augmented_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=use_persistent,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
 
     return train_loader, val_loader
