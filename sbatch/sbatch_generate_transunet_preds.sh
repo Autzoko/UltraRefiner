@@ -49,11 +49,8 @@ DATASETS="BUSI BUSBRA BUS BUS_UC BUS_UCLM"
 CHECKPOINT_DIR="./checkpoints/transunet"  # Directory with trained TransUNet models
 OUTPUT_DIR="./dataset/transunet_preds"
 IMG_SIZE=224
-
-# Use ensemble of all folds for better predictions
-USE_ALL_FOLDS="--use_all_folds"
-# Or use a specific fold:
-# FOLD=0
+N_FOLDS=5
+SEED=42  # Must match training seed for correct fold splits
 
 echo "============================================================"
 echo "Configuration:"
@@ -63,7 +60,13 @@ echo "  Datasets: ${DATASETS}"
 echo "  Checkpoint dir: ${CHECKPOINT_DIR}"
 echo "  Output dir: ${OUTPUT_DIR}"
 echo "  Image size: ${IMG_SIZE}"
-echo "  Using: All folds (ensemble)"
+echo "  Number of folds: ${N_FOLDS}"
+echo "  Random seed: ${SEED}"
+echo ""
+echo "Out-of-Fold Strategy:"
+echo "  - For each fold, predict on that fold's VALIDATION set only"
+echo "  - This ensures predictions are on unseen data (real failures)"
+echo "  - 5 folds × validation sets = entire training set"
 echo "============================================================"
 echo ""
 
@@ -74,7 +77,8 @@ CMD="python scripts/generate_transunet_predictions.py \
     --checkpoint_dir ${CHECKPOINT_DIR} \
     --output_dir ${OUTPUT_DIR} \
     --img_size ${IMG_SIZE} \
-    ${USE_ALL_FOLDS}"
+    --n_folds ${N_FOLDS} \
+    --seed ${SEED}"
 
 echo "Running command:"
 echo "${CMD}"
@@ -85,7 +89,7 @@ eval ${CMD}
 if [ $? -eq 0 ]; then
     echo ""
     echo "============================================================"
-    echo "TransUNet predictions generated successfully!"
+    echo "Out-of-fold TransUNet predictions generated successfully!"
     echo "============================================================"
     echo "Output saved to: ${OUTPUT_DIR}/"
     echo ""
@@ -96,6 +100,9 @@ if [ $? -eq 0 ]; then
     echo "          ├── images/       (symlinks to original)"
     echo "          ├── masks/        (symlinks to GT)"
     echo "          └── coarse_masks/ (TransUNet soft predictions as .npy)"
+    echo ""
+    echo "Each sample was predicted by a model that did NOT see it during training."
+    echo "This ensures predictions represent real TransUNet failure modes."
     echo ""
     echo "Next step: Run hybrid SAM finetuning with:"
     echo "  sbatch sbatch/sbatch_phase2_finetune_sam_hybrid.sh"
