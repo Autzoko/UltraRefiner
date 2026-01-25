@@ -180,6 +180,15 @@ class HybridDataset(Dataset):
             coarse_path = os.path.join(self.coarse_mask_dir, f"{name}.npy")
             if os.path.exists(coarse_path):
                 coarse_mask = np.load(coarse_path)
+                # Resize coarse_mask to match gt_mask for Dice computation
+                # (TransUNet predictions are saved at transunet_img_size, e.g., 224x224)
+                if coarse_mask.shape != gt_mask.shape:
+                    import cv2
+                    coarse_mask = cv2.resize(
+                        coarse_mask,
+                        (gt_mask.shape[1], gt_mask.shape[0]),  # (width, height)
+                        interpolation=cv2.INTER_LINEAR
+                    )
                 # Compute Dice
                 pred_binary = (coarse_mask > 0.5).astype(np.float32)
                 gt_binary = (gt_mask > 0.5).astype(np.float32)
