@@ -3,6 +3,10 @@ Offline Augmented Dataset for Phase 2 SAM Refinement Training.
 
 Loads pre-generated augmented masks from disk for fast training.
 Use with generate_augmented_masks.py to create the data.
+
+Key optimizations (matching AugmentedSAMDataset):
+- Uses metadata.json for fast sample indexing (no directory scanning)
+- No symlinks (files are copied)
 """
 
 import os
@@ -18,15 +22,16 @@ from typing import Optional, Tuple, List, Union
 class OfflineAugmentedDataset(Dataset):
     """
     Dataset that loads pre-generated augmented masks from disk.
+    Uses metadata.json for fast indexing (no directory scanning).
 
     Directory structure:
         data_root/
         └── {dataset}/
             └── train/
-                ├── images/         (symlinks or copies)
-                ├── masks/          (GT masks, symlinks or copies)
+                ├── images/         (copied files, not symlinks)
+                ├── masks/          (GT masks, copied files)
                 ├── coarse_masks/   (augmented masks as .npy)
-                └── metadata.json   (optional, contains augmentation info)
+                └── metadata.json   (sample index for fast lookup)
     """
 
     def __init__(
@@ -39,16 +44,6 @@ class OfflineAugmentedDataset(Dataset):
         is_train: bool = True,
         seed: int = 42,
     ):
-        """
-        Args:
-            data_root: Root directory containing augmented datasets.
-            dataset_name: Dataset name (e.g., BUSI, BUSBRA).
-            img_size: Output image size (SAM input size, typically 1024).
-            transunet_img_size: TransUNet resolution for resolution path matching.
-            split_ratio: Train/val split ratio.
-            is_train: Whether this is training set.
-            seed: Random seed.
-        """
         self.data_root = data_root
         self.dataset_name = dataset_name
         self.img_size = img_size
@@ -61,18 +56,19 @@ class OfflineAugmentedDataset(Dataset):
         self.mask_dir = os.path.join(self.base_dir, 'masks')
         self.coarse_mask_dir = os.path.join(self.base_dir, 'coarse_masks')
 
-        # Load metadata if exists
-        self.metadata = {}
+        # Load metadata for fast indexing (no directory scanning)
         metadata_path = os.path.join(self.base_dir, 'metadata.json')
         if os.path.exists(metadata_path):
             with open(metadata_path, 'r') as f:
                 meta = json.load(f)
-                # Create lookup by name
-                for sample in meta.get('samples', []):
-                    self.metadata[sample['name']] = sample
-
-        # Get all samples
-        self.samples = self._load_samples()
+                self.samples = meta.get('samples', [])
+                # Create lookup dict for metadata
+                self.sample_meta = {s['name']: s for s in self.samples}
+        else:
+            # Fallback: scan directory (slower)
+            print(f"Warning: metadata.json not found, scanning directory (slower)...")
+            self.samples = self._scan_samples()
+            self.sample_meta = {}
 
         # Train/val split
         np.random.seed(seed)
@@ -80,9 +76,11 @@ class OfflineAugmentedDataset(Dataset):
         split_idx = int(len(indices) * split_ratio)
 
         if is_train:
-            self.samples = [self.samples[i] for i in indices[:split_idx]]
+            selected = indices[:split_idx]
         else:
-            self.samples = [self.samples[i] for i in indices[split_idx:]]
+            selected = indices[split_idx:]
+
+        self.samples = [self.samples[i] for i in selected]
 
         # SAM normalization parameters
         self.pixel_mean = torch.tensor([123.675, 116.28, 103.53]).view(3, 1, 1)
@@ -90,22 +88,28 @@ class OfflineAugmentedDataset(Dataset):
 
         print(f"Loaded {len(self.samples)} {'train' if is_train else 'val'} samples from {dataset_name}")
 
-    def _load_samples(self) -> List[str]:
-        """Load sample names from coarse_masks directory."""
+    def _scan_samples(self) -> List[dict]:
+        """Fallback: scan directory for samples (slower)."""
         samples = []
         for f in sorted(os.listdir(self.coarse_mask_dir)):
             if f.endswith('.npy'):
                 name = os.path.splitext(f)[0]
-                samples.append(name)
+                samples.append({'name': name})
         return samples
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        name = self.samples[idx]
+        sample = self.samples[idx]
+        name = sample['name'] if isinstance(sample, dict) else sample
 
-        # Load image (try multiple extensions)
+        # Get metadata
+        meta = self.sample_meta.get(name, {})
+        dice = meta.get('dice', 1.0)
+        error_type = meta.get('error_type', 'unknown')
+
+        # Load image
         image = None
         for ext in ['.png', '.jpg', '.jpeg', '.npy']:
             image_path = os.path.join(self.image_dir, f"{name}{ext}")
@@ -123,7 +127,6 @@ class OfflineAugmentedDataset(Dataset):
         mask_path = os.path.join(self.mask_dir, f"{name}.png")
         gt_mask = np.array(Image.open(mask_path).convert('L'))
 
-        # Normalize to [0, 1]
         if gt_mask.max() > 1:
             gt_mask = gt_mask.astype(np.float32) / 255.0
         else:
@@ -133,10 +136,14 @@ class OfflineAugmentedDataset(Dataset):
         coarse_path = os.path.join(self.coarse_mask_dir, f"{name}.npy")
         coarse_mask = np.load(coarse_path)
 
-        # Get metadata if available
-        meta = self.metadata.get(name, {})
-        dice = meta.get('dice', 1.0)
-        error_type = meta.get('error_type', 'unknown')
+        # Resize coarse_mask to match gt_mask if needed
+        if coarse_mask.shape != gt_mask.shape:
+            import cv2
+            coarse_mask = cv2.resize(
+                coarse_mask,
+                (gt_mask.shape[1], gt_mask.shape[0]),
+                interpolation=cv2.INTER_LINEAR
+            )
 
         # Convert to tensors
         image = torch.from_numpy(image).float()
@@ -153,24 +160,14 @@ class OfflineAugmentedDataset(Dataset):
 
         original_size = (image.shape[-2], image.shape[-1])
 
-        # Resize coarse_mask to match image size if needed
-        if coarse_mask.shape != gt_mask.shape:
-            coarse_mask = TF.resize(
-                coarse_mask.unsqueeze(0).unsqueeze(0),
-                list(gt_mask.shape),
-                interpolation=TF.InterpolationMode.BILINEAR
-            ).squeeze(0).squeeze(0)
-
         # Resolution path matching
         if self.transunet_img_size > 0 and self.transunet_img_size < self.img_size:
-            # Step 1: Resize to TransUNet resolution
             image_small = TF.resize(image, [self.transunet_img_size, self.transunet_img_size])
             coarse_mask_small = TF.resize(
                 coarse_mask.unsqueeze(0), [self.transunet_img_size, self.transunet_img_size],
                 interpolation=TF.InterpolationMode.BILINEAR
             ).squeeze(0)
 
-            # Step 2: Resize to SAM input size
             image = TF.resize(image_small, [self.img_size, self.img_size])
             coarse_mask = TF.resize(
                 coarse_mask_small.unsqueeze(0), [self.img_size, self.img_size],
@@ -183,7 +180,6 @@ class OfflineAugmentedDataset(Dataset):
                 interpolation=TF.InterpolationMode.BILINEAR
             ).squeeze(0)
 
-        # GT mask: resize directly to SAM size
         gt_mask = TF.resize(
             gt_mask.unsqueeze(0), [self.img_size, self.img_size],
             interpolation=TF.InterpolationMode.NEAREST
@@ -259,24 +255,7 @@ def get_offline_augmented_dataloaders(
     persistent_workers: bool = True,
     prefetch_factor: int = 4,
 ) -> Tuple[DataLoader, DataLoader]:
-    """
-    Get train and validation dataloaders with offline augmented data.
-
-    Args:
-        data_root: Root directory containing augmented datasets.
-        dataset_names: Single dataset name or list of names to combine.
-        batch_size: Batch size.
-        img_size: SAM input size (typically 1024).
-        transunet_img_size: TransUNet resolution for resolution path matching.
-        num_workers: Data loading workers.
-        split_ratio: Train/val split.
-        seed: Random seed.
-        persistent_workers: Keep workers alive between epochs.
-        prefetch_factor: Number of batches to prefetch per worker.
-
-    Returns:
-        train_loader, val_loader
-    """
+    """Get train and validation dataloaders with offline augmented data."""
     if isinstance(dataset_names, str):
         dataset_names = [dataset_names]
 
@@ -330,7 +309,6 @@ def get_offline_augmented_dataloaders(
         drop_last=True,
         persistent_workers=use_persistent,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        timeout=120,  # 2 minute timeout to detect hangs
     )
 
     val_loader = DataLoader(
@@ -341,7 +319,6 @@ def get_offline_augmented_dataloaders(
         pin_memory=True,
         persistent_workers=use_persistent,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        timeout=120,
     )
 
     return train_loader, val_loader
