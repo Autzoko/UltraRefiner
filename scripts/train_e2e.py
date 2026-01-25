@@ -55,7 +55,7 @@ from tqdm import tqdm
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import build_ultra_refiner, CONFIGS
+from models import build_ultra_refiner, build_gated_ultra_refiner, CONFIGS
 from data import (
     get_combined_kfold_dataloaders,
     RandomGenerator,
@@ -175,6 +175,26 @@ def get_args():
     parser.add_argument('--freeze_transunet_epochs', type=int, default=0,
                         help='Number of epochs to freeze TransUNet at the start. '
                              'Allows SAM to adapt first before joint training.')
+
+    # Gated residual refinement options (alternative to Phase 2)
+    parser.add_argument('--use_gated_refinement', action='store_true',
+                        help='Enable gated residual refinement: final = coarse + gate * (SAM - coarse). '
+                             'Constrains SAM to act as controlled error corrector. '
+                             'Recommended when skipping Phase 2 to prevent SAM from degrading good predictions.')
+    parser.add_argument('--gate_type', type=str, default='uncertainty',
+                        choices=['uncertainty', 'learned', 'hybrid'],
+                        help='Gate type: uncertainty (based on coarse confidence, no extra params), '
+                             'learned (CNN predicts correction regions), '
+                             'hybrid (uncertainty * learned)')
+    parser.add_argument('--gate_gamma', type=float, default=1.0,
+                        help='Gamma for uncertainty gate curve. '
+                             'Higher = more aggressive (only very uncertain regions). '
+                             'Lower = softer (more regions get corrections).')
+    parser.add_argument('--gate_min', type=float, default=0.0,
+                        help='Minimum gate value. 0 = fully preserve confident regions.')
+    parser.add_argument('--gate_max', type=float, default=0.8,
+                        help='Maximum gate value. Caps correction strength. '
+                             'Recommended: 0.3-0.5 for unfinetuned SAM, 0.8 for finetuned SAM.')
 
     return parser.parse_args()
 
@@ -602,25 +622,53 @@ def main():
     # Build UltraRefiner model
     logging.info(f'mask_prompt_style: {args.mask_prompt_style}')
     logging.info(f'use_roi_crop: {args.use_roi_crop}')
+    logging.info(f'use_gated_refinement: {args.use_gated_refinement}')
 
-    model = build_ultra_refiner(
-        vit_name=args.vit_name,
-        img_size=args.img_size,
-        num_classes=args.num_classes,
-        sam_model_type=args.sam_model_type,
-        sam_checkpoint=args.sam_checkpoint,
-        transunet_checkpoint=args.transunet_checkpoint,
-        n_skip=args.n_skip,
-        freeze_sam_image_encoder=args.freeze_sam_image_encoder,
-        freeze_sam_prompt_encoder=args.freeze_sam_prompt_encoder,
-        sharpen_coarse_mask=args.sharpen_coarse_mask,
-        sharpen_temperature=args.sharpen_temperature,
-        mask_prompt_style=args.mask_prompt_style,
-        use_roi_crop=args.use_roi_crop,
-        roi_expand_ratio=args.roi_expand_ratio,
-    ).to(device)
-
-    logging.info('Built UltraRefiner model')
+    if args.use_gated_refinement:
+        # Use gated residual refinement: final = coarse + gate * (SAM - coarse)
+        logging.info(f'Gated refinement enabled: gate_type={args.gate_type}, '
+                     f'gamma={args.gate_gamma}, min={args.gate_min}, max={args.gate_max}')
+        model = build_gated_ultra_refiner(
+            vit_name=args.vit_name,
+            img_size=args.img_size,
+            num_classes=args.num_classes,
+            sam_model_type=args.sam_model_type,
+            sam_checkpoint=args.sam_checkpoint,
+            transunet_checkpoint=args.transunet_checkpoint,
+            n_skip=args.n_skip,
+            freeze_sam_image_encoder=args.freeze_sam_image_encoder,
+            freeze_sam_prompt_encoder=args.freeze_sam_prompt_encoder,
+            sharpen_coarse_mask=args.sharpen_coarse_mask,
+            sharpen_temperature=args.sharpen_temperature,
+            mask_prompt_style=args.mask_prompt_style,
+            use_roi_crop=args.use_roi_crop,
+            roi_expand_ratio=args.roi_expand_ratio,
+            # Gated refinement parameters
+            gate_type=args.gate_type,
+            gate_gamma=args.gate_gamma,
+            gate_min=args.gate_min,
+            gate_max=args.gate_max,
+        ).to(device)
+        logging.info('Built GatedUltraRefiner model')
+    else:
+        # Standard refinement: final = SAM(coarse)
+        model = build_ultra_refiner(
+            vit_name=args.vit_name,
+            img_size=args.img_size,
+            num_classes=args.num_classes,
+            sam_model_type=args.sam_model_type,
+            sam_checkpoint=args.sam_checkpoint,
+            transunet_checkpoint=args.transunet_checkpoint,
+            n_skip=args.n_skip,
+            freeze_sam_image_encoder=args.freeze_sam_image_encoder,
+            freeze_sam_prompt_encoder=args.freeze_sam_prompt_encoder,
+            sharpen_coarse_mask=args.sharpen_coarse_mask,
+            sharpen_temperature=args.sharpen_temperature,
+            mask_prompt_style=args.mask_prompt_style,
+            use_roi_crop=args.use_roi_crop,
+            roi_expand_ratio=args.roi_expand_ratio,
+        ).to(device)
+        logging.info('Built UltraRefiner model')
     if args.use_roi_crop:
         logging.info(f'ROI cropping enabled: expand_ratio={args.roi_expand_ratio}')
 
