@@ -156,7 +156,7 @@ python scripts/finetune_sam_offline.py \
 
 **Optional: Mix with Real TransUNet Predictions**
 ```bash
-# First generate TransUNet predictions (see Option B)
+# First generate TransUNet predictions (see Option B below)
 # Then train with both real and augmented data
 python scripts/finetune_sam_offline.py \
     --data_root ./dataset/augmented_masks \
@@ -164,7 +164,11 @@ python scripts/finetune_sam_offline.py \
     --real_ratio 0.3 \
     --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
     --sam_checkpoint ./pretrained/sam_vit_b_01ec64.pth \
-    --use_amp --use_roi_crop
+    --output_dir ./checkpoints/sam_finetuned \
+    --mask_prompt_style direct --transunet_img_size 224 \
+    --use_roi_crop --roi_expand_ratio 0.3 \
+    --use_amp --batch_size 4 \
+    --epochs 100
 ```
 
 | `--real_ratio` | Meaning |
@@ -703,9 +707,10 @@ python scripts/finetune_sam_offline.py \
     --data_root ./dataset/augmented_masks \
     --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
     --sam_checkpoint ./pretrained/sam_vit_b_01ec64.pth \
+    --output_dir ./checkpoints/sam_finetuned \
     --mask_prompt_style direct --transunet_img_size 224 \
     --use_roi_crop --roi_expand_ratio 0.3 \
-    --use_amp --batch_size 4
+    --use_amp --batch_size 4 --epochs 100
 
 # Option B: Offline + Real Predictions (best of both worlds)
 # First generate TransUNet out-of-fold predictions
@@ -722,9 +727,10 @@ python scripts/finetune_sam_offline.py \
     --real_ratio 0.3 \
     --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
     --sam_checkpoint ./pretrained/sam_vit_b_01ec64.pth \
+    --output_dir ./checkpoints/sam_finetuned \
     --mask_prompt_style direct --transunet_img_size 224 \
     --use_roi_crop --roi_expand_ratio 0.3 \
-    --use_amp --batch_size 4
+    --use_amp --batch_size 4 --epochs 100
 
 # Option C: Pre-generated Data (requires generate_augmented_data.py first)
 python scripts/generate_augmented_data.py \
