@@ -581,8 +581,9 @@ class MaskAugmentor:
 
         # Optional rotation
         if np.random.random() < 0.5:
-            angle = np.random.uniform(5, 20) * np.random.choice([-1, 1])
-            cy, cx = (y1 + y2) // 2 + shift_y, (x1 + x2) // 2 + shift_x
+            angle = float(np.random.uniform(5, 20) * np.random.choice([-1, 1]))
+            cy = float((y1 + y2) // 2 + shift_y)
+            cx = float((x1 + x2) // 2 + shift_x)
             M_rotate = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
             result = cv2.warpAffine(result, M_rotate, (W, H))
 
