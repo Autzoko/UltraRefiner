@@ -271,10 +271,93 @@ finetuning and end-to-end training.
 2.5 GATED RESIDUAL REFINEMENT (Alternative to Phase 2)
 ================================================================================
 
-When Phase 2 SAM finetuning is skipped, unfinetuned SAM may make inappropriate
-corrections that degrade already accurate coarse predictions. Gated Residual
-Refinement addresses this by constraining SAM to act as a controlled error
-corrector instead of directly replacing the coarse prediction.
+**2.5.0 Design Philosophy and Motivation**
+------------------------------------------
+The standard UltraRefiner pipeline assumes SAM has been finetuned (Phase 2) to
+understand the medical imaging domain and coarse mask distribution. However,
+Phase 2 requires significant computational resources and careful hyperparameter
+tuning. When Phase 2 is skipped, a fundamental problem emerges:
+
+  THE UNFINETUNED SAM PROBLEM:
+  ┌────────────────────────────────────────────────────────────────────────────┐
+  │ SAM was trained on natural images with high-quality prompts. When given    │
+  │ soft probability masks from TransUNet as prompts:                          │
+  │                                                                            │
+  │ 1. Distribution Mismatch: SAM expects sharp, confident masks but receives  │
+  │    soft probabilities with uncertainty at boundaries                       │
+  │                                                                            │
+  │ 2. Domain Gap: Medical ultrasound characteristics (speckle noise, low      │
+  │    contrast, fuzzy boundaries) differ from SAM's training distribution     │
+  │                                                                            │
+  │ 3. Overconfident Corrections: SAM may "correct" already accurate regions,  │
+  │    introducing false positives/negatives in confident predictions          │
+  │                                                                            │
+  │ 4. No "Do Nothing" Training: SAM never learned when to preserve input —    │
+  │    it always tries to produce a "better" mask, even when input is perfect  │
+  └────────────────────────────────────────────────────────────────────────────┘
+
+  OBSERVED FAILURE MODE (without gating):
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │ TransUNet Dice: 0.85 → SAM Refinement Dice: 0.72 (DEGRADATION!)             │
+  │                                                                             │
+  │ SAM incorrectly "refines" confident TransUNet predictions, replacing       │
+  │ accurate segmentations with hallucinated boundaries based on its natural   │
+  │ image priors. The refinement network actively hurts performance.           │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+**THE GATED RESIDUAL SOLUTION:**
+
+Instead of letting SAM directly replace the coarse prediction, we constrain it
+to act as a RESIDUAL ERROR CORRECTOR with spatially-varying correction strength:
+
+  Standard:  final = SAM(coarse)                    — Direct replacement
+  Gated:     final = coarse + gate × (SAM - coarse) — Controlled correction
+                            └───────────────────┘
+                              Residual (correction)
+
+The gate (ranging 0 to 1) controls how much we trust SAM's correction at each
+pixel. This design embodies several key principles:
+
+  PRINCIPLE 1: PRESERVE BY DEFAULT
+  ────────────────────────────────
+  When gate ≈ 0, final ≈ coarse. Confident predictions (coarse near 0 or 1)
+  are preserved, preventing SAM from damaging accurate segmentations.
+
+  PRINCIPLE 2: CORRECT SELECTIVELY
+  ────────────────────────────────
+  When gate ≈ 1, final ≈ SAM. Uncertain predictions (coarse ≈ 0.5) are
+  delegated to SAM for refinement, leveraging SAM's boundary expertise.
+
+  PRINCIPLE 3: SMOOTH INTERPOLATION
+  ─────────────────────────────────
+  The gate provides smooth interpolation between coarse and SAM outputs,
+  avoiding harsh transitions and enabling gradient-based optimization.
+
+  PRINCIPLE 4: UNCERTAINTY-AWARE
+  ──────────────────────────────
+  The gate is derived from TransUNet's own prediction confidence. Regions
+  where TransUNet is uncertain (boundary pixels) get refined; regions
+  where TransUNet is confident (interior/exterior) are preserved.
+
+**Mathematical Formulation:**
+
+  final = coarse + gate × (SAM - coarse)
+        = coarse + gate × residual
+        = (1 - gate) × coarse + gate × SAM    [equivalent form]
+
+  where:
+    coarse ∈ [0, 1]^{H×W}  — TransUNet soft mask (probabilities)
+    SAM ∈ [0, 1]^{H×W}     — SAM refinement output (probabilities)
+    gate ∈ [0, 1]^{H×W}    — Spatially-varying correction strength
+    residual = SAM - coarse — SAM's proposed correction
+
+**Why Residual Learning?**
+
+The residual formulation (coarse + gate × residual) is inspired by ResNet:
+- Easier to learn small corrections than complete transformations
+- Identity mapping (gate=0) is the default, requiring no learning
+- Gradients flow directly through the skip connection
+- The network learns "what to change" rather than "what the answer is"
 
 **Core Formula:**
 Instead of: final = SAM(coarse)                    [direct replacement]
@@ -285,6 +368,82 @@ This can be rewritten as:
 
 When gate ≈ 0: final ≈ coarse (preserve accurate predictions)
 When gate ≈ 1: final ≈ SAM    (trust SAM's correction)
+
+**Pipeline Comparison:**
+
+STANDARD ULTRAREFINER (Direct Replacement):
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                                                                              │
+│   Image ──→ TransUNet ──→ Coarse ──→ Prompts ──→ SAM ──→ Final              │
+│             (frozen)       Mask                          Mask               │
+│                             │                             │                 │
+│                             └───────── IGNORED ───────────┘                 │
+│                                                                              │
+│   Problem: SAM completely replaces coarse mask, may degrade good predictions│
+└──────────────────────────────────────────────────────────────────────────────┘
+
+GATED ULTRAREFINER (Controlled Correction):
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                                                                              │
+│   Image ──→ TransUNet ──→ Coarse ──┬──→ Prompts ──→ SAM ──→ SAM Mask        │
+│             (frozen)       Mask    │                          │              │
+│                             │      │                          │              │
+│                             │      └──→ Uncertainty ──→ Gate  │              │
+│                             │               │           │     │              │
+│                             │               ▼           ▼     ▼              │
+│                             └──────────→ [ Coarse + Gate × (SAM - Coarse) ] │
+│                                                      │                       │
+│                                                      ▼                       │
+│                                                 Final Mask                   │
+│                                                                              │
+│   Benefit: Preserves confident predictions, only refines uncertain regions  │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+**Information Flow in Gated Refinement:**
+
+  ┌─────────────┐
+  │   Coarse    │──────────────────────────────────────────┐
+  │    Mask     │                                          │
+  │  (0.0-1.0)  │──────┐                                   │
+  └─────────────┘      │                                   │
+        │              │                                   │
+        │              ▼                                   │
+        │    ┌─────────────────┐                           │
+        │    │ Compute Gate:   │                           │
+        │    │ confidence =    │                           │
+        │    │  |2×coarse - 1| │                           │
+        │    │ gate = 1 - conf │                           │
+        │    └────────┬────────┘                           │
+        │             │                                    │
+        │             │ gate ∈ [0, 1]                      │
+        │             │                                    │
+        ▼             │                                    │
+  ┌─────────────┐     │                                    │
+  │   Prompt    │     │                                    │
+  │ Generation  │     │                                    │
+  └──────┬──────┘     │                                    │
+         │            │                                    │
+         ▼            │                                    │
+  ┌─────────────┐     │                                    │
+  │     SAM     │     │                                    │
+  │  Refinement │     │                                    │
+  └──────┬──────┘     │                                    │
+         │            │                                    │
+         │ SAM output │                                    │
+         │ (0.0-1.0)  │                                    │
+         │            │                                    │
+         ▼            ▼                                    ▼
+  ┌───────────────────────────────────────────────────────────────┐
+  │                                                               │
+  │   Final = Coarse + Gate × (SAM - Coarse)                      │
+  │                          └─────┬─────┘                        │
+  │                             Residual                          │
+  │                                                               │
+  │   At each pixel:                                              │
+  │   • If coarse ≈ 0.5 (uncertain): gate ≈ 1 → Final ≈ SAM       │
+  │   • If coarse ≈ 0 or 1 (confident): gate ≈ 0 → Final ≈ Coarse │
+  │                                                               │
+  └───────────────────────────────────────────────────────────────┘
 
 **2.5.1 Uncertainty-Based Gate**
 --------------------------------
@@ -858,6 +1017,13 @@ Logging:
 2. Novel differentiable prompt generation enabling gradient flow through discrete prompts
 3. Prediction-based SAM training using actual coarse network outputs
 4. LoRA integration for parameter-efficient SAM adaptation to medical domain
-5. Comprehensive evaluation on five breast ultrasound datasets with K-fold CV
+5. Gated residual refinement mechanism that constrains SAM as a controlled error corrector,
+   enabling effective refinement without domain-specific finetuning
+6. Comprehensive evaluation on five breast ultrasound datasets with K-fold CV
 
 Our work establishes a new paradigm for integrating foundation models into task-specific pipelines through differentiable interfaces, with broad applicability beyond medical image segmentation to any domain requiring coarse-to-fine prediction refinement.
+
+The gated residual refinement contribution is particularly significant for practical deployment:
+it enables leveraging SAM's boundary refinement capabilities without the computational cost of
+Phase 2 finetuning, while protecting against the domain gap problem that causes unfinetuned
+foundation models to degrade task-specific predictions.
