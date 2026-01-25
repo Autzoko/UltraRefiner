@@ -604,10 +604,10 @@ We provide TWO approaches for Phase 2, each with different trade-offs:
 └─────────────────────────────────────────────────────────────────────────────┘
 
 ================================================================================
-Phase 2 Option A: SAM Fine-tuning with Synthetic Failure Simulation [RECOMMENDED]
+Phase 2 Option A: SAM Fine-tuning with Online Mask Augmentation [RECOMMENDED]
 ================================================================================
 Objective: Train SAM to refine imperfect masks by simulating realistic segmentation
-failures directly on ground-truth masks.
+failures directly on ground-truth masks using on-the-fly augmentation.
 
 Key Challenge: Teaching the Refiner "When Not to Modify"
 --------------------------------------------------------
@@ -615,64 +615,234 @@ A critical challenge is ensuring the refiner learns both:
   (1) When TO modify: Low-quality inputs need strong correction
   (2) When NOT to modify: High-quality inputs should be preserved
 
-Failure Mode Simulation
------------------------
-We simulate realistic segmentation failures that match observed model behavior:
+================================================================================
+3.1 COMPREHENSIVE MASK AUGMENTATION SYSTEM
+================================================================================
 
-Under-segmentation:
-  - Boundary erosion: Missing boundary regions due to conservative predictions
-  - Partial breakage: Object split into disconnected parts (common for irregular shapes)
-  - Small-lesion disappearance: Tiny lesions completely missed (most critical failure)
-  - Extreme shrinkage: Severe size reduction from pooling/downsampling artifacts
+We implement a comprehensive mask augmentation system with 12 primary error types
+that simulate realistic TransUNet failure modes. The system applies augmentation
+on-the-fly during training, providing unlimited diversity.
 
-Over-segmentation:
-  - Boundary dilation: Bleeding into background from over-confident predictions
-  - Attachment to nearby structures: Unintended connection to adjacent anatomy
-  - Artificial bridges: Thin spurious connections to nearby regions
+**Module Location:** data/mask_augmentation.py, data/online_augmented_dataset.py
 
-Boundary Artifacts:
-  - Contour jitter: Pixel-level noise along edge band from aliasing
-  - Edge roughening: Jagged boundaries from low-resolution feature maps
-  - Elastic deformation: Wavy/distorted boundaries from spatial inconsistency
-
-Internal Failures:
-  - Internal holes: Missing low-contrast central regions
-  - Partial dropout: Missing object regions from attention failures
-
-False Positives:
-  - False-positive islands: Small spurious blobs near lesion mimicking speckle/artifacts
-
-Size and Shape Conditioning
+3.1.1 Architecture Overview
 ---------------------------
-Augmentation intensity is conditioned on lesion properties to reflect realistic behavior:
-  - Tiny lesions (<500 pixels): Higher probability of disappearance/shrinkage
-  - Irregular shapes (low circularity): Higher probability of breakage
-  - Large lesions: Higher probability of internal holes and partial dropout
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                    Mask Augmentation Pipeline                            │
+  ├─────────────────────────────────────────────────────────────────────────┤
+  │                                                                          │
+  │   GT Mask (binary)                                                       │
+  │        │                                                                 │
+  │        ▼                                                                 │
+  │   ┌─────────────────────────────────────────────────────────────────┐   │
+  │   │              Sample Primary Error Type (1 of 12)                 │   │
+  │   │   Probabilities weighted by DEFAULT_ERROR_PROBS                 │   │
+  │   └─────────────────────────────┬───────────────────────────────────┘   │
+  │                                 │                                        │
+  │                                 ▼                                        │
+  │   ┌─────────────────────────────────────────────────────────────────┐   │
+  │   │              Apply 0-2 Secondary Perturbations (50% prob)        │   │
+  │   │   - boundary_jitter: morphological noise on boundaries          │   │
+  │   │   - threshold_fluctuation: slight dilation/erosion              │   │
+  │   └─────────────────────────────┬───────────────────────────────────┘   │
+  │                                 │                                        │
+  │                                 ▼                                        │
+  │   ┌─────────────────────────────────────────────────────────────────┐   │
+  │   │              Convert to Soft Mask (80% prob)                     │   │
+  │   │   P(x) = sigmoid(signed_distance(x) / temperature)              │   │
+  │   │   temperature ~ Uniform(2.0, 8.0)                               │   │
+  │   └─────────────────────────────┬───────────────────────────────────┘   │
+  │                                 │                                        │
+  │                                 ▼                                        │
+  │   Pseudo-Coarse Mask M̃ (soft probability, simulating TransUNet)         │
+  │                                                                          │
+  └─────────────────────────────────────────────────────────────────────────┘
 
-SDF-Based Augmentation (Mathematically Grounded)
-------------------------------------------------
-For anatomically plausible deformations, we operate in the continuous Signed Distance
-Function (SDF) domain rather than directly on binary masks:
+3.1.2 Twelve Primary Error Types
+--------------------------------
+Each error type simulates a specific TransUNet failure mode:
 
-  1. Convert GT mask M to SDF φ (zero level set defines the contour)
-  2. Apply perturbations: φ'(x,y) = φ(x,y) + c + G(x,y)
-     - c: global offset for uniform erosion/dilation
-     - G(x,y): low-frequency Gaussian random field for spatially varying boundary shifts
-  3. Threshold back to binary: M' = (φ' < 0)
+┌────────────────────────────────────────────────────────────────────────────┐
+│  #  │ Error Type              │ Prob  │ Description                        │
+├─────┼─────────────────────────┼───────┼────────────────────────────────────┤
+│  1  │ Identity/Near-Perfect   │ 15%   │ GT or minimal 1-2px boundary shift │
+│     │                         │       │ Teaches SAM to preserve good masks │
+├─────┼─────────────────────────┼───────┼────────────────────────────────────┤
+│  2  │ Over-Segmentation       │ 17%   │ Dilation: 1.2x-3x area expansion   │
+│     │                         │       │ Simulates bleeding into background │
+├─────┼─────────────────────────┼───────┼────────────────────────────────────┤
+│  3  │ Giant Over-Segmentation │ 10%   │ Massive dilation: 3x-20x expansion │
+│     │                         │       │ Background takeover failures       │
+├─────┼─────────────────────────┼───────┼────────────────────────────────────┤
+│  4  │ Under-Segmentation      │ 17%   │ Erosion: 0.4x-0.9x area shrinkage  │
+│     │                         │       │ Missing boundary regions           │
+├─────┼─────────────────────────┼───────┼────────────────────────────────────┤
+│  5  │ Missing Chunk           │ 12%   │ Wedge or blob cutout: 5-30% of GT  │
+│     │                         │       │ Partial boundary/region missing    │
+├─────┼─────────────────────────┼───────┼────────────────────────────────────┤
+│  6  │ Internal Holes          │ 10%   │ 1-3 elliptical holes inside mask   │
+│     │                         │       │ Each hole: 2-20% of GT area        │
+├─────┼─────────────────────────┼───────┼────────────────────────────────────┤
+│  7  │ Bridge/Adhesion         │ 10%   │ Thin band (2-6px × 10-60px) +      │
+│     │                         │       │ optional FP blob at end            │
+├─────┼─────────────────────────┼───────┼────────────────────────────────────┤
+│  8  │ False Positive Islands  │ 17%   │ 1-5 blobs (normal) or 5-30 (severe)│
+│     │                         │       │ Each blob: 0.2-10% of GT area      │
+├─────┼─────────────────────────┼───────┼────────────────────────────────────┤
+│  9  │ Fragmentation           │ 10%   │ 1-5 black strips cutting through GT│
+│     │                         │       │ Strip width: 2-8px                 │
+├─────┼─────────────────────────┼───────┼────────────────────────────────────┤
+│ 10  │ Shift/Wrong Location    │ 10%   │ Translation: 5-30% of bbox size    │
+│     │                         │       │ Optional rotation: ±5-20°          │
+├─────┼─────────────────────────┼───────┼────────────────────────────────────┤
+│ 11  │ Empty Prediction        │  4%   │ Completely empty or 1-5% fragment  │
+│     │                         │       │ Simulates complete miss            │
+├─────┼─────────────────────────┼───────┼────────────────────────────────────┤
+│ 12  │ Noise-Only Scatter      │  3%   │ 10-50 tiny blobs, no GT overlap    │
+│     │                         │       │ Pure false positive noise          │
+└─────┴─────────────────────────┴───────┴────────────────────────────────────┘
 
-This formulation provides:
-  - Smooth, anatomically plausible deformations (no pixel-level artifacts)
-  - Explicit control over boundary displacement magnitude (in pixels)
-  - Topological consistency through level-set representation
-  - Regularization via total variation and area constraints
+3.1.3 Secondary Perturbations
+-----------------------------
+After primary error, 0-2 secondary perturbations are applied (50% probability):
+
+  boundary_jitter:
+    - Applies morphological operations (dilate/erode/open/close)
+    - Random kernel size: 3-11 pixels
+    - Simulates small boundary instabilities
+
+  threshold_fluctuation:
+    - Very slight dilation or erosion (3×3 kernel)
+    - Simulates prediction threshold instability
+
+3.1.4 Soft Mask Conversion
+--------------------------
+80% of augmented masks are converted to soft pseudo-probability maps using
+signed distance transform:
+
+  Step 1: Compute signed distance
+    d_inside = distance_transform_edt(binary_mask)
+    d_outside = distance_transform_edt(1 - binary_mask)
+    signed_dist = d_inside - d_outside    # Positive inside, negative outside
+
+  Step 2: Apply sigmoid with temperature
+    P(x) = 1 / (1 + exp(-signed_dist(x) / temperature))
+
+  Temperature is sampled from Uniform(2.0, 8.0):
+    - Low temperature (2.0): Sharp boundaries, high confidence
+    - High temperature (8.0): Soft/fuzzy boundaries, gradual transitions
+
+  This creates realistic soft probability maps that match TransUNet's output
+  distribution, with smooth transitions at boundaries.
+
+3.1.5 Preset Configurations
+---------------------------
+Five presets are available for different training scenarios:
+
+  'default':        Balanced distribution (as shown in table above)
+  'mild':           More identity (30%), less severe errors
+  'severe':         More giant over-seg (20%), empty (3%), scatter (2%)
+  'boundary_focus': 50% over/under-segmentation for boundary refinement
+  'structural':     40% holes + missing chunks + fragmentation
+
+3.1.6 Usage Example
+-------------------
+  from data import create_augmentor, MaskAugmentor, AUGMENTOR_PRESETS
+
+  # Create augmentor with default settings
+  augmentor = create_augmentor(preset='default', soft_mask_prob=0.8)
+
+  # Apply augmentation to GT mask
+  coarse_mask, aug_info = augmentor(gt_mask)
+
+  # aug_info contains:
+  #   'error_type': 'over_segmentation'
+  #   'secondary': ['boundary_jitter']
+  #   'soft': True
+  #   'dice': 0.72
+
+================================================================================
+3.2 ONLINE AUGMENTED DATASET
+================================================================================
+
+The OnlineAugmentedDataset applies augmentation on-the-fly during training,
+providing unlimited augmentation diversity without pre-generating data.
+
+**Benefits:**
+  - New augmentation every epoch (unlimited diversity)
+  - No disk storage required for augmented masks
+  - Easy to adjust augmentation distribution during training
+  - Matches Phase 3 prompt generation logic exactly
+
+3.2.1 Dataset Structure
+-----------------------
+  data_root/
+  └── {dataset}/
+      └── train/
+          ├── images/    # Original images (.png, .jpg, .npy)
+          └── masks/     # Ground truth masks (.png)
+
+3.2.2 Resolution Path Matching
+------------------------------
+The dataset simulates Phase 3's resolution path to ensure training-inference
+consistency:
+
+  Step 1: Load image and GT mask at original resolution
+  Step 2: Apply mask augmentation (produces soft coarse mask)
+  Step 3: Resize to TransUNet resolution (e.g., 224×224)
+  Step 4: Resize to SAM resolution (1024×1024)
+
+This bilinear interpolation path matches what happens in Phase 3 when
+TransUNet's output is upscaled for SAM, ensuring SAM sees the same input
+distribution during training and inference.
+
+3.2.3 Usage Example
+-------------------
+  from data import get_online_augmented_dataloaders, OnlineAugmentedDataset
+
+  # Get train and val dataloaders
+  train_loader, val_loader = get_online_augmented_dataloaders(
+      data_root='./dataset/processed',
+      dataset_names=['BUSI', 'BUSBRA'],   # Can combine multiple datasets
+      batch_size=4,
+      img_size=1024,                       # SAM input size
+      transunet_img_size=224,              # TransUNet resolution for path matching
+      augmentor_preset='default',
+      num_workers=4,
+  )
+
+  # Each batch contains:
+  #   'image':        (B, 3, 1024, 1024)  - SAM-normalized image
+  #   'label':        (B, 1024, 1024)     - GT mask
+  #   'coarse_mask':  (B, 1024, 1024)     - Augmented soft mask
+  #   'dice':         float               - Dice(coarse, GT)
+  #   'error_type':   str                 - Primary error type applied
+  #   'augmentations': list               - Secondary perturbations
+
+3.2.4 Multi-Dataset Training
+----------------------------
+The MultiDatasetOnlineAugmented class combines multiple datasets:
+
+  train_dataset = MultiDatasetOnlineAugmented(
+      data_root='./dataset/processed',
+      dataset_names=['BUSI', 'BUSBRA', 'BUS', 'BUS_UC', 'BUS_UCLM'],
+      augmentor_preset='default',
+  )
+
+  # Combines all datasets with shared augmentor
+  # Outputs: "Combined dataset: 3363 samples from 5 datasets"
+
+================================================================================
+3.3 QUALITY-AWARE TRAINING CONSIDERATIONS
+================================================================================
 
 Controlled Dice Score Distribution
 ----------------------------------
-Training samples are generated with controlled quality distribution:
-  - Perfect (Dice = 1.0): 10% - Teaches preservation of good predictions
-  - High (Dice 0.9-1.0): 15% - Minor artifacts, should mostly preserve
-  - Medium (Dice 0.8-0.9): 40% - Moderate errors, needs refinement
-  - Low (Dice 0.6-0.8): 35% - Severe failures, needs strong correction
+The augmentation system naturally produces a distribution of Dice scores:
+  - Identity (15%): Dice ≈ 0.95-1.0 (teaches preservation)
+  - Over/Under-seg (34%): Dice ≈ 0.60-0.90 (moderate correction)
+  - Structural errors (32%): Dice ≈ 0.50-0.85 (varies by severity)
+  - Severe cases (7%): Dice ≈ 0.0-0.30 (extreme failures)
 
 Quality-Aware Training Loss
 ---------------------------
@@ -1019,7 +1189,13 @@ Logging:
 4. LoRA integration for parameter-efficient SAM adaptation to medical domain
 5. Gated residual refinement mechanism that constrains SAM as a controlled error corrector,
    enabling effective refinement without domain-specific finetuning
-6. Comprehensive evaluation on five breast ultrasound datasets with K-fold CV
+6. Comprehensive mask augmentation system with 12 primary error types simulating realistic
+   TransUNet failure modes, enabling effective Phase 2 training with unlimited diversity:
+   - On-the-fly augmentation (no pre-generation required)
+   - Soft mask conversion via signed distance transform
+   - Resolution path matching for Phase 2 ↔ Phase 3 consistency
+   - Configurable presets for different training scenarios
+7. Comprehensive evaluation on five breast ultrasound datasets with K-fold CV
 
 Our work establishes a new paradigm for integrating foundation models into task-specific pipelines through differentiable interfaces, with broad applicability beyond medical image segmentation to any domain requiring coarse-to-fine prediction refinement.
 
@@ -1027,3 +1203,9 @@ The gated residual refinement contribution is particularly significant for pract
 it enables leveraging SAM's boundary refinement capabilities without the computational cost of
 Phase 2 finetuning, while protecting against the domain gap problem that causes unfinetuned
 foundation models to degrade task-specific predictions.
+
+The mask augmentation system contribution enables effective Phase 2 training by:
+- Simulating the full spectrum of segmentation failures (12 error types)
+- Generating soft probability masks matching TransUNet's output distribution
+- Teaching SAM both "when to correct" and "when to preserve"
+- Providing unlimited training diversity through on-the-fly augmentation

@@ -123,7 +123,59 @@ In Phase 3, TransUNet produces **soft probability masks** (values in [0,1] with 
 2. **Simulating the resolution path** (224→1024) that occurs in Phase 3
 3. **Teaching SAM when to refine and when to preserve** via quality-aware loss
 
-#### Step 2.1: Generate Augmented Data
+#### Option A: Online Augmentation (RECOMMENDED - No Pre-generation)
+
+The new **online augmentation system** applies mask augmentation on-the-fly during training:
+
+```bash
+python scripts/finetune_sam_online.py \
+    --data_root ./dataset/processed \
+    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
+    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
+    --output_dir ./checkpoints/sam_finetuned \
+    --augmentor_preset default \
+    --mask_prompt_style direct \
+    --transunet_img_size 224 \
+    --use_roi_crop \
+    --roi_expand_ratio 0.2 \
+    --epochs 50 \
+    --batch_size 4
+```
+
+**Benefits of online augmentation:**
+- No disk storage required for augmented masks
+- New augmentation every epoch (unlimited diversity)
+- 12 primary error types simulating TransUNet failures
+- Soft mask conversion matching TransUNet output distribution
+
+**12 Primary Error Types:**
+
+| # | Error Type | Prob | Description |
+|---|------------|------|-------------|
+| 1 | Identity/Near-Perfect | 15% | Preserve good predictions |
+| 2 | Over-Segmentation | 17% | 1.2x-3x area expansion |
+| 3 | Giant Over-Segmentation | 10% | 3x-20x area expansion |
+| 4 | Under-Segmentation | 17% | 0.4x-0.9x area shrinkage |
+| 5 | Missing Chunk | 12% | 5-30% wedge/blob cutout |
+| 6 | Internal Holes | 10% | 1-3 holes (2-20% each) |
+| 7 | Bridge/Adhesion | 10% | Thin band + FP blob |
+| 8 | False Positive Islands | 17% | 1-30 scattered blobs |
+| 9 | Fragmentation | 10% | 1-5 cuts through mask |
+| 10 | Shift/Wrong Location | 10% | 5-30% translation |
+| 11 | Empty Prediction | 4% | Complete miss |
+| 12 | Noise-Only Scatter | 3% | Pure FP noise |
+
+**Augmentor Presets:**
+
+| Preset | Description |
+|--------|-------------|
+| `default` | Balanced distribution (recommended) |
+| `mild` | More identity (30%), fewer severe errors |
+| `severe` | More extreme failures (giant, empty, scatter) |
+| `boundary_focus` | 50% over/under-segmentation |
+| `structural` | 40% holes + missing + fragmentation |
+
+#### Option B: Pre-generated Augmented Data
 
 Generate synthetic "coarse masks" with controlled failure patterns:
 
@@ -530,14 +582,26 @@ python scripts/train_transunet.py \
     --dataset BUSI --fold 0 \
     --vit_pretrained ./pretrained/R50+ViT-B_16.npz
 
-# 2. Phase 2a: Generate augmented data
+# 2. Phase 2: Finetune SAM (CHOOSE ONE OPTION)
+
+# Option A: Online Augmentation (RECOMMENDED - no pre-generation needed)
+python scripts/finetune_sam_online.py \
+    --data_root ./dataset/processed \
+    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
+    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
+    --output_dir ./checkpoints/sam_finetuned \
+    --augmentor_preset default \
+    --mask_prompt_style direct --transunet_img_size 224 \
+    --use_roi_crop --roi_expand_ratio 0.2 \
+    --epochs 50 --batch_size 4
+
+# Option B: Pre-generated Data (requires generate_augmented_data.py first)
 python scripts/generate_augmented_data.py \
     --data_root ./dataset/processed \
     --output_dir ./dataset/augmented_soft \
     --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
     --target_samples 100000 --soft_masks --use_sdf
 
-# 3. Phase 2b: Finetune SAM (with ROI - default)
 python scripts/finetune_sam_augmented.py \
     --data_root ./dataset/augmented_soft \
     --dataset COMBINED \
@@ -545,7 +609,7 @@ python scripts/finetune_sam_augmented.py \
     --mask_prompt_style direct --transunet_img_size 224 \
     --use_roi_crop --roi_expand_ratio 0.2
 
-# 4. Phase 3: End-to-end training (with ROI + protection - RECOMMENDED)
+# 3. Phase 3: End-to-end training (with ROI + protection - RECOMMENDED)
 python scripts/train_e2e.py \
     --data_root ./dataset/processed \
     --datasets BUSI --fold 0 \
@@ -573,6 +637,90 @@ python scripts/train_e2e.py \
 
 ---
 
+## Mask Augmentation Module
+
+The mask augmentation module (`data/mask_augmentation.py`) provides comprehensive simulation of TransUNet failure modes for Phase 2 training.
+
+### Python API
+
+```python
+from data import MaskAugmentor, create_augmentor, AUGMENTOR_PRESETS
+
+# Create augmentor with preset
+augmentor = create_augmentor(
+    preset='default',           # 'default', 'mild', 'severe', 'boundary_focus', 'structural'
+    soft_mask_prob=0.8,         # Probability of soft mask conversion
+    soft_mask_temperature=(2.0, 8.0),  # Temperature range for soft masks
+    secondary_prob=0.5,         # Probability of secondary perturbations
+)
+
+# Apply augmentation to GT mask
+gt_mask = np.array(Image.open('mask.png').convert('L')) / 255.0
+coarse_mask, aug_info = augmentor(gt_mask)
+
+# aug_info contains:
+print(aug_info['error_type'])    # e.g., 'over_segmentation'
+print(aug_info['secondary'])     # e.g., ['boundary_jitter']
+print(aug_info['soft'])          # True if soft mask applied
+print(aug_info['dice'])          # Dice score between coarse and GT
+
+# Force specific error type for testing
+coarse_mask, _ = augmentor(gt_mask, force_error_type='internal_holes')
+```
+
+### Online Augmented Dataset
+
+```python
+from data import OnlineAugmentedDataset, get_online_augmented_dataloaders
+
+# Single dataset
+dataset = OnlineAugmentedDataset(
+    data_root='./dataset/processed',
+    dataset_name='BUSI',
+    img_size=1024,              # SAM input size
+    transunet_img_size=224,     # Resolution path matching
+    augmentor_preset='default',
+    soft_mask_prob=0.8,
+    split_ratio=0.9,            # Train/val split
+    is_train=True,
+)
+
+# Combined dataloaders (multiple datasets)
+train_loader, val_loader = get_online_augmented_dataloaders(
+    data_root='./dataset/processed',
+    dataset_names=['BUSI', 'BUSBRA', 'BUS'],
+    batch_size=4,
+    img_size=1024,
+    transunet_img_size=224,
+    augmentor_preset='default',
+    num_workers=4,
+)
+
+# Each batch:
+for batch in train_loader:
+    image = batch['image']          # (B, 3, 1024, 1024) - SAM normalized
+    label = batch['label']          # (B, 1024, 1024) - GT mask
+    coarse = batch['coarse_mask']   # (B, 1024, 1024) - Augmented mask
+    dice = batch['dice']            # Dice(coarse, GT)
+    error_type = batch['error_type'] # Primary error applied
+```
+
+### Soft Mask Conversion
+
+The soft mask conversion uses signed distance transform to create realistic probability maps:
+
+```
+signed_dist = distance_inside - distance_outside
+P(x) = sigmoid(signed_dist(x) / temperature)
+```
+
+- **Low temperature (2.0)**: Sharp boundaries, high confidence
+- **High temperature (8.0)**: Fuzzy boundaries, gradual transitions
+
+This matches TransUNet's soft probability output distribution.
+
+---
+
 ## Project Structure
 
 ```
@@ -583,12 +731,15 @@ UltraRefiner/
 │   └── transunet/            # TransUNet backbone
 ├── scripts/
 │   ├── train_transunet.py    # Phase 1
-│   ├── generate_augmented_data.py  # Phase 2a
-│   ├── finetune_sam_augmented.py   # Phase 2b
+│   ├── generate_augmented_data.py  # Phase 2a (pre-generation)
+│   ├── finetune_sam_augmented.py   # Phase 2b (pre-generated data)
+│   ├── finetune_sam_online.py      # Phase 2b (online augmentation) [NEW]
 │   └── train_e2e.py          # Phase 3
 ├── data/
 │   ├── dataset.py            # K-fold data loaders
-│   └── augmented_dataset.py  # Augmented data loader
+│   ├── augmented_dataset.py  # Augmented data loader (pre-generated)
+│   ├── mask_augmentation.py  # Mask augmentor with 12 error types [NEW]
+│   └── online_augmented_dataset.py  # Online augmentation dataset [NEW]
 └── utils/
     └── losses.py             # Dice, BCE, quality-aware losses
 ```
