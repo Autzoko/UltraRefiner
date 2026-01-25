@@ -283,6 +283,118 @@ This approach matches the SAMRefiner paper configuration (unfinetuned SAM + gaus
 
 ---
 
+## Gated Residual Refinement (Alternative to Phase 2)
+
+If you want to skip Phase 2 but still get meaningful improvements, use **Gated Residual Refinement**. This constrains SAM to act as a controlled error corrector instead of directly replacing the coarse prediction.
+
+### How It Works
+
+```
+Standard:  final = SAM(coarse)                    # Direct replacement
+Gated:     final = coarse + gate × (SAM - coarse) # Controlled correction
+```
+
+The gate is computed from **coarse mask uncertainty**:
+- When coarse ≈ 0.5 (uncertain): gate ≈ 1 → trust SAM's correction
+- When coarse ≈ 0 or 1 (confident): gate ≈ 0 → preserve coarse prediction
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      Gated Residual Refinement                       │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│   coarse_mask (from TransUNet)                                       │
+│        │                                                             │
+│        ├───────────────────────┐                                     │
+│        │                       │                                     │
+│        ▼                       ▼                                     │
+│   ┌─────────┐           ┌──────────────┐                            │
+│   │   SAM   │           │ Uncertainty  │                            │
+│   │ Refiner │           │    Gate      │                            │
+│   └────┬────┘           │ 1-|2p-1|^γ   │                            │
+│        │                └──────┬───────┘                            │
+│        ▼                       │                                     │
+│   sam_output                   │                                     │
+│        │                       │                                     │
+│        └───────────┬───────────┘                                     │
+│                    │                                                 │
+│                    ▼                                                 │
+│   ┌─────────────────────────────────────────────────────────────┐   │
+│   │  final = coarse + gate × (sam_output - coarse)              │   │
+│   │                                                              │   │
+│   │  gate ≈ 0 (confident): final ≈ coarse (preserve)            │   │
+│   │  gate ≈ 1 (uncertain): final ≈ sam    (correct)             │   │
+│   └─────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Usage
+
+```python
+from models.ultra_refiner import build_gated_ultra_refiner
+
+model = build_gated_ultra_refiner(
+    vit_name='R50-ViT-B_16',
+    img_size=224,
+    num_classes=2,
+    sam_model_type='vit_b',
+    transunet_checkpoint='./checkpoints/transunet/BUSI/fold_0/best.pth',
+    sam_checkpoint='./pretrained/medsam_vit_b.pth',
+    # Gate parameters
+    gate_type='uncertainty',  # 'uncertainty', 'learned', or 'hybrid'
+    gate_gamma=1.0,           # Shape of uncertainty curve
+    gate_min=0.0,             # Min gate value (0 = fully preserve confident)
+    gate_max=0.8,             # Max gate value (0.8 = cap at 80% correction)
+    # SAM parameters
+    mask_prompt_style='gaussian',
+    use_roi_crop=True,
+    roi_expand_ratio=0.2,
+)
+```
+
+### Gate Types
+
+| Type | Description | Parameters |
+|------|-------------|------------|
+| `uncertainty` | Based on coarse mask confidence: `gate = 1 - |2*coarse - 1|^γ` | No learnable params |
+| `learned` | CNN that predicts where corrections should be applied | ~3K learnable params |
+| `hybrid` | `uncertainty × learned` - combines both approaches | ~3K learnable params |
+
+### Gate Parameters
+
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `gate_gamma` | `1.0` | Higher = more aggressive (only very uncertain regions) |
+| `gate_min` | `0.0` | Minimum correction (0 = fully preserve confident regions) |
+| `gate_max` | `0.8` | Maximum correction (0.8 = cap at 80%) |
+
+### When to Use Gated Refinement
+
+| Scenario | Recommendation |
+|----------|----------------|
+| Skip Phase 2 completely | Use gated with `gate_max=0.5` (conservative) |
+| Unfinetuned SAM makes wild guesses | Use gated with `gate_max=0.3-0.5` |
+| Phase 2-finetuned SAM | Standard refinement (no gating needed) |
+| TransUNet already very good | Use gated with `gate_max=0.3` to preserve |
+
+### Output Format
+
+```python
+output = model(image)
+
+# Standard outputs
+coarse_mask = output['coarse_mask']      # TransUNet prediction (B, H, W)
+refined_mask = output['refined_mask']    # Final gated output (B, H, W) ← use this
+
+# Gated refinement outputs
+gate = output['gate']                    # Where corrections applied (B, H, W)
+residual = output['residual']            # SAM's proposed changes (B, H, W)
+sam_mask = output['sam_mask']            # Raw SAM output before gating (B, H, W)
+```
+
+---
+
 ## Differentiable Prompt Generation
 
 The core innovation enabling end-to-end training is **fully differentiable prompt extraction** from soft probability masks.

@@ -268,6 +268,128 @@ roi_expand_ratio. This ensures SAM sees the same input distribution during
 finetuning and end-to-end training.
 
 ================================================================================
+2.5 GATED RESIDUAL REFINEMENT (Alternative to Phase 2)
+================================================================================
+
+When Phase 2 SAM finetuning is skipped, unfinetuned SAM may make inappropriate
+corrections that degrade already accurate coarse predictions. Gated Residual
+Refinement addresses this by constraining SAM to act as a controlled error
+corrector instead of directly replacing the coarse prediction.
+
+**Core Formula:**
+Instead of: final = SAM(coarse)                    [direct replacement]
+We use:     final = coarse + gate × (SAM - coarse) [controlled correction]
+
+This can be rewritten as:
+  final = (1 - gate) × coarse + gate × SAM
+
+When gate ≈ 0: final ≈ coarse (preserve accurate predictions)
+When gate ≈ 1: final ≈ SAM    (trust SAM's correction)
+
+**2.5.1 Uncertainty-Based Gate**
+--------------------------------
+The gate is computed from the coarse mask's pixel-wise uncertainty:
+
+  confidence = |2 × coarse - 1|           # 0 at coarse=0.5, 1 at coarse=0 or 1
+  uncertainty = 1 - confidence^γ          # High when coarse is uncertain
+  gate = gate_min + (gate_max - gate_min) × uncertainty
+
+Gate behavior by coarse value:
+┌──────────────────────────────────────────────────────────────────┐
+│  Coarse Value    Confidence    Uncertainty    Gate (γ=1, max=0.8)│
+├──────────────────────────────────────────────────────────────────┤
+│  0.0 (certain bg)    1.0          0.0             0.0            │
+│  0.2 (likely bg)     0.6          0.4             0.32           │
+│  0.5 (uncertain)     0.0          1.0             0.8            │
+│  0.8 (likely fg)     0.6          0.4             0.32           │
+│  1.0 (certain fg)    1.0          0.0             0.0            │
+└──────────────────────────────────────────────────────────────────┘
+
+**Parameters:**
+- γ (gamma): Controls uncertainty curve shape
+  - γ > 1: More aggressive gating (only very uncertain regions get corrections)
+  - γ < 1: Softer gating (more regions receive SAM corrections)
+  - γ = 1: Linear relationship (default)
+
+- gate_min: Minimum gate value (default 0.0)
+  - 0.0 = Fully preserve confident regions
+  - >0 = Allow small corrections everywhere
+
+- gate_max: Maximum gate value (default 0.8)
+  - 1.0 = Full SAM replacement in uncertain regions
+  - <1.0 = Cap maximum correction strength (recommended for unfinetuned SAM)
+
+**2.5.2 Learned Gate (Optional)**
+---------------------------------
+For more complex correction patterns, a learned gate network predicts where
+corrections should be applied:
+
+  Input: [coarse, sam_output, uncertainty]    # Shape: (B, 3, H, W)
+
+  Gate Network:
+    Conv2d(3, 32, 3×3) → ReLU →
+    Conv2d(32, 32, 3×3) → ReLU →
+    Conv2d(32, 1, 1×1) → Sigmoid
+
+  Output: gate                                 # Shape: (B, H, W)
+
+The network is initialized conservatively (small initial gate values) to
+preserve coarse predictions by default.
+
+**2.5.3 Hybrid Gate**
+---------------------
+Combines uncertainty and learned gates multiplicatively:
+
+  gate_hybrid = gate_uncertainty × gate_learned
+
+This ensures corrections only occur where both:
+1. The coarse prediction is uncertain (uncertainty gate high)
+2. The learned network predicts a correction is beneficial (learned gate high)
+
+**2.5.4 Differentiability**
+---------------------------
+All gating operations are fully differentiable:
+
+  ∂final/∂coarse = (1 - gate) + gate × ∂SAM/∂coarse + (SAM - coarse) × ∂gate/∂coarse
+  ∂final/∂SAM = gate
+
+Gradients flow through:
+1. The direct coarse path (weighted by 1-gate)
+2. The SAM refinement path (weighted by gate)
+3. The gate computation (modulates the residual)
+
+**2.5.5 When to Use Gated Refinement**
+--------------------------------------
+┌────────────────────────────────────────────────────────────────────────┐
+│ Scenario                              │ Recommendation                 │
+├────────────────────────────────────────────────────────────────────────┤
+│ Skip Phase 2 completely               │ Gated with gate_max=0.5       │
+│ Unfinetuned SAM makes wild guesses    │ Gated with gate_max=0.3-0.5   │
+│ Phase 2-finetuned SAM                 │ Standard (no gating needed)   │
+│ TransUNet already very accurate       │ Gated with gate_max=0.3       │
+│ Want to preserve good + fix bad       │ Gated with learned gate       │
+└────────────────────────────────────────────────────────────────────────┘
+
+**2.5.6 Implementation**
+------------------------
+  from models.ultra_refiner import build_gated_ultra_refiner
+
+  model = build_gated_ultra_refiner(
+      transunet_checkpoint='./checkpoints/transunet/best.pth',
+      sam_checkpoint='./pretrained/medsam_vit_b.pth',
+      gate_type='uncertainty',    # 'uncertainty', 'learned', or 'hybrid'
+      gate_gamma=1.0,             # Uncertainty curve shape
+      gate_min=0.0,               # Minimum correction
+      gate_max=0.8,               # Maximum correction (cap at 80%)
+      mask_prompt_style='gaussian',
+      use_roi_crop=True,
+  )
+
+  output = model(image)
+  refined_mask = output['refined_mask']  # Final gated output
+  gate = output['gate']                  # Visualization of where corrections applied
+
+================================================================================
 3. THREE-PHASE TRAINING PIPELINE
 ================================================================================
 
