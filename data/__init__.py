@@ -27,6 +27,18 @@ from .augmented_dataset import (
     get_augmented_dataloaders,
 )
 
+from .mask_augmentation import (
+    MaskAugmentor,
+    create_augmentor,
+    AUGMENTOR_PRESETS,
+)
+
+from .online_augmented_dataset import (
+    OnlineAugmentedDataset,
+    MultiDatasetOnlineAugmented,
+    get_online_augmented_dataloaders,
+)
+
 __all__ = [
     # Constants
     'SUPPORTED_DATASETS',
@@ -50,6 +62,14 @@ __all__ = [
     'get_combined_kfold_dataloaders',
     # Augmented data loaders
     'get_augmented_dataloaders',
+    # Mask augmentation
+    'MaskAugmentor',
+    'create_augmentor',
+    'AUGMENTOR_PRESETS',
+    # Online augmented dataset
+    'OnlineAugmentedDataset',
+    'MultiDatasetOnlineAugmented',
+    'get_online_augmented_dataloaders',
     # Utilities
     'load_split_info',
 ]
