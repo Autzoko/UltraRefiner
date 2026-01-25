@@ -35,7 +35,7 @@ from torch.cuda.amp import GradScaler, autocast
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models.sam_refiner import SAMRefiner
+from models.sam_refiner import DifferentiableSAMRefiner
 from data import get_hybrid_dataloaders
 
 
@@ -307,8 +307,8 @@ def main():
     print(f"Real prediction ratio: {args.real_ratio:.0%}")
 
     # Create model
-    print("\nCreating SAM Refiner...")
-    model = SAMRefiner(
+    print("\nCreating DifferentiableSAMRefiner...")
+    model = DifferentiableSAMRefiner(
         sam_checkpoint=args.sam_checkpoint,
         model_type=args.sam_model_type,
         device=device,
