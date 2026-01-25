@@ -216,7 +216,9 @@ class OnlineAugmentedDataset(Dataset):
         if self.return_augmentation_info:
             result['dice'] = aug_info.get('dice', 1.0)
             result['error_type'] = aug_info.get('error_type', 'unknown')
-            result['augmentations'] = aug_info.get('secondary', [])
+            # Convert list to string for batching compatibility
+            secondary = aug_info.get('secondary', [])
+            result['augmentations'] = ','.join(secondary) if secondary else ''
 
         return result
 
