@@ -175,7 +175,57 @@ python scripts/finetune_sam_online.py \
 | `boundary_focus` | 50% over/under-segmentation |
 | `structural` | 40% holes + missing + fragmentation |
 
-#### Option B: Pre-generated Augmented Data
+#### Option B: Hybrid Training (Real Predictions + Augmented GT)
+
+This option combines **real TransUNet predictions** with **augmented GT masks** for the best of both worlds:
+- Real predictions capture actual TransUNet failure modes
+- Augmented GT provides additional diversity and edge cases
+
+**Step 1: Generate TransUNet Predictions**
+```bash
+# Generate predictions on all training data
+python scripts/generate_transunet_predictions.py \
+    --data_root ./dataset/processed \
+    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
+    --checkpoint_dir ./checkpoints/transunet \
+    --output_dir ./dataset/transunet_preds \
+    --use_all_folds  # Ensemble all 5 folds for better predictions
+```
+
+This creates:
+```
+./dataset/transunet_preds/
+└── {dataset}/
+    └── train/
+        ├── images/       (symlinks to original)
+        ├── masks/        (symlinks to GT)
+        └── coarse_masks/ (TransUNet soft predictions as .npy)
+```
+
+**Step 2: Train with Hybrid Data**
+```bash
+python scripts/finetune_sam_hybrid.py \
+    --gt_data_root ./dataset/processed \
+    --pred_data_root ./dataset/transunet_preds \
+    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
+    --real_ratio 0.5 \
+    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
+    --output_dir ./checkpoints/sam_finetuned_hybrid \
+    --augmentor_preset default \
+    --mask_prompt_style direct --transunet_img_size 224 \
+    --use_roi_crop --roi_expand_ratio 0.5 \
+    --use_amp --fast_soft_mask \
+    --epochs 300 --batch_size 8
+```
+
+**Key parameter: `--real_ratio`**
+| Value | Meaning |
+|-------|---------|
+| `0.5` | 50% real predictions, 50% augmented GT (balanced) |
+| `0.7` | 70% real, 30% augmented (favor real failures) |
+| `0.3` | 30% real, 70% augmented (favor diversity) |
+
+#### Option C: Pre-generated Augmented Data
 
 Generate synthetic "coarse masks" with controlled failure patterns:
 
@@ -595,7 +645,25 @@ python scripts/finetune_sam_online.py \
     --use_roi_crop --roi_expand_ratio 0.2 \
     --epochs 50 --batch_size 4
 
-# Option B: Pre-generated Data (requires generate_augmented_data.py first)
+# Option B: Hybrid Training (real TransUNet predictions + augmented GT)
+python scripts/generate_transunet_predictions.py \
+    --data_root ./dataset/processed \
+    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
+    --checkpoint_dir ./checkpoints/transunet \
+    --output_dir ./dataset/transunet_preds \
+    --use_all_folds
+
+python scripts/finetune_sam_hybrid.py \
+    --gt_data_root ./dataset/processed \
+    --pred_data_root ./dataset/transunet_preds \
+    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
+    --real_ratio 0.5 \
+    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
+    --mask_prompt_style direct --transunet_img_size 224 \
+    --use_roi_crop --roi_expand_ratio 0.5 \
+    --use_amp --fast_soft_mask
+
+# Option C: Pre-generated Data (requires generate_augmented_data.py first)
 python scripts/generate_augmented_data.py \
     --data_root ./dataset/processed \
     --output_dir ./dataset/augmented_soft \
@@ -705,6 +773,35 @@ for batch in train_loader:
     error_type = batch['error_type'] # Primary error applied
 ```
 
+### Hybrid Dataset API
+
+```python
+from data import HybridDataset, get_hybrid_dataloaders
+
+# Create hybrid dataloaders
+train_loader, val_loader = get_hybrid_dataloaders(
+    gt_data_root='./dataset/processed',
+    pred_data_root='./dataset/transunet_preds',
+    dataset_names=['BUSI', 'BUSBRA', 'BUS'],
+    batch_size=4,
+    img_size=1024,
+    transunet_img_size=224,
+    real_ratio=0.5,          # 50% real predictions, 50% augmented
+    augmentor_preset='default',
+    use_fast_soft_mask=True,
+    num_workers=8,
+)
+
+# Each batch:
+for batch in train_loader:
+    image = batch['image']          # (B, 3, 1024, 1024)
+    label = batch['label']          # (B, 1024, 1024)
+    coarse = batch['coarse_mask']   # (B, 1024, 1024)
+    source = batch['source']        # 'real' or 'augmented'
+    dice = batch['dice']            # Dice(coarse, GT)
+    error_type = batch['error_type']
+```
+
 ### Soft Mask Conversion
 
 The soft mask conversion uses signed distance transform to create realistic probability maps:
@@ -732,14 +829,17 @@ UltraRefiner/
 ├── scripts/
 │   ├── train_transunet.py    # Phase 1
 │   ├── generate_augmented_data.py  # Phase 2a (pre-generation)
+│   ├── generate_transunet_predictions.py  # Generate TransUNet preds for hybrid [NEW]
 │   ├── finetune_sam_augmented.py   # Phase 2b (pre-generated data)
 │   ├── finetune_sam_online.py      # Phase 2b (online augmentation) [NEW]
+│   ├── finetune_sam_hybrid.py      # Phase 2b (hybrid: real + augmented) [NEW]
 │   └── train_e2e.py          # Phase 3
 ├── data/
 │   ├── dataset.py            # K-fold data loaders
 │   ├── augmented_dataset.py  # Augmented data loader (pre-generated)
 │   ├── mask_augmentation.py  # Mask augmentor with 12 error types [NEW]
-│   └── online_augmented_dataset.py  # Online augmentation dataset [NEW]
+│   ├── online_augmented_dataset.py  # Online augmentation dataset [NEW]
+│   └── hybrid_dataset.py     # Hybrid dataset (real + augmented) [NEW]
 └── utils/
     └── losses.py             # Dice, BCE, quality-aware losses
 ```

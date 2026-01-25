@@ -39,6 +39,12 @@ from .online_augmented_dataset import (
     get_online_augmented_dataloaders,
 )
 
+from .hybrid_dataset import (
+    HybridDataset,
+    MultiDatasetHybrid,
+    get_hybrid_dataloaders,
+)
+
 __all__ = [
     # Constants
     'SUPPORTED_DATASETS',
@@ -70,6 +76,10 @@ __all__ = [
     'OnlineAugmentedDataset',
     'MultiDatasetOnlineAugmented',
     'get_online_augmented_dataloaders',
+    # Hybrid dataset (real predictions + augmented)
+    'HybridDataset',
+    'MultiDatasetHybrid',
+    'get_hybrid_dataloaders',
     # Utilities
     'load_split_info',
 ]
