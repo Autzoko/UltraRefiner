@@ -22,7 +22,6 @@ from PIL import Image
 from tqdm import tqdm
 import json
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing as mp
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

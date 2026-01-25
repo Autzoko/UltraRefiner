@@ -34,7 +34,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models.sam_refiner import DifferentiableSAMRefiner
-from data import get_offline_augmented_dataloaders
+from data import get_offline_augmented_dataloaders, get_hybrid_dataloaders
 
 
 def get_args():
@@ -43,6 +43,10 @@ def get_args():
     # Data paths
     parser.add_argument('--data_root', type=str, required=True,
                         help='Root directory containing augmented datasets')
+    parser.add_argument('--pred_data_root', type=str, default=None,
+                        help='Root directory containing TransUNet predictions (optional)')
+    parser.add_argument('--real_ratio', type=float, default=0.0,
+                        help='Ratio of real predictions (0.0 = 100%% augmented, 0.5 = 50%% each)')
     parser.add_argument('--datasets', type=str, nargs='+', required=True,
                         help='Dataset names (e.g., BUSI BUSBRA)')
 
@@ -249,16 +253,34 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     # Create dataloaders
-    print("\nCreating offline augmented dataloaders...")
-    train_loader, val_loader = get_offline_augmented_dataloaders(
-        data_root=args.data_root,
-        dataset_names=args.datasets,
-        batch_size=args.batch_size,
-        img_size=1024,
-        transunet_img_size=args.transunet_img_size,
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
-    )
+    if args.pred_data_root and args.real_ratio > 0:
+        # Hybrid mode: mix real predictions with offline augmented data
+        print(f"\nCreating hybrid dataloaders (real_ratio={args.real_ratio})...")
+        print(f"  Real predictions from: {args.pred_data_root}")
+        print(f"  Augmented data from: {args.data_root}")
+        train_loader, val_loader = get_hybrid_dataloaders(
+            gt_data_root=args.data_root,  # Use augmented data root as GT source
+            pred_data_root=args.pred_data_root,
+            dataset_names=args.datasets,
+            batch_size=args.batch_size,
+            img_size=1024,
+            transunet_img_size=args.transunet_img_size,
+            real_ratio=args.real_ratio,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+        )
+    else:
+        # Pure offline augmented mode
+        print("\nCreating offline augmented dataloaders...")
+        train_loader, val_loader = get_offline_augmented_dataloaders(
+            data_root=args.data_root,
+            dataset_names=args.datasets,
+            batch_size=args.batch_size,
+            img_size=1024,
+            transunet_img_size=args.transunet_img_size,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+        )
 
     print(f"\nTrain samples: {len(train_loader.dataset)}")
     print(f"Val samples: {len(val_loader.dataset)}")

@@ -123,9 +123,67 @@ In Phase 3, TransUNet produces **soft probability masks** (values in [0,1] with 
 2. **Simulating the resolution path** (224→1024) that occurs in Phase 3
 3. **Teaching SAM when to refine and when to preserve** via quality-aware loss
 
-#### Option A: Online Augmentation (RECOMMENDED - No Pre-generation)
+#### Option A: Offline Augmentation (RECOMMENDED - Fast Training)
 
-The new **online augmentation system** applies mask augmentation on-the-fly during training:
+Pre-generate augmented masks for fast training without CPU bottleneck:
+
+**Step 1: Generate Augmented Masks**
+```bash
+python scripts/generate_augmented_masks.py \
+    --data_root ./dataset/processed \
+    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
+    --output_dir ./dataset/augmented_masks \
+    --num_augmentations 5 \
+    --augmentor_preset default \
+    --use_fast_soft_mask \
+    --num_workers 16
+```
+
+This creates 5 augmented versions per sample, applying the 12 error types with soft mask conversion.
+
+**Step 2: Train SAM with Offline Data**
+```bash
+python scripts/finetune_sam_offline.py \
+    --data_root ./dataset/augmented_masks \
+    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
+    --sam_checkpoint ./pretrained/sam_vit_b_01ec64.pth \
+    --output_dir ./checkpoints/sam_finetuned \
+    --mask_prompt_style direct --transunet_img_size 224 \
+    --use_roi_crop --roi_expand_ratio 0.3 \
+    --use_amp --batch_size 4 \
+    --epochs 100
+```
+
+**Optional: Mix with Real TransUNet Predictions**
+```bash
+# First generate TransUNet predictions (see Option B)
+# Then train with both real and augmented data
+python scripts/finetune_sam_offline.py \
+    --data_root ./dataset/augmented_masks \
+    --pred_data_root ./dataset/transunet_preds \
+    --real_ratio 0.3 \
+    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
+    --sam_checkpoint ./pretrained/sam_vit_b_01ec64.pth \
+    --use_amp --use_roi_crop
+```
+
+| `--real_ratio` | Meaning |
+|----------------|---------|
+| `0.0` | 100% offline augmented (default) |
+| `0.3` | 30% real TransUNet predictions, 70% augmented |
+| `0.5` | 50% each |
+
+**Benefits of offline augmentation:**
+- No CPU bottleneck during training (augmentation already done)
+- GPU stays 100% utilized
+- Reproducible (same augmentations each run)
+- 5x data multiplier with `--num_augmentations 5`
+
+---
+
+#### Option B: Online Augmentation (Slower but No Pre-generation)
+
+The **online augmentation system** applies mask augmentation on-the-fly during training:
 
 ```bash
 python scripts/finetune_sam_online.py \
@@ -634,34 +692,39 @@ python scripts/train_transunet.py \
 
 # 2. Phase 2: Finetune SAM (CHOOSE ONE OPTION)
 
-# Option A: Online Augmentation (RECOMMENDED - no pre-generation needed)
-python scripts/finetune_sam_online.py \
+# Option A: Offline Augmentation (RECOMMENDED - fast training)
+python scripts/generate_augmented_masks.py \
     --data_root ./dataset/processed \
     --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
-    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
-    --output_dir ./checkpoints/sam_finetuned \
-    --augmentor_preset default \
-    --mask_prompt_style direct --transunet_img_size 224 \
-    --use_roi_crop --roi_expand_ratio 0.2 \
-    --epochs 50 --batch_size 4
+    --output_dir ./dataset/augmented_masks \
+    --num_augmentations 5 --use_fast_soft_mask
 
-# Option B: Hybrid Training (real TransUNet predictions + augmented GT)
+python scripts/finetune_sam_offline.py \
+    --data_root ./dataset/augmented_masks \
+    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
+    --sam_checkpoint ./pretrained/sam_vit_b_01ec64.pth \
+    --mask_prompt_style direct --transunet_img_size 224 \
+    --use_roi_crop --roi_expand_ratio 0.3 \
+    --use_amp --batch_size 4
+
+# Option B: Offline + Real Predictions (best of both worlds)
+# First generate TransUNet out-of-fold predictions
 python scripts/generate_transunet_predictions.py \
     --data_root ./dataset/processed \
     --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
     --checkpoint_dir ./checkpoints/transunet \
-    --output_dir ./dataset/transunet_preds \
-    --use_all_folds
+    --output_dir ./dataset/transunet_preds
 
-python scripts/finetune_sam_hybrid.py \
-    --gt_data_root ./dataset/processed \
+# Then train with mix of real predictions + augmented data
+python scripts/finetune_sam_offline.py \
+    --data_root ./dataset/augmented_masks \
     --pred_data_root ./dataset/transunet_preds \
+    --real_ratio 0.3 \
     --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
-    --real_ratio 0.5 \
-    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
+    --sam_checkpoint ./pretrained/sam_vit_b_01ec64.pth \
     --mask_prompt_style direct --transunet_img_size 224 \
-    --use_roi_crop --roi_expand_ratio 0.5 \
-    --use_amp --fast_soft_mask
+    --use_roi_crop --roi_expand_ratio 0.3 \
+    --use_amp --batch_size 4
 
 # Option C: Pre-generated Data (requires generate_augmented_data.py first)
 python scripts/generate_augmented_data.py \
@@ -828,18 +891,18 @@ UltraRefiner/
 │   └── transunet/            # TransUNet backbone
 ├── scripts/
 │   ├── train_transunet.py    # Phase 1
-│   ├── generate_augmented_data.py  # Phase 2a (pre-generation)
-│   ├── generate_transunet_predictions.py  # Generate TransUNet preds for hybrid [NEW]
-│   ├── finetune_sam_augmented.py   # Phase 2b (pre-generated data)
-│   ├── finetune_sam_online.py      # Phase 2b (online augmentation) [NEW]
-│   ├── finetune_sam_hybrid.py      # Phase 2b (hybrid: real + augmented) [NEW]
+│   ├── generate_augmented_masks.py # Generate offline augmented masks [RECOMMENDED]
+│   ├── generate_transunet_predictions.py  # Generate TransUNet out-of-fold predictions
+│   ├── finetune_sam_offline.py     # Phase 2 with offline augmentation [RECOMMENDED]
+│   ├── finetune_sam_online.py      # Phase 2 with online augmentation (slower)
+│   ├── finetune_sam_hybrid.py      # Phase 2 hybrid (deprecated, use offline)
 │   └── train_e2e.py          # Phase 3
 ├── data/
 │   ├── dataset.py            # K-fold data loaders
-│   ├── augmented_dataset.py  # Augmented data loader (pre-generated)
-│   ├── mask_augmentation.py  # Mask augmentor with 12 error types [NEW]
-│   ├── online_augmented_dataset.py  # Online augmentation dataset [NEW]
-│   └── hybrid_dataset.py     # Hybrid dataset (real + augmented) [NEW]
+│   ├── mask_augmentation.py  # Mask augmentor with 12 error types
+│   ├── offline_augmented_dataset.py  # Offline augmentation dataset [RECOMMENDED]
+│   ├── online_augmented_dataset.py   # Online augmentation dataset (slower)
+│   └── hybrid_dataset.py     # Hybrid dataset (real + augmented)
 └── utils/
     └── losses.py             # Dice, BCE, quality-aware losses
 ```
