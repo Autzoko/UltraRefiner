@@ -28,7 +28,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -157,7 +157,7 @@ def train_epoch(model, train_loader, optimizer, scaler, device, use_amp, grad_ac
         gt_mask = batch['label'].to(device, non_blocking=True)
         coarse_mask = batch['coarse_mask'].to(device, non_blocking=True)
 
-        with autocast(enabled=use_amp):
+        with torch.amp.autocast('cuda', enabled=use_amp):
             result = model(image, coarse_mask, image_already_normalized=True)
             refined_masks = result['masks']
 
@@ -218,7 +218,7 @@ def validate(model, val_loader, device, use_amp):
         gt_mask = batch['label'].to(device, non_blocking=True)
         coarse_mask = batch['coarse_mask'].to(device, non_blocking=True)
 
-        with autocast(enabled=use_amp):
+        with torch.amp.autocast('cuda', enabled=use_amp):
             result = model(image, coarse_mask, image_already_normalized=True)
             refined_masks = result['masks']
 
