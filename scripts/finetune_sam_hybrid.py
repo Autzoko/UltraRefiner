@@ -306,13 +306,21 @@ def main():
     print(f"Val samples: {len(val_loader.dataset)}")
     print(f"Real prediction ratio: {args.real_ratio:.0%}")
 
-    # Create model
-    print("\nCreating DifferentiableSAMRefiner...")
+    # Load SAM model
+    print("\nLoading SAM model...")
+    from segment_anything import sam_model_registry
+    sam = sam_model_registry[args.sam_model_type](checkpoint=args.sam_checkpoint)
+    sam = sam.to(device)
+
+    # Create SAM refiner
+    print("Creating DifferentiableSAMRefiner...")
     model = DifferentiableSAMRefiner(
-        sam_checkpoint=args.sam_checkpoint,
-        model_type=args.sam_model_type,
-        device=device,
-        trainable_components=['mask_decoder'],
+        sam_model=sam,
+        use_point_prompt=True,
+        use_box_prompt=True,
+        use_mask_prompt=True,
+        freeze_image_encoder=True,
+        freeze_prompt_encoder=False,
         mask_prompt_style=args.mask_prompt_style,
         use_roi_crop=args.use_roi_crop,
         roi_expand_ratio=args.roi_expand_ratio,
