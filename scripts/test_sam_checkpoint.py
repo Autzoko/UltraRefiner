@@ -47,7 +47,7 @@ def main():
     config = CONFIGS['R50-ViT-B_16']
     config.n_classes = 2
     config.n_skip = 3
-    transunet = VisionTransformer(config=config, img_size=224, num_classes=2)
+    transunet = VisionTransformer(config=config, img_size=(224, 224), num_classes=2)
 
     ckpt = torch.load(args.transunet_checkpoint, map_location='cpu', weights_only=False)
     if 'model' in ckpt:
