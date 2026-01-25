@@ -330,6 +330,7 @@ def get_offline_augmented_dataloaders(
         drop_last=True,
         persistent_workers=use_persistent,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        timeout=120,  # 2 minute timeout to detect hangs
     )
 
     val_loader = DataLoader(
@@ -340,6 +341,7 @@ def get_offline_augmented_dataloaders(
         pin_memory=True,
         persistent_workers=use_persistent,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        timeout=120,
     )
 
     return train_loader, val_loader

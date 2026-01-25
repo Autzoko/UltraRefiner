@@ -89,6 +89,8 @@ def get_args():
                         help='Gradient accumulation steps')
     parser.add_argument('--prefetch_factor', type=int, default=4,
                         help='Prefetch factor for dataloader')
+    parser.add_argument('--no_persistent_workers', action='store_true',
+                        help='Disable persistent workers (can help with hangs)')
 
     # Output
     parser.add_argument('--output_dir', type=str, default='./checkpoints/sam_finetuned_offline',
@@ -280,6 +282,7 @@ def main():
             transunet_img_size=args.transunet_img_size,
             num_workers=args.num_workers,
             prefetch_factor=args.prefetch_factor,
+            persistent_workers=not args.no_persistent_workers,
         )
 
     print(f"\nTrain samples: {len(train_loader.dataset)}")
