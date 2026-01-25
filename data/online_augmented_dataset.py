@@ -51,6 +51,7 @@ class OnlineAugmentedDataset(Dataset):
         is_train: bool = True,
         seed: int = 42,
         return_augmentation_info: bool = True,
+        use_fast_soft_mask: bool = False,
     ):
         """
         Args:
@@ -66,6 +67,7 @@ class OnlineAugmentedDataset(Dataset):
             is_train: Whether this is training set.
             seed: Random seed.
             return_augmentation_info: Whether to return augmentation details.
+            use_fast_soft_mask: Use fast Gaussian blur instead of distance transform (~10x faster).
         """
         self.data_root = data_root
         self.dataset_name = dataset_name
@@ -100,6 +102,7 @@ class OnlineAugmentedDataset(Dataset):
                 preset=augmentor_preset,
                 soft_mask_prob=soft_mask_prob,
                 soft_mask_temperature=soft_mask_temperature,
+                use_fast_soft_mask=use_fast_soft_mask,
             )
 
         # SAM normalization parameters
@@ -294,6 +297,7 @@ def get_online_augmented_dataloaders(
     seed: int = 42,
     persistent_workers: bool = True,
     prefetch_factor: int = 4,
+    use_fast_soft_mask: bool = False,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Get train and validation dataloaders with online augmentation.
@@ -310,6 +314,7 @@ def get_online_augmented_dataloaders(
         seed: Random seed.
         persistent_workers: Keep workers alive between epochs (faster).
         prefetch_factor: Number of batches to prefetch per worker.
+        use_fast_soft_mask: Use fast Gaussian blur instead of distance transform (~10x faster).
 
     Returns:
         train_loader, val_loader
@@ -318,7 +323,7 @@ def get_online_augmented_dataloaders(
         dataset_names = [dataset_names]
 
     # Create shared augmentor
-    augmentor = create_augmentor(preset=augmentor_preset)
+    augmentor = create_augmentor(preset=augmentor_preset, use_fast_soft_mask=use_fast_soft_mask)
 
     if len(dataset_names) == 1:
         train_dataset = OnlineAugmentedDataset(

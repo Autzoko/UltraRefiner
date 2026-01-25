@@ -55,14 +55,14 @@ OUTPUT_DIR="./checkpoints/sam_finetuned_online"
 
 # Training parameters
 EPOCHS=300
-BATCH_SIZE=4
+BATCH_SIZE=8
 LR=1e-4
-NUM_WORKERS=8
+NUM_WORKERS=16  # More workers to keep GPU fed
 
 # Speed optimizations (AMP gives ~2x speedup on A100)
 USE_AMP="--use_amp"
-GRAD_ACCUM_STEPS=2  # Effective batch size = BATCH_SIZE * GRAD_ACCUM_STEPS = 16
-PREFETCH_FACTOR=4
+GRAD_ACCUM_STEPS=1  # Effective batch size = BATCH_SIZE * GRAD_ACCUM_STEPS = 8
+PREFETCH_FACTOR=8   # Prefetch more batches
 # Uncomment to use torch.compile (PyTorch 2.0+, may have compatibility issues)
 # COMPILE_MODEL="--compile_model"
 
@@ -70,6 +70,7 @@ PREFETCH_FACTOR=4
 AUGMENTOR_PRESET="default"  # Options: default, mild, severe, boundary_focus, structural
 SOFT_MASK_PROB=0.8
 CHANGE_PENALTY_WEIGHT=0.5
+FAST_SOFT_MASK="--fast_soft_mask"  # Use Gaussian blur instead of distance transform (~10x faster)
 
 # Phase 3 compatibility settings
 TRANSUNET_IMG_SIZE=224
@@ -134,6 +135,7 @@ CMD="python scripts/finetune_sam_online.py \
     ${USE_AMP} \
     --grad_accum_steps ${GRAD_ACCUM_STEPS} \
     --prefetch_factor ${PREFETCH_FACTOR} \
+    ${FAST_SOFT_MASK} \
     --output_dir ${OUTPUT_DIR}"
 
 # Add compile flag if set

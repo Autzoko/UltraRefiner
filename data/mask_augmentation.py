@@ -67,6 +67,7 @@ class MaskAugmentor:
         soft_mask_prob: float = 0.8,
         soft_mask_temperature: Tuple[float, float] = (2.0, 8.0),
         seed: Optional[int] = None,
+        use_fast_soft_mask: bool = False,
     ):
         """
         Args:
@@ -75,11 +76,13 @@ class MaskAugmentor:
             soft_mask_prob: Probability of converting to soft mask (0-1).
             soft_mask_temperature: Temperature range for soft mask conversion.
             seed: Random seed for reproducibility.
+            use_fast_soft_mask: Use Gaussian blur instead of distance transform (~10x faster).
         """
         self.error_probs = error_probs or self.DEFAULT_ERROR_PROBS.copy()
         self.secondary_prob = secondary_prob
         self.soft_mask_prob = soft_mask_prob
         self.soft_mask_temperature = soft_mask_temperature
+        self.use_fast_soft_mask = use_fast_soft_mask
 
         if seed is not None:
             random.seed(seed)
@@ -159,7 +162,10 @@ class MaskAugmentor:
         is_soft = False
         if np.random.random() < self.soft_mask_prob:
             temperature = np.random.uniform(*self.soft_mask_temperature)
-            coarse_mask = self._to_soft_mask(coarse_mask, temperature)
+            if self.use_fast_soft_mask:
+                coarse_mask = self._to_soft_mask_fast(coarse_mask, temperature)
+            else:
+                coarse_mask = self._to_soft_mask(coarse_mask, temperature)
             is_soft = True
 
         # Compute Dice score
@@ -730,6 +736,25 @@ class MaskAugmentor:
 
         # Apply sigmoid with temperature
         soft_mask = 1.0 / (1.0 + np.exp(-signed_dist / temperature))
+
+        return soft_mask.astype(np.float32)
+
+    def _to_soft_mask_fast(self, mask: np.ndarray, temperature: float = 5.0) -> np.ndarray:
+        """
+        Fast soft mask conversion using Gaussian blur (no distance transform).
+        ~10x faster than distance transform version.
+        """
+        binary_mask = (mask > 0.5).astype(np.float32)
+
+        if binary_mask.sum() < 1:
+            return binary_mask
+
+        # Map temperature to kernel size (higher temp = more blur)
+        kernel_size = int(temperature * 2) | 1  # Ensure odd
+        kernel_size = max(3, min(kernel_size, 31))  # Clamp to [3, 31]
+
+        # Apply Gaussian blur
+        soft_mask = cv2.GaussianBlur(binary_mask, (kernel_size, kernel_size), temperature)
 
         return soft_mask.astype(np.float32)
 

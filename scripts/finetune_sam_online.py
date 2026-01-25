@@ -79,6 +79,8 @@ def get_args():
                         help='Minimum temperature for soft mask conversion')
     parser.add_argument('--soft_mask_temp_max', type=float, default=8.0,
                         help='Maximum temperature for soft mask conversion')
+    parser.add_argument('--fast_soft_mask', action='store_true',
+                        help='Use fast Gaussian blur instead of distance transform (~10x faster)')
 
     # Training arguments
     parser.add_argument('--epochs', type=int, default=50,
@@ -493,6 +495,7 @@ def main():
         seed=args.seed,
         persistent_workers=True,
         prefetch_factor=args.prefetch_factor,
+        use_fast_soft_mask=args.fast_soft_mask,
     )
 
     print(f'Training samples: {len(train_loader.dataset)}')
