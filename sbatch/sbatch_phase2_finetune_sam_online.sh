@@ -3,7 +3,7 @@
 #SBATCH --output=logs/phase2_sam_online_%j.out
 #SBATCH --error=logs/phase2_sam_online_%j.err
 #SBATCH --partition=nvidia
-#SBATCH --gres=gpu:a100:1
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=192G
 #SBATCH --time=90:00:00
