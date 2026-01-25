@@ -329,7 +329,41 @@ The gate is computed from **coarse mask uncertainty**:
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Usage
+### Command-Line Usage
+
+Enable gated refinement by adding `--use_gated_refinement` flag:
+
+```bash
+# Skip Phase 2 with gated refinement (RECOMMENDED for unfinetuned SAM)
+python scripts/train_e2e.py \
+    --data_root ./dataset/processed \
+    --datasets BUSI \
+    --fold 0 \
+    --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
+    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
+    --mask_prompt_style gaussian \
+    --use_roi_crop \
+    --roi_expand_ratio 0.2 \
+    --use_gated_refinement \
+    --gate_type uncertainty \
+    --gate_gamma 1.0 \
+    --gate_max 0.5 \
+    --max_epochs 100 \
+    --coarse_loss_weight 0.8 \
+    --refined_loss_weight 0.2
+```
+
+### Command-Line Arguments for Gated Refinement
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--use_gated_refinement` | `False` | Enable gated residual refinement |
+| `--gate_type` | `uncertainty` | Gate type: `uncertainty`, `learned`, `hybrid` |
+| `--gate_gamma` | `1.0` | Uncertainty curve shape (higher = more aggressive) |
+| `--gate_min` | `0.0` | Minimum gate value (0 = fully preserve confident) |
+| `--gate_max` | `0.8` | Maximum gate value (caps correction strength) |
+
+### Python API Usage
 
 ```python
 from models.ultra_refiner import build_gated_ultra_refiner
@@ -341,12 +375,10 @@ model = build_gated_ultra_refiner(
     sam_model_type='vit_b',
     transunet_checkpoint='./checkpoints/transunet/BUSI/fold_0/best.pth',
     sam_checkpoint='./pretrained/medsam_vit_b.pth',
-    # Gate parameters
-    gate_type='uncertainty',  # 'uncertainty', 'learned', or 'hybrid'
-    gate_gamma=1.0,           # Shape of uncertainty curve
-    gate_min=0.0,             # Min gate value (0 = fully preserve confident)
-    gate_max=0.8,             # Max gate value (0.8 = cap at 80% correction)
-    # SAM parameters
+    gate_type='uncertainty',
+    gate_gamma=1.0,
+    gate_min=0.0,
+    gate_max=0.5,
     mask_prompt_style='gaussian',
     use_roi_crop=True,
     roi_expand_ratio=0.2,
@@ -524,6 +556,19 @@ python scripts/train_e2e.py \
     --transunet_lr 1e-6 --sam_lr 1e-5 \
     --coarse_loss_weight 0.8 --refined_loss_weight 0.2 \
     --transunet_grad_scale 0.01 --transunet_weight_reg 0.1
+
+# Alternative: Skip Phase 2 with Gated Refinement
+python scripts/train_e2e.py \
+    --data_root ./dataset/processed \
+    --datasets BUSI --fold 0 \
+    --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
+    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
+    --mask_prompt_style gaussian \
+    --use_roi_crop --roi_expand_ratio 0.2 \
+    --use_gated_refinement \
+    --gate_type uncertainty --gate_max 0.5 \
+    --coarse_loss_weight 0.8 --refined_loss_weight 0.2 \
+    --freeze_transunet_epochs 10
 ```
 
 ---
