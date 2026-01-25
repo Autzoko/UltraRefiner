@@ -51,6 +51,12 @@ from .offline_augmented_dataset import (
     get_offline_augmented_dataloaders,
 )
 
+from .offline_hybrid_dataset import (
+    OfflineHybridDataset,
+    MultiDatasetOfflineHybrid,
+    get_offline_hybrid_dataloaders,
+)
+
 __all__ = [
     # Constants
     'SUPPORTED_DATASETS',
@@ -90,6 +96,10 @@ __all__ = [
     'OfflineAugmentedDataset',
     'MultiDatasetOfflineAugmented',
     'get_offline_augmented_dataloaders',
+    # Offline hybrid dataset (real predictions + offline augmented)
+    'OfflineHybridDataset',
+    'MultiDatasetOfflineHybrid',
+    'get_offline_hybrid_dataloaders',
     # Utilities
     'load_split_info',
 ]

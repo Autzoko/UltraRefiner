@@ -34,7 +34,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models.sam_refiner import DifferentiableSAMRefiner
-from data import get_offline_augmented_dataloaders, get_hybrid_dataloaders
+from data import get_offline_augmented_dataloaders, get_offline_hybrid_dataloaders
 
 
 def get_args():
@@ -256,13 +256,13 @@ def main():
 
     # Create dataloaders
     if args.pred_data_root and args.real_ratio > 0:
-        # Hybrid mode: mix real predictions with offline augmented data
-        print(f"\nCreating hybrid dataloaders (real_ratio={args.real_ratio})...")
+        # Offline hybrid mode: mix real predictions with offline augmented data
+        print(f"\nCreating offline hybrid dataloaders (real_ratio={args.real_ratio})...")
         print(f"  Real predictions from: {args.pred_data_root}")
         print(f"  Augmented data from: {args.data_root}")
-        train_loader, val_loader = get_hybrid_dataloaders(
-            gt_data_root=args.data_root,  # Use augmented data root as GT source
+        train_loader, val_loader = get_offline_hybrid_dataloaders(
             pred_data_root=args.pred_data_root,
+            aug_data_root=args.data_root,
             dataset_names=args.datasets,
             batch_size=args.batch_size,
             img_size=1024,
@@ -270,6 +270,7 @@ def main():
             real_ratio=args.real_ratio,
             num_workers=args.num_workers,
             prefetch_factor=args.prefetch_factor,
+            persistent_workers=not args.no_persistent_workers,
         )
     else:
         # Pure offline augmented mode
