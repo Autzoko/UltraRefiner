@@ -207,22 +207,64 @@ def set_seed(seed):
     torch.cuda.manual_seed(seed)
 
 
+class BCEDiceLossProb(nn.Module):
+    """
+    Combined BCE and Dice loss for binary segmentation with probability inputs.
+    Unlike BCEDiceLoss, this expects probabilities (after sigmoid), not logits.
+    Used for gated refinement where output is already in probability space.
+    """
+    def __init__(self, bce_weight=0.5, dice_weight=0.5, smooth=1e-5, eps=1e-7):
+        super().__init__()
+        self.bce_weight = bce_weight
+        self.dice_weight = dice_weight
+        self.smooth = smooth
+        self.eps = eps
+
+    def forward(self, pred, target):
+        """
+        Args:
+            pred: Probability predictions (after sigmoid, range [0, 1])
+            target: Ground truth binary mask
+        """
+        # Clamp to avoid log(0)
+        pred_clamped = torch.clamp(pred, self.eps, 1 - self.eps)
+
+        # BCE loss for probabilities
+        bce_loss = F.binary_cross_entropy(pred_clamped, target, reduction='mean')
+
+        # Dice loss
+        pred_flat = pred.contiguous().view(-1)
+        target_flat = target.contiguous().view(-1)
+        intersection = (pred_flat * target_flat).sum()
+        dice = (2. * intersection + self.smooth) / (pred_flat.sum() + target_flat.sum() + self.smooth)
+        dice_loss = 1 - dice
+
+        return self.bce_weight * bce_loss + self.dice_weight * dice_loss
+
+
 class EndToEndLoss(nn.Module):
     """
     Combined loss for end-to-end training.
+    Supports both standard UltraRefiner (logits) and GatedUltraRefiner (probabilities).
     """
-    def __init__(self, coarse_weight=0.3, refined_weight=0.7, n_classes=2):
+    def __init__(self, coarse_weight=0.3, refined_weight=0.7, n_classes=2, use_gated_refinement=False):
         super().__init__()
         self.coarse_weight = coarse_weight
         self.refined_weight = refined_weight
         self.n_classes = n_classes
+        self.use_gated_refinement = use_gated_refinement
 
         # Loss for coarse mask (TransUNet output)
         self.ce_loss = nn.CrossEntropyLoss()
         self.dice_loss = DiceLoss(n_classes=n_classes)
 
-        # Loss for refined mask (SAM output)
-        self.bce_dice = BCEDiceLoss()
+        # Loss for refined mask
+        if use_gated_refinement:
+            # Gated refinement outputs probabilities, not logits
+            self.refined_loss_fn = BCEDiceLossProb()
+        else:
+            # Standard refinement outputs logits
+            self.refined_loss_fn = BCEDiceLoss()
 
     def forward(self, outputs, target):
         """
@@ -235,7 +277,14 @@ class EndToEndLoss(nn.Module):
             loss_dict: Dictionary of individual losses
         """
         coarse_logits = outputs['coarse_logits']
-        refined_mask = outputs['refined_mask_logits']
+
+        # Get refined mask based on mode
+        if self.use_gated_refinement:
+            # Gated mode: 'refined_mask' is probabilities
+            refined_mask = outputs['refined_mask']
+        else:
+            # Standard mode: 'refined_mask_logits' is logits
+            refined_mask = outputs['refined_mask_logits']
 
         # Resize target for refined mask if needed
         if refined_mask.shape[-2:] != target.shape[-2:]:
@@ -253,7 +302,7 @@ class EndToEndLoss(nn.Module):
         coarse_loss = 0.5 * loss_ce + 0.5 * loss_dice
 
         # Refined loss
-        refined_loss = self.bce_dice(refined_mask.unsqueeze(1), target_refined.unsqueeze(1))
+        refined_loss = self.refined_loss_fn(refined_mask.unsqueeze(1), target_refined.unsqueeze(1).float())
 
         # Combined loss
         total_loss = self.coarse_weight * coarse_loss + self.refined_weight * refined_loss
@@ -291,14 +340,20 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, writ
         # DEBUG: Print mask statistics for first batch of first epoch
         if batch_idx == 0 and epoch == 0:
             with torch.no_grad():
-                refined_logits = outputs['refined_mask']
-                refined_prob = torch.sigmoid(refined_logits)
+                refined_out = outputs['refined_mask']
+                # In gated mode, refined_mask is already probabilities; otherwise it's logits
+                if args.use_gated_refinement:
+                    refined_prob = refined_out
+                    refined_label = "Refined prob"
+                else:
+                    refined_prob = torch.sigmoid(refined_out)
+                    refined_label = "Refined logits (224)"
                 coarse_mask = outputs['coarse_mask']
-                print(f"\n  [DEBUG] Mask Statistics:")
+                print(f"\n  [DEBUG] Mask Statistics (gated={args.use_gated_refinement}):")
                 print(f"  ├── Coarse mask:  min={coarse_mask.min():.4f}, max={coarse_mask.max():.4f}, mean={coarse_mask.mean():.4f}")
                 print(f"  ├── Coarse shape: {coarse_mask.shape}")
-                print(f"  ├── Refined logits (224): min={refined_logits.min():.4f}, max={refined_logits.max():.4f}, mean={refined_logits.mean():.4f}")
-                print(f"  ├── Refined shape: {refined_logits.shape}")
+                print(f"  ├── {refined_label}: min={refined_out.min():.4f}, max={refined_out.max():.4f}, mean={refined_out.mean():.4f}")
+                print(f"  ├── Refined shape: {refined_out.shape}")
                 print(f"  ├── Refined prob:   min={refined_prob.min():.4f}, max={refined_prob.max():.4f}, mean={refined_prob.mean():.4f}")
                 print(f"  ├── Refined > 0.5:  {(refined_prob > 0.5).float().mean():.4f} of pixels")
                 print(f"  └── Label > 0.5:    {(label > 0.5).float().mean():.4f} of pixels")
@@ -376,7 +431,11 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, writ
         # Compute metrics
         with torch.no_grad():
             coarse_pred = outputs['coarse_mask']
-            refined_pred = torch.sigmoid(outputs['refined_mask'])
+            # In gated mode, refined_mask is already probabilities; otherwise apply sigmoid
+            if args.use_gated_refinement:
+                refined_pred = outputs['refined_mask']
+            else:
+                refined_pred = torch.sigmoid(outputs['refined_mask'])
 
             # Resize refined prediction to original size if needed
             if refined_pred.shape[-2:] != label.shape[-2:]:
@@ -427,7 +486,11 @@ def validate(model, dataloader, criterion, device):
             loss, loss_dict = criterion(outputs, label)
 
             coarse_pred = outputs['coarse_mask']
-            refined_pred = torch.sigmoid(outputs['refined_mask'])
+            # In gated mode, refined_mask is already probabilities; otherwise apply sigmoid
+            if criterion.use_gated_refinement:
+                refined_pred = outputs['refined_mask']
+            else:
+                refined_pred = torch.sigmoid(outputs['refined_mask'])
 
             # Resize if needed
             if refined_pred.shape[-2:] != label.shape[-2:]:
@@ -722,7 +785,8 @@ def main():
     criterion = EndToEndLoss(
         coarse_weight=args.coarse_loss_weight,
         refined_weight=args.refined_loss_weight,
-        n_classes=args.num_classes
+        n_classes=args.num_classes,
+        use_gated_refinement=args.use_gated_refinement
     )
 
     # Optimizer with different learning rates
