@@ -32,6 +32,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
+from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -172,7 +173,8 @@ def train_epoch(model, train_loader, optimizer, scaler, device, use_amp, grad_ac
 
     optimizer.zero_grad()
 
-    for batch_idx, batch in enumerate(train_loader):
+    pbar = tqdm(train_loader, desc='Training')
+    for batch_idx, batch in enumerate(pbar):
         image = batch['image'].to(device, non_blocking=True)
         gt_mask = batch['label'].to(device, non_blocking=True)
         coarse_mask = batch['coarse_mask'].to(device, non_blocking=True)
@@ -218,6 +220,12 @@ def train_epoch(model, train_loader, optimizer, scaler, device, use_amp, grad_ac
 
         total_loss += loss_components['total']
 
+        # Update progress bar
+        pbar.set_postfix({
+            'loss': f"{loss_components['total']:.4f}",
+            'dice': f"{total_dice / max(1, (batch_idx + 1) * image.shape[0]):.4f}",
+        })
+
     n_batches = len(train_loader)
     n_samples = len(train_loader.dataset)
 
@@ -239,7 +247,7 @@ def validate(model, val_loader, device, use_amp):
     real_count = 0
     aug_count = 0
 
-    for batch in val_loader:
+    for batch in tqdm(val_loader, desc='Validation'):
         image = batch['image'].to(device, non_blocking=True)
         gt_mask = batch['label'].to(device, non_blocking=True)
         coarse_mask = batch['coarse_mask'].to(device, non_blocking=True)
@@ -357,6 +365,7 @@ def main():
     print("\n" + "=" * 60)
     print("Starting Hybrid Training")
     print("=" * 60)
+    sys.stdout.flush()
 
     for epoch in range(start_epoch, args.epochs):
         epoch_start = time.time()
