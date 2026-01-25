@@ -55,7 +55,7 @@ OUTPUT_DIR="./checkpoints/sam_finetuned_online"
 
 # Training parameters
 EPOCHS=300
-BATCH_SIZE=8
+BATCH_SIZE=4
 LR=1e-4
 NUM_WORKERS=8
 
