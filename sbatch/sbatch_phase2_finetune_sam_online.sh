@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=192G
-#SBATCH --time=72:00:00
+#SBATCH --time=90:00:00
 
 # Print job information
 echo "Job ID: $SLURM_JOB_ID"
@@ -49,12 +49,12 @@ echo ""
 # Configuration - modify these as needed
 DATA_ROOT="./dataset/processed"
 DATASETS="BUSI BUSBRA BUS BUS_UC BUS_UCLM"  # Space-separated list of datasets
-SAM_CHECKPOINT="./pretrained/medsam_vit_b.pth"
+SAM_CHECKPOINT="./pretrained/sam_vit_b_01ec64.pth"
 SAM_MODEL_TYPE="vit_b"
 OUTPUT_DIR="./checkpoints/sam_finetuned_online"
 
 # Training parameters
-EPOCHS=100
+EPOCHS=300
 BATCH_SIZE=4
 LR=1e-4
 NUM_WORKERS=8
@@ -68,7 +68,7 @@ CHANGE_PENALTY_WEIGHT=0.5
 TRANSUNET_IMG_SIZE=224
 MASK_PROMPT_STYLE="direct"
 USE_ROI_CROP="--use_roi_crop"
-ROI_EXPAND_RATIO=0.2
+ROI_EXPAND_RATIO=0.5
 
 # Optional: Resume from checkpoint (uncomment to use)
 # RESUME_CHECKPOINT="./checkpoints/sam_finetuned_online/BUSI_BUSBRA_BUS_BUS_UC_BUS_UCLM/best.pth"
