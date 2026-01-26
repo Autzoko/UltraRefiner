@@ -117,6 +117,8 @@ def get_args():
                         help='Resolution for evaluating SAM refined output. '
                              '224 = downsample SAM to match label (default), '
                              '1024 = upsample label to match SAM (preserves boundary details)')
+    parser.add_argument('--threshold', type=float, default=0.5,
+                        help='Threshold for binarizing predictions (default: 0.5)')
 
     # Model configuration (must match training)
     parser.add_argument('--mask_prompt_style', type=str, default='direct',
@@ -634,7 +636,8 @@ def evaluate_dataset(model, dataloader, device, refined_eval_size=224, use_gated
                      visualize=False, num_visualize=10, visualize_best_worst=False,
                      output_dir=None, dataset_name=None,
                      use_rejection=False, rejection_params=None,
-                     use_boundary_fusion=False, fusion_params=None):
+                     use_boundary_fusion=False, fusion_params=None,
+                     threshold=0.5):
     """Evaluate model on a dataset.
 
     Returns:
@@ -707,10 +710,10 @@ def evaluate_dataset(model, dataloader, device, refined_eval_size=224, use_gated
             # Compute per-sample metrics for visualization
             for i in range(image.shape[0]):
                 sample_coarse_metrics = compute_metrics(
-                    coarse_pred[i:i+1], label[i:i+1]
+                    coarse_pred[i:i+1], label[i:i+1], threshold=threshold
                 )
                 sample_refined_metrics = compute_metrics(
-                    refined_pred_eval[i:i+1], label_for_refined[i:i+1]
+                    refined_pred_eval[i:i+1], label_for_refined[i:i+1], threshold=threshold
                 )
 
                 coarse_dice = sample_coarse_metrics['dice']
@@ -906,6 +909,7 @@ def main():
 
     print(f"\nEvaluating on datasets: {args.datasets}")
     print(f"Refined evaluation size: {args.refined_eval_size}")
+    print(f"Binarization threshold: {args.threshold}")
 
     # Print stabilization settings
     if args.use_rejection_rules:
@@ -1022,7 +1026,8 @@ def main():
             use_rejection=args.use_rejection_rules,
             rejection_params=rejection_params,
             use_boundary_fusion=args.use_boundary_fusion,
-            fusion_params=fusion_params
+            fusion_params=fusion_params,
+            threshold=args.threshold
         )
         results[dataset_name] = dataset_results
 
