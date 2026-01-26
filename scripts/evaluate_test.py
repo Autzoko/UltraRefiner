@@ -17,6 +17,20 @@ Usage:
         --checkpoint ./checkpoints/ultra_refiner/fold_0/best.pth \
         --data_root ./dataset/processed \
         --refined_eval_size 1024
+
+    # With visualization (10 samples per dataset)
+    python scripts/evaluate_test.py \
+        --checkpoint ./checkpoints/ultra_refiner/fold_0/best.pth \
+        --data_root ./dataset/processed \
+        --datasets BUSI \
+        --visualize --num_visualize 10
+
+    # Visualize best and worst cases (most improved / most degraded)
+    python scripts/evaluate_test.py \
+        --checkpoint ./checkpoints/ultra_refiner/fold_0/best.pth \
+        --data_root ./dataset/processed \
+        --datasets BUSI \
+        --visualize --visualize_best_worst --num_visualize 20
 """
 
 import argparse
@@ -27,6 +41,8 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 from collections import defaultdict
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -84,6 +100,14 @@ def get_args():
                         help='Gate min')
     parser.add_argument('--gate_max', type=float, default=0.8,
                         help='Gate max')
+
+    # Visualization arguments
+    parser.add_argument('--visualize', action='store_true',
+                        help='Generate visualization images')
+    parser.add_argument('--num_visualize', type=int, default=10,
+                        help='Number of samples to visualize per dataset')
+    parser.add_argument('--visualize_best_worst', action='store_true',
+                        help='Visualize best and worst cases based on improvement')
 
     # Other arguments
     parser.add_argument('--gpu', type=int, default=0,
@@ -151,7 +175,188 @@ def compute_metrics(pred, target, threshold=0.5):
     }
 
 
-def evaluate_dataset(model, dataloader, device, refined_eval_size=224, use_gated=False):
+def visualize_sample(image, label, coarse_pred, refined_pred,
+                     coarse_dice, refined_dice, sample_idx,
+                     output_dir, dataset_name):
+    """Visualize a single sample with all predictions.
+
+    Args:
+        image: Input image (H, W) or (H, W, 3)
+        label: Ground truth mask (H, W)
+        coarse_pred: Coarse prediction (H, W) in [0, 1]
+        refined_pred: Refined prediction (H, W) in [0, 1]
+        coarse_dice: Dice score for coarse prediction
+        refined_dice: Dice score for refined prediction
+        sample_idx: Sample index for filename
+        output_dir: Output directory
+        dataset_name: Dataset name for subdirectory
+    """
+    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+
+    # Convert to numpy if tensor
+    if torch.is_tensor(image):
+        image = image.cpu().numpy()
+    if torch.is_tensor(label):
+        label = label.cpu().numpy()
+    if torch.is_tensor(coarse_pred):
+        coarse_pred = coarse_pred.cpu().numpy()
+    if torch.is_tensor(refined_pred):
+        refined_pred = refined_pred.cpu().numpy()
+
+    # Normalize image for display
+    if image.max() > 1:
+        image = image / 255.0
+
+    # Binarize predictions for overlay
+    coarse_binary = (coarse_pred > 0.5).astype(np.float32)
+    refined_binary = (refined_pred > 0.5).astype(np.float32)
+    label_binary = (label > 0.5).astype(np.float32)
+
+    # Row 1: Individual masks
+    # Image
+    axes[0, 0].imshow(image, cmap='gray')
+    axes[0, 0].set_title('Input Image')
+    axes[0, 0].axis('off')
+
+    # Ground Truth
+    axes[0, 1].imshow(label_binary, cmap='gray')
+    axes[0, 1].set_title('Ground Truth')
+    axes[0, 1].axis('off')
+
+    # Coarse (TransUNet)
+    axes[0, 2].imshow(coarse_binary, cmap='gray')
+    axes[0, 2].set_title(f'Coarse (Dice: {coarse_dice:.4f})')
+    axes[0, 2].axis('off')
+
+    # Refined (SAM)
+    axes[0, 3].imshow(refined_binary, cmap='gray')
+    axes[0, 3].set_title(f'Refined (Dice: {refined_dice:.4f})')
+    axes[0, 3].axis('off')
+
+    # Row 2: Overlays and comparisons
+    # Image with GT overlay
+    axes[1, 0].imshow(image, cmap='gray')
+    axes[1, 0].contour(label_binary, colors='green', linewidths=2)
+    axes[1, 0].set_title('GT Contour')
+    axes[1, 0].axis('off')
+
+    # Coarse overlay on image
+    axes[1, 1].imshow(image, cmap='gray')
+    axes[1, 1].contour(label_binary, colors='green', linewidths=2)
+    axes[1, 1].contour(coarse_binary, colors='red', linewidths=2)
+    axes[1, 1].set_title('Coarse vs GT')
+    axes[1, 1].axis('off')
+
+    # Refined overlay on image
+    axes[1, 2].imshow(image, cmap='gray')
+    axes[1, 2].contour(label_binary, colors='green', linewidths=2)
+    axes[1, 2].contour(refined_binary, colors='blue', linewidths=2)
+    axes[1, 2].set_title('Refined vs GT')
+    axes[1, 2].axis('off')
+
+    # Difference map: show where refined differs from coarse
+    # Green: refined correct, coarse wrong
+    # Red: refined wrong, coarse correct
+    # Yellow: both wrong
+    diff_map = np.zeros((*label_binary.shape, 3))
+
+    # Refined correct, coarse wrong (green)
+    refined_correct = (refined_binary == label_binary)
+    coarse_wrong = (coarse_binary != label_binary)
+    diff_map[refined_correct & coarse_wrong] = [0, 1, 0]
+
+    # Refined wrong, coarse correct (red)
+    refined_wrong = (refined_binary != label_binary)
+    coarse_correct = (coarse_binary == label_binary)
+    diff_map[refined_wrong & coarse_correct] = [1, 0, 0]
+
+    # Both wrong (yellow)
+    diff_map[refined_wrong & coarse_wrong] = [1, 1, 0]
+
+    axes[1, 3].imshow(diff_map)
+    axes[1, 3].set_title(f'Improvement: {refined_dice - coarse_dice:+.4f}')
+    axes[1, 3].axis('off')
+
+    # Add legend
+    green_patch = mpatches.Patch(color='green', label='Refined fixed')
+    red_patch = mpatches.Patch(color='red', label='Refined broke')
+    yellow_patch = mpatches.Patch(color='yellow', label='Both wrong')
+    axes[1, 3].legend(handles=[green_patch, red_patch, yellow_patch],
+                      loc='lower right', fontsize=8)
+
+    plt.tight_layout()
+
+    # Save figure
+    vis_dir = os.path.join(output_dir, 'visualizations', dataset_name)
+    os.makedirs(vis_dir, exist_ok=True)
+
+    improvement = refined_dice - coarse_dice
+    filename = f'sample_{sample_idx:04d}_imp{improvement:+.4f}.png'
+    plt.savefig(os.path.join(vis_dir, filename), dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def visualize_summary(results_list, output_dir, dataset_name):
+    """Create a summary visualization showing improvement distribution.
+
+    Args:
+        results_list: List of (coarse_dice, refined_dice, improvement) tuples
+        output_dir: Output directory
+        dataset_name: Dataset name
+    """
+    coarse_dices = [r[0] for r in results_list]
+    refined_dices = [r[1] for r in results_list]
+    improvements = [r[2] for r in results_list]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+    # Dice distribution
+    axes[0].hist(coarse_dices, bins=20, alpha=0.7, label='Coarse', color='red')
+    axes[0].hist(refined_dices, bins=20, alpha=0.7, label='Refined', color='blue')
+    axes[0].set_xlabel('Dice Score')
+    axes[0].set_ylabel('Count')
+    axes[0].set_title(f'{dataset_name}: Dice Distribution')
+    axes[0].legend()
+    axes[0].axvline(np.mean(coarse_dices), color='red', linestyle='--', label=f'Coarse mean: {np.mean(coarse_dices):.4f}')
+    axes[0].axvline(np.mean(refined_dices), color='blue', linestyle='--', label=f'Refined mean: {np.mean(refined_dices):.4f}')
+
+    # Improvement distribution
+    axes[1].hist(improvements, bins=20, alpha=0.7, color='green')
+    axes[1].axvline(0, color='black', linestyle='-', linewidth=2)
+    axes[1].axvline(np.mean(improvements), color='red', linestyle='--')
+    axes[1].set_xlabel('Dice Improvement')
+    axes[1].set_ylabel('Count')
+    axes[1].set_title(f'Improvement Distribution (mean: {np.mean(improvements):+.4f})')
+
+    # Scatter plot: coarse vs refined
+    axes[2].scatter(coarse_dices, refined_dices, alpha=0.5, s=20)
+    axes[2].plot([0, 1], [0, 1], 'k--', label='No change')
+    axes[2].set_xlabel('Coarse Dice')
+    axes[2].set_ylabel('Refined Dice')
+    axes[2].set_title('Coarse vs Refined Dice')
+    axes[2].set_xlim([0, 1])
+    axes[2].set_ylim([0, 1])
+    axes[2].legend()
+
+    # Count improvements vs degradations
+    n_improved = sum(1 for i in improvements if i > 0)
+    n_degraded = sum(1 for i in improvements if i < 0)
+    n_same = sum(1 for i in improvements if i == 0)
+    axes[2].text(0.05, 0.95, f'Improved: {n_improved}\nDegraded: {n_degraded}\nSame: {n_same}',
+                 transform=axes[2].transAxes, fontsize=10, verticalalignment='top',
+                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    plt.tight_layout()
+
+    vis_dir = os.path.join(output_dir, 'visualizations', dataset_name)
+    os.makedirs(vis_dir, exist_ok=True)
+    plt.savefig(os.path.join(vis_dir, 'summary.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def evaluate_dataset(model, dataloader, device, refined_eval_size=224, use_gated=False,
+                     visualize=False, num_visualize=10, visualize_best_worst=False,
+                     output_dir=None, dataset_name=None):
     """Evaluate model on a dataset.
 
     Returns:
@@ -161,6 +366,10 @@ def evaluate_dataset(model, dataloader, device, refined_eval_size=224, use_gated
 
     coarse_metrics = defaultdict(list)
     refined_metrics = defaultdict(list)
+
+    # For visualization
+    vis_data = []  # Store (image, label, coarse, refined, coarse_dice, refined_dice, idx)
+    sample_idx = 0
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc='Evaluating', leave=False):
@@ -179,10 +388,6 @@ def evaluate_dataset(model, dataloader, device, refined_eval_size=224, use_gated
                 refined_pred = torch.sigmoid(outputs['refined_mask'])  # (B, H, W)
 
             # Coarse: evaluate at 224x224 (TransUNet native resolution)
-            batch_coarse_metrics = compute_metrics(coarse_pred, label)
-            for k, v in batch_coarse_metrics.items():
-                coarse_metrics[k].append(v)
-
             # Refined: evaluate at refined_eval_size
             if refined_eval_size >= 1024 and refined_pred.shape[-2:] != label.shape[-2:]:
                 # Upsample label to match SAM output (preserves boundary details)
@@ -191,9 +396,10 @@ def evaluate_dataset(model, dataloader, device, refined_eval_size=224, use_gated
                     size=refined_pred.shape[-2:],
                     mode='nearest'
                 ).squeeze(1)
+                refined_pred_eval = refined_pred
             elif refined_pred.shape[-2:] != label.shape[-2:]:
                 # Downsample SAM output to match label (default behavior)
-                refined_pred = F.interpolate(
+                refined_pred_eval = F.interpolate(
                     refined_pred.unsqueeze(1),
                     size=label.shape[-2:],
                     mode='bilinear',
@@ -202,14 +408,88 @@ def evaluate_dataset(model, dataloader, device, refined_eval_size=224, use_gated
                 label_for_refined = label
             else:
                 label_for_refined = label
+                refined_pred_eval = refined_pred
 
-            batch_refined_metrics = compute_metrics(refined_pred, label_for_refined)
-            for k, v in batch_refined_metrics.items():
-                refined_metrics[k].append(v)
+            # Compute per-sample metrics for visualization
+            for i in range(image.shape[0]):
+                sample_coarse_metrics = compute_metrics(
+                    coarse_pred[i:i+1], label[i:i+1]
+                )
+                sample_refined_metrics = compute_metrics(
+                    refined_pred_eval[i:i+1], label_for_refined[i:i+1]
+                )
+
+                coarse_dice = sample_coarse_metrics['dice']
+                refined_dice = sample_refined_metrics['dice']
+
+                for k, v in sample_coarse_metrics.items():
+                    coarse_metrics[k].append(v)
+                for k, v in sample_refined_metrics.items():
+                    refined_metrics[k].append(v)
+
+                # Store data for visualization
+                if visualize:
+                    # Downsample refined to match coarse for visualization
+                    refined_for_vis = F.interpolate(
+                        refined_pred[i:i+1].unsqueeze(1),
+                        size=label.shape[-2:],
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze()
+
+                    vis_data.append({
+                        'image': image[i, 0].cpu(),  # Assume grayscale
+                        'label': label[i].cpu(),
+                        'coarse': coarse_pred[i].cpu(),
+                        'refined': refined_for_vis.cpu(),
+                        'coarse_dice': coarse_dice,
+                        'refined_dice': refined_dice,
+                        'improvement': refined_dice - coarse_dice,
+                        'idx': sample_idx
+                    })
+
+                sample_idx += 1
 
     # Average metrics
     avg_coarse = {k: np.mean(v) for k, v in coarse_metrics.items()}
     avg_refined = {k: np.mean(v) for k, v in refined_metrics.items()}
+
+    # Generate visualizations
+    if visualize and output_dir and dataset_name:
+        print(f"  Generating visualizations...")
+
+        if visualize_best_worst:
+            # Sort by improvement and visualize best/worst
+            vis_data_sorted = sorted(vis_data, key=lambda x: x['improvement'])
+
+            # Worst cases (refinement hurt most)
+            worst_cases = vis_data_sorted[:num_visualize // 2]
+            # Best cases (refinement helped most)
+            best_cases = vis_data_sorted[-(num_visualize // 2):]
+
+            samples_to_vis = worst_cases + best_cases
+        else:
+            # Visualize evenly spaced samples
+            step = max(1, len(vis_data) // num_visualize)
+            samples_to_vis = vis_data[::step][:num_visualize]
+
+        for sample in tqdm(samples_to_vis, desc='Visualizing', leave=False):
+            visualize_sample(
+                image=sample['image'],
+                label=sample['label'],
+                coarse_pred=sample['coarse'],
+                refined_pred=sample['refined'],
+                coarse_dice=sample['coarse_dice'],
+                refined_dice=sample['refined_dice'],
+                sample_idx=sample['idx'],
+                output_dir=output_dir,
+                dataset_name=dataset_name
+            )
+
+        # Generate summary visualization
+        results_list = [(d['coarse_dice'], d['refined_dice'], d['improvement'])
+                        for d in vis_data]
+        visualize_summary(results_list, output_dir, dataset_name)
 
     return {
         'coarse': avg_coarse,
@@ -399,7 +679,12 @@ def main():
         dataset_results = evaluate_dataset(
             model, dataloader, device,
             refined_eval_size=args.refined_eval_size,
-            use_gated=args.use_gated_refinement
+            use_gated=args.use_gated_refinement,
+            visualize=args.visualize,
+            num_visualize=args.num_visualize,
+            visualize_best_worst=args.visualize_best_worst,
+            output_dir=args.output_dir,
+            dataset_name=dataset_name
         )
         results[dataset_name] = dataset_results
 
