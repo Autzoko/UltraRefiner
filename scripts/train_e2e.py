@@ -437,17 +437,20 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, writ
             else:
                 refined_pred = torch.sigmoid(outputs['refined_mask'])
 
-            # Resize refined prediction to original size if needed
-            if refined_pred.shape[-2:] != label.shape[-2:]:
-                refined_pred = F.interpolate(
-                    refined_pred.unsqueeze(1),
-                    size=label.shape[-2:],
-                    mode='bilinear',
-                    align_corners=False
-                ).squeeze(1)
-
+            # Coarse: evaluate at 224x224 (TransUNet native resolution)
             metric_tracker_coarse.update(coarse_pred, label)
-            metric_tracker_refined.update(refined_pred, label, loss_dict['total'])
+
+            # Refined: evaluate at 1024x1024 (SAM native resolution)
+            # Upsample label to match refined_pred size instead of downsampling refined_pred
+            if refined_pred.shape[-2:] != label.shape[-2:]:
+                label_1024 = F.interpolate(
+                    label.unsqueeze(1),
+                    size=refined_pred.shape[-2:],
+                    mode='nearest'  # Use nearest for GT to preserve sharp boundaries
+                ).squeeze(1)
+            else:
+                label_1024 = label
+            metric_tracker_refined.update(refined_pred, label_1024, loss_dict['total'])
 
         # Logging
         for key, value in loss_dict.items():
@@ -468,7 +471,11 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, writ
 
 
 def validate(model, dataloader, criterion, device):
-    """Validate the model."""
+    """Validate the model.
+
+    Coarse (TransUNet) is evaluated at 224x224 (native resolution).
+    Refined (SAM) is evaluated at 1024x1024 (native resolution) by upsampling GT.
+    """
     model.eval()
     metric_tracker_coarse = MetricTracker(
         metrics=['dice', 'iou', 'jaccard', 'precision', 'recall', 'accuracy']
@@ -492,17 +499,20 @@ def validate(model, dataloader, criterion, device):
             else:
                 refined_pred = torch.sigmoid(outputs['refined_mask'])
 
-            # Resize if needed
-            if refined_pred.shape[-2:] != label.shape[-2:]:
-                refined_pred = F.interpolate(
-                    refined_pred.unsqueeze(1),
-                    size=label.shape[-2:],
-                    mode='bilinear',
-                    align_corners=False
-                ).squeeze(1)
-
+            # Coarse: evaluate at 224x224 (TransUNet native resolution)
             metric_tracker_coarse.update(coarse_pred, label)
-            metric_tracker_refined.update(refined_pred, label, loss_dict['total'])
+
+            # Refined: evaluate at 1024x1024 (SAM native resolution)
+            # Upsample label to match refined_pred size instead of downsampling refined_pred
+            if refined_pred.shape[-2:] != label.shape[-2:]:
+                label_1024 = F.interpolate(
+                    label.unsqueeze(1),
+                    size=refined_pred.shape[-2:],
+                    mode='nearest'  # Use nearest for GT to preserve sharp boundaries
+                ).squeeze(1)
+            else:
+                label_1024 = label
+            metric_tracker_refined.update(refined_pred, label_1024, loss_dict['total'])
 
     return {
         'coarse': metric_tracker_coarse.get_average(),
