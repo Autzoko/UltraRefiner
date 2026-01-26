@@ -90,6 +90,10 @@ def get_args():
                         help='Path to finetuned SAM checkpoint')
     parser.add_argument('--img_size', type=int, default=224,
                         help='Input image size for TransUNet')
+    parser.add_argument('--refined_eval_size', type=int, default=224,
+                        help='Resolution for evaluating SAM refined output. '
+                             '224 = downsample SAM to match label (default), '
+                             '1024 = upsample label to match SAM (preserves boundary details)')
     parser.add_argument('--num_classes', type=int, default=2,
                         help='Number of segmentation classes')
     parser.add_argument('--n_skip', type=int, default=3,
@@ -440,17 +444,26 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, writ
             # Coarse: evaluate at 224x224 (TransUNet native resolution)
             metric_tracker_coarse.update(coarse_pred, label)
 
-            # Refined: evaluate at 1024x1024 (SAM native resolution)
-            # Upsample label to match refined_pred size instead of downsampling refined_pred
-            if refined_pred.shape[-2:] != label.shape[-2:]:
-                label_1024 = F.interpolate(
+            # Refined: evaluate at refined_eval_size (default 224, or 1024 to preserve SAM details)
+            if args.refined_eval_size >= 1024 and refined_pred.shape[-2:] != label.shape[-2:]:
+                # Upsample label to match SAM output (preserves boundary details)
+                label_for_refined = F.interpolate(
                     label.unsqueeze(1),
                     size=refined_pred.shape[-2:],
                     mode='nearest'  # Use nearest for GT to preserve sharp boundaries
                 ).squeeze(1)
+            elif refined_pred.shape[-2:] != label.shape[-2:]:
+                # Downsample SAM output to match label (default behavior)
+                refined_pred = F.interpolate(
+                    refined_pred.unsqueeze(1),
+                    size=label.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False
+                ).squeeze(1)
+                label_for_refined = label
             else:
-                label_1024 = label
-            metric_tracker_refined.update(refined_pred, label_1024, loss_dict['total'])
+                label_for_refined = label
+            metric_tracker_refined.update(refined_pred, label_for_refined, loss_dict['total'])
 
         # Logging
         for key, value in loss_dict.items():
@@ -470,11 +483,13 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, writ
     }
 
 
-def validate(model, dataloader, criterion, device):
+def validate(model, dataloader, criterion, device, refined_eval_size=224):
     """Validate the model.
 
-    Coarse (TransUNet) is evaluated at 224x224 (native resolution).
-    Refined (SAM) is evaluated at 1024x1024 (native resolution) by upsampling GT.
+    Args:
+        refined_eval_size: Resolution for SAM evaluation.
+            224 = downsample SAM output to match label (default)
+            1024 = upsample label to match SAM output (preserves boundary details)
     """
     model.eval()
     metric_tracker_coarse = MetricTracker(
@@ -490,7 +505,7 @@ def validate(model, dataloader, criterion, device):
             label = batch['label'].to(device)
 
             outputs = model(image)
-            loss, loss_dict = criterion(outputs, label)
+            _, loss_dict = criterion(outputs, label)
 
             coarse_pred = outputs['coarse_mask']
             # In gated mode, refined_mask is already probabilities; otherwise apply sigmoid
@@ -502,17 +517,26 @@ def validate(model, dataloader, criterion, device):
             # Coarse: evaluate at 224x224 (TransUNet native resolution)
             metric_tracker_coarse.update(coarse_pred, label)
 
-            # Refined: evaluate at 1024x1024 (SAM native resolution)
-            # Upsample label to match refined_pred size instead of downsampling refined_pred
-            if refined_pred.shape[-2:] != label.shape[-2:]:
-                label_1024 = F.interpolate(
+            # Refined: evaluate at refined_eval_size
+            if refined_eval_size >= 1024 and refined_pred.shape[-2:] != label.shape[-2:]:
+                # Upsample label to match SAM output (preserves boundary details)
+                label_for_refined = F.interpolate(
                     label.unsqueeze(1),
                     size=refined_pred.shape[-2:],
                     mode='nearest'  # Use nearest for GT to preserve sharp boundaries
                 ).squeeze(1)
+            elif refined_pred.shape[-2:] != label.shape[-2:]:
+                # Downsample SAM output to match label (default behavior)
+                refined_pred = F.interpolate(
+                    refined_pred.unsqueeze(1),
+                    size=label.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False
+                ).squeeze(1)
+                label_for_refined = label
             else:
-                label_1024 = label
-            metric_tracker_refined.update(refined_pred, label_1024, loss_dict['total'])
+                label_for_refined = label
+            metric_tracker_refined.update(refined_pred, label_for_refined, loss_dict['total'])
 
     return {
         'coarse': metric_tracker_coarse.get_average(),
@@ -696,6 +720,7 @@ def main():
     logging.info(f'mask_prompt_style: {args.mask_prompt_style}')
     logging.info(f'use_roi_crop: {args.use_roi_crop}')
     logging.info(f'use_gated_refinement: {args.use_gated_refinement}')
+    logging.info(f'refined_eval_size: {args.refined_eval_size} (SAM metrics evaluated at this resolution)')
 
     if args.use_gated_refinement:
         # Use gated residual refinement: final = coarse + gate * (SAM - coarse)
@@ -893,7 +918,7 @@ def main():
         logging.info(f'Epoch {epoch} Train Refined: {train_metrics["refined"]}')
 
         # Validate
-        val_metrics = validate(model, val_loader, criterion, device)
+        val_metrics = validate(model, val_loader, criterion, device, args.refined_eval_size)
         logging.info(f'Epoch {epoch} Val Coarse: {val_metrics["coarse"]}')
         logging.info(f'Epoch {epoch} Val Refined: {val_metrics["refined"]}')
 
