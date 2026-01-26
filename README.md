@@ -424,6 +424,41 @@ python scripts/train_e2e.py \
 
 ---
 
+### Evaluation on Test Sets
+
+Evaluate the trained model on test sets of each dataset, showing both coarse (TransUNet) and refined (SAM) performance:
+
+```bash
+# Basic evaluation (at 224x224 resolution)
+python scripts/evaluate_test.py \
+    --checkpoint ./checkpoints/ultra_refiner/fold_0/best.pth \
+    --data_root ./dataset/processed \
+    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM
+
+# Evaluate at SAM's native resolution (1024x1024) to preserve boundary details
+python scripts/evaluate_test.py \
+    --checkpoint ./checkpoints/ultra_refiner/fold_0/best.pth \
+    --data_root ./dataset/processed \
+    --refined_eval_size 1024
+
+# For gated refinement models
+python scripts/evaluate_test.py \
+    --checkpoint ./checkpoints/ultra_refiner/fold_0/best.pth \
+    --data_root ./dataset/processed \
+    --use_gated_refinement \
+    --gate_type uncertainty
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--refined_eval_size` | `224` | Resolution for SAM evaluation (224 or 1024) |
+| `--datasets` | All | Specific datasets to evaluate |
+| `--output_dir` | `./results/test_evaluation` | Where to save JSON results |
+
+**Output**: Detailed metrics (Dice, IoU, Precision, Recall, Accuracy) for each dataset with improvement comparison between coarse and refined outputs.
+
+---
+
 ## Mask Augmentation System
 
 ### 12 Primary Error Types
@@ -501,6 +536,7 @@ UltraRefiner/
 |   +-- generate_transunet_predictions.py  # Out-of-fold predictions
 |   +-- finetune_sam_offline.py   # Phase 2 (recommended)
 |   +-- train_e2e.py              # Phase 3
+|   +-- evaluate_test.py          # Test set evaluation
 |   +-- inference.py              # Inference pipeline
 +-- utils/
 |   +-- losses.py                 # Dice, BCE, quality-aware losses
