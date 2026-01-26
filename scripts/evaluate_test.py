@@ -561,8 +561,8 @@ def visualize_sample(image, label, coarse_pred, refined_pred,
 
     plt.tight_layout()
 
-    # Save figure
-    vis_dir = os.path.join(output_dir, 'visualizations', dataset_name)
+    # Save figure to dataset's own directory
+    vis_dir = os.path.join(output_dir, dataset_name, 'visualizations')
     os.makedirs(vis_dir, exist_ok=True)
 
     improvement = refined_dice - coarse_dice
@@ -623,7 +623,8 @@ def visualize_summary(results_list, output_dir, dataset_name):
 
     plt.tight_layout()
 
-    vis_dir = os.path.join(output_dir, 'visualizations', dataset_name)
+    # Save to dataset's own directory
+    vis_dir = os.path.join(output_dir, dataset_name, 'visualizations')
     os.makedirs(vis_dir, exist_ok=True)
     plt.savefig(os.path.join(vis_dir, 'summary.png'), dpi=150, bbox_inches='tight')
     plt.close()
@@ -1037,10 +1038,38 @@ def main():
 
         print(summary_str)
 
+        # Save per-dataset results to dataset's own directory
+        if args.output_dir:
+            import json
+
+            # Convert numpy types to Python types for JSON serialization
+            def convert_to_serializable(obj):
+                if isinstance(obj, np.floating):
+                    return float(obj)
+                elif isinstance(obj, np.integer):
+                    return int(obj)
+                elif isinstance(obj, dict):
+                    return {k: convert_to_serializable(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [convert_to_serializable(v) for v in obj]
+                return obj
+
+            dataset_dir = os.path.join(args.output_dir, dataset_name)
+            os.makedirs(dataset_dir, exist_ok=True)
+
+            dataset_results_path = os.path.join(dataset_dir, 'test_result.json')
+            with open(dataset_results_path, 'w') as f:
+                json.dump(convert_to_serializable({
+                    'dataset': dataset_name,
+                    'args': vars(args),
+                    'results': dataset_results,
+                }), f, indent=2)
+            print(f"  Results saved to: {dataset_results_path}")
+
     # Print final results table
     summary = print_results_table(results, args.datasets)
 
-    # Save results
+    # Save combined summary
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
         import json
@@ -1057,14 +1086,15 @@ def main():
                 return [convert_to_serializable(v) for v in obj]
             return obj
 
-        results_path = os.path.join(args.output_dir, 'test_results.json')
-        with open(results_path, 'w') as f:
+        # Save combined summary at root level
+        summary_path = os.path.join(args.output_dir, 'summary.json')
+        with open(summary_path, 'w') as f:
             json.dump(convert_to_serializable({
                 'args': vars(args),
                 'results': results,
                 'summary': summary,
             }), f, indent=2)
-        print(f"\nResults saved to: {results_path}")
+        print(f"\nCombined summary saved to: {summary_path}")
 
     print("\nEvaluation complete!")
     return results
