@@ -38,6 +38,33 @@ Usage:
         --data_root ./dataset/processed \
         --datasets BUSI \
         --visualize --num_visualize -1
+
+    # With rejection rules (discard bad refinements)
+    python scripts/evaluate_test.py \
+        --checkpoint ./checkpoints/ultra_refiner/fold_0/best.pth \
+        --data_root ./dataset/processed \
+        --datasets BUSI \
+        --use_rejection_rules \
+        --reject_iou_threshold 0.5 \
+        --reject_area_ratio_min 0.3 \
+        --reject_area_ratio_max 3.0
+
+    # With boundary-band fusion (refine only near boundaries)
+    python scripts/evaluate_test.py \
+        --checkpoint ./checkpoints/ultra_refiner/fold_0/best.pth \
+        --data_root ./dataset/processed \
+        --datasets BUSI \
+        --use_boundary_fusion \
+        --boundary_band_width 15
+
+    # Combined stabilization (rejection + boundary fusion)
+    python scripts/evaluate_test.py \
+        --checkpoint ./checkpoints/ultra_refiner/fold_0/best.pth \
+        --data_root ./dataset/processed \
+        --datasets BUSI \
+        --use_rejection_rules \
+        --use_boundary_fusion \
+        --boundary_band_width 20
 """
 
 import argparse
@@ -50,6 +77,8 @@ from tqdm import tqdm
 from collections import defaultdict
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+from scipy import ndimage
+from scipy.ndimage import binary_dilation, binary_erosion, label as ndimage_label
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -116,6 +145,23 @@ def get_args():
     parser.add_argument('--visualize_best_worst', action='store_true',
                         help='Visualize best and worst cases based on improvement')
 
+    # Inference-time stabilization arguments
+    parser.add_argument('--use_rejection_rules', action='store_true',
+                        help='Apply rejection rules to discard bad refinements')
+    parser.add_argument('--reject_iou_threshold', type=float, default=0.5,
+                        help='Reject refined if IoU with coarse < threshold')
+    parser.add_argument('--reject_area_ratio_min', type=float, default=0.3,
+                        help='Reject if refined_area/coarse_area < min')
+    parser.add_argument('--reject_area_ratio_max', type=float, default=3.0,
+                        help='Reject if refined_area/coarse_area > max')
+    parser.add_argument('--reject_max_components', type=int, default=5,
+                        help='Reject if refined has more than N connected components')
+
+    parser.add_argument('--use_boundary_fusion', action='store_true',
+                        help='Apply boundary-band fusion (refine only near boundaries)')
+    parser.add_argument('--boundary_band_width', type=int, default=15,
+                        help='Width of boundary band in pixels (default: 15)')
+
     # Other arguments
     parser.add_argument('--gpu', type=int, default=0,
                         help='GPU device ID')
@@ -181,6 +227,228 @@ def compute_metrics(pred, target, threshold=0.5):
         'specificity': specificity.item(),
     }
 
+
+# ============================================================================
+# Inference-time Stabilization Methods
+# ============================================================================
+
+def apply_rejection_rules(coarse_mask, refined_mask,
+                          iou_threshold=0.5,
+                          area_ratio_min=0.3,
+                          area_ratio_max=3.0,
+                          max_components=5):
+    """Apply rejection rules to decide whether to keep refined or fall back to coarse.
+
+    Rejects refined predictions when they deviate excessively from the coarse mask,
+    based on IoU consistency, area ratio constraints, and connected component count.
+
+    Args:
+        coarse_mask: Coarse prediction (H, W), binary or probability
+        refined_mask: Refined prediction (H, W), binary or probability
+        iou_threshold: Reject if IoU between coarse and refined < threshold
+        area_ratio_min: Reject if refined_area / coarse_area < min
+        area_ratio_max: Reject if refined_area / coarse_area > max
+        max_components: Reject if refined has more connected components than this
+
+    Returns:
+        output_mask: Either refined_mask (if accepted) or coarse_mask (if rejected)
+        rejected: Boolean indicating if the refinement was rejected
+        reject_reason: String describing why rejected (or None if accepted)
+    """
+    # Convert to numpy for processing
+    if torch.is_tensor(coarse_mask):
+        coarse_np = coarse_mask.cpu().numpy()
+    else:
+        coarse_np = coarse_mask
+
+    if torch.is_tensor(refined_mask):
+        refined_np = refined_mask.cpu().numpy()
+    else:
+        refined_np = refined_mask
+
+    # Binarize
+    coarse_binary = (coarse_np > 0.5).astype(np.float32)
+    refined_binary = (refined_np > 0.5).astype(np.float32)
+
+    # Rule 1: IoU consistency check
+    intersection = (coarse_binary * refined_binary).sum()
+    union = coarse_binary.sum() + refined_binary.sum() - intersection
+    iou = (intersection + 1e-7) / (union + 1e-7)
+
+    if iou < iou_threshold:
+        return coarse_mask, True, f'IoU too low: {iou:.3f} < {iou_threshold}'
+
+    # Rule 2: Area ratio check
+    coarse_area = coarse_binary.sum()
+    refined_area = refined_binary.sum()
+
+    if coarse_area > 0:
+        area_ratio = refined_area / coarse_area
+        if area_ratio < area_ratio_min:
+            return coarse_mask, True, f'Area ratio too small: {area_ratio:.3f} < {area_ratio_min}'
+        if area_ratio > area_ratio_max:
+            return coarse_mask, True, f'Area ratio too large: {area_ratio:.3f} > {area_ratio_max}'
+
+    # Rule 3: Connected component count check
+    labeled_array, num_components = ndimage_label(refined_binary)
+    if num_components > max_components:
+        return coarse_mask, True, f'Too many components: {num_components} > {max_components}'
+
+    # All rules passed - accept refinement
+    return refined_mask, False, None
+
+
+def apply_boundary_fusion(coarse_mask, refined_mask, band_width=15):
+    """Apply boundary-band fusion to restrict refinement to boundary regions.
+
+    Restricts refinement to a narrow morphological band around the coarse mask
+    boundary, while preserving the interior and exterior regions from the coarse mask.
+
+    Args:
+        coarse_mask: Coarse prediction (H, W), probability in [0, 1]
+        refined_mask: Refined prediction (H, W), probability in [0, 1]
+        band_width: Width of boundary band in pixels (e.g., 10-20)
+
+    Returns:
+        fused_mask: Mask with refinement only in boundary band
+    """
+    # Convert to numpy for morphological operations
+    if torch.is_tensor(coarse_mask):
+        coarse_np = coarse_mask.cpu().numpy()
+        is_tensor = True
+        device = coarse_mask.device
+    else:
+        coarse_np = coarse_mask
+        is_tensor = False
+        device = None
+
+    if torch.is_tensor(refined_mask):
+        refined_np = refined_mask.cpu().numpy()
+    else:
+        refined_np = refined_mask
+
+    # Binarize coarse for morphological operations
+    coarse_binary = (coarse_np > 0.5).astype(np.uint8)
+
+    # Create structuring element
+    struct = np.ones((3, 3), dtype=np.uint8)
+
+    # Compute boundary band using dilation and erosion
+    # Outer boundary: dilated - original
+    dilated = binary_dilation(coarse_binary, structure=struct, iterations=band_width // 2)
+    # Inner boundary: original - eroded
+    eroded = binary_erosion(coarse_binary, structure=struct, iterations=band_width // 2)
+
+    # Boundary band = dilated AND NOT eroded = region within band_width of boundary
+    boundary_band = dilated.astype(np.float32) - eroded.astype(np.float32)
+    boundary_band = np.clip(boundary_band, 0, 1)
+
+    # Interior region (definitely inside, far from boundary)
+    interior = eroded.astype(np.float32)
+
+    # Exterior region (definitely outside, far from boundary)
+    exterior = 1.0 - dilated.astype(np.float32)
+
+    # Fuse: interior from coarse, exterior from coarse, boundary from refined
+    # fused = interior * coarse + exterior * (1 - coarse) + boundary * refined
+    # Simplified: fused = coarse * (1 - boundary_band) + refined * boundary_band
+    fused_np = coarse_np * (1 - boundary_band) + refined_np * boundary_band
+
+    # Convert back to tensor if input was tensor
+    if is_tensor:
+        fused_mask = torch.from_numpy(fused_np).float().to(device)
+    else:
+        fused_mask = fused_np
+
+    return fused_mask
+
+
+def apply_stabilization(coarse_mask, refined_mask,
+                        use_rejection=False, use_boundary_fusion=False,
+                        rejection_params=None, fusion_params=None):
+    """Apply inference-time stabilization to refined predictions.
+
+    Args:
+        coarse_mask: Coarse prediction (B, H, W) or (H, W)
+        refined_mask: Refined prediction (B, H, W) or (H, W)
+        use_rejection: Whether to apply rejection rules
+        use_boundary_fusion: Whether to apply boundary-band fusion
+        rejection_params: Dict with rejection rule parameters
+        fusion_params: Dict with boundary fusion parameters
+
+    Returns:
+        stabilized_mask: Stabilized refined prediction
+        stats: Dict with stabilization statistics
+    """
+    if rejection_params is None:
+        rejection_params = {}
+    if fusion_params is None:
+        fusion_params = {}
+
+    # Handle batched input
+    if coarse_mask.dim() == 3:
+        batch_size = coarse_mask.shape[0]
+        stabilized = []
+        total_rejected = 0
+        reject_reasons = []
+
+        for i in range(batch_size):
+            coarse_i = coarse_mask[i]
+            refined_i = refined_mask[i]
+
+            # Apply rejection rules first
+            if use_rejection:
+                refined_i, rejected, reason = apply_rejection_rules(
+                    coarse_i, refined_i, **rejection_params
+                )
+                if rejected:
+                    total_rejected += 1
+                    reject_reasons.append(reason)
+
+            # Apply boundary fusion (only if not rejected or always)
+            if use_boundary_fusion:
+                refined_i = apply_boundary_fusion(
+                    coarse_i, refined_i, **fusion_params
+                )
+
+            stabilized.append(refined_i)
+
+        # Stack back to batch
+        if torch.is_tensor(stabilized[0]):
+            stabilized_mask = torch.stack(stabilized, dim=0)
+        else:
+            stabilized_mask = np.stack(stabilized, axis=0)
+
+        stats = {
+            'rejected_count': total_rejected,
+            'rejected_ratio': total_rejected / batch_size,
+            'reject_reasons': reject_reasons
+        }
+    else:
+        # Single sample
+        stabilized_mask = refined_mask
+        stats = {'rejected_count': 0, 'rejected_ratio': 0.0, 'reject_reasons': []}
+
+        if use_rejection:
+            stabilized_mask, rejected, reason = apply_rejection_rules(
+                coarse_mask, stabilized_mask, **rejection_params
+            )
+            if rejected:
+                stats['rejected_count'] = 1
+                stats['rejected_ratio'] = 1.0
+                stats['reject_reasons'] = [reason]
+
+        if use_boundary_fusion:
+            stabilized_mask = apply_boundary_fusion(
+                coarse_mask, stabilized_mask, **fusion_params
+            )
+
+    return stabilized_mask, stats
+
+
+# ============================================================================
+# Visualization Functions
+# ============================================================================
 
 def visualize_sample(image, label, coarse_pred, refined_pred,
                      coarse_dice, refined_dice, sample_idx,
@@ -363,7 +631,9 @@ def visualize_summary(results_list, output_dir, dataset_name):
 
 def evaluate_dataset(model, dataloader, device, refined_eval_size=224, use_gated=False,
                      visualize=False, num_visualize=10, visualize_best_worst=False,
-                     output_dir=None, dataset_name=None):
+                     output_dir=None, dataset_name=None,
+                     use_rejection=False, rejection_params=None,
+                     use_boundary_fusion=False, fusion_params=None):
     """Evaluate model on a dataset.
 
     Returns:
@@ -377,6 +647,10 @@ def evaluate_dataset(model, dataloader, device, refined_eval_size=224, use_gated
     # For visualization
     vis_data = []  # Store (image, label, coarse, refined, coarse_dice, refined_dice, idx)
     sample_idx = 0
+
+    # Stabilization statistics
+    total_rejected = 0
+    total_samples = 0
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc='Evaluating', leave=False):
@@ -393,6 +667,18 @@ def evaluate_dataset(model, dataloader, device, refined_eval_size=224, use_gated
                 refined_pred = outputs['refined_mask']  # Already probabilities
             else:
                 refined_pred = torch.sigmoid(outputs['refined_mask'])  # (B, H, W)
+
+            # Apply inference-time stabilization if enabled
+            if use_rejection or use_boundary_fusion:
+                refined_pred, stab_stats = apply_stabilization(
+                    coarse_pred, refined_pred,
+                    use_rejection=use_rejection,
+                    use_boundary_fusion=use_boundary_fusion,
+                    rejection_params=rejection_params,
+                    fusion_params=fusion_params
+                )
+                total_rejected += stab_stats['rejected_count']
+                total_samples += coarse_pred.shape[0]
 
             # Coarse: evaluate at 224x224 (TransUNet native resolution)
             # Refined: evaluate at refined_eval_size
@@ -505,11 +791,22 @@ def evaluate_dataset(model, dataloader, device, refined_eval_size=224, use_gated
                         for d in vis_data]
         visualize_summary(results_list, output_dir, dataset_name)
 
-    return {
+    result = {
         'coarse': avg_coarse,
         'refined': avg_refined,
         'n_samples': len(dataloader.dataset)
     }
+
+    # Add stabilization stats if enabled
+    if use_rejection or use_boundary_fusion:
+        result['stabilization'] = {
+            'rejected_count': total_rejected,
+            'rejected_ratio': total_rejected / max(1, total_samples),
+            'use_rejection': use_rejection,
+            'use_boundary_fusion': use_boundary_fusion,
+        }
+
+    return result
 
 
 def print_results_table(results, datasets):
@@ -609,6 +906,17 @@ def main():
     print(f"\nEvaluating on datasets: {args.datasets}")
     print(f"Refined evaluation size: {args.refined_eval_size}")
 
+    # Print stabilization settings
+    if args.use_rejection_rules:
+        print(f"\nRejection rules ENABLED:")
+        print(f"  IoU threshold: {args.reject_iou_threshold}")
+        print(f"  Area ratio range: [{args.reject_area_ratio_min}, {args.reject_area_ratio_max}]")
+        print(f"  Max components: {args.reject_max_components}")
+
+    if args.use_boundary_fusion:
+        print(f"\nBoundary-band fusion ENABLED:")
+        print(f"  Band width: {args.boundary_band_width} pixels")
+
     # Load checkpoint
     print(f"\nLoading checkpoint: {args.checkpoint}")
     checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
@@ -689,6 +997,17 @@ def main():
             print(f"  Error loading dataset: {e}, skipping...")
             continue
 
+        # Prepare stabilization parameters
+        rejection_params = {
+            'iou_threshold': args.reject_iou_threshold,
+            'area_ratio_min': args.reject_area_ratio_min,
+            'area_ratio_max': args.reject_area_ratio_max,
+            'max_components': args.reject_max_components,
+        }
+        fusion_params = {
+            'band_width': args.boundary_band_width,
+        }
+
         # Evaluate
         dataset_results = evaluate_dataset(
             model, dataloader, device,
@@ -698,15 +1017,25 @@ def main():
             num_visualize=args.num_visualize,
             visualize_best_worst=args.visualize_best_worst,
             output_dir=args.output_dir,
-            dataset_name=dataset_name
+            dataset_name=dataset_name,
+            use_rejection=args.use_rejection_rules,
+            rejection_params=rejection_params,
+            use_boundary_fusion=args.use_boundary_fusion,
+            fusion_params=fusion_params
         )
         results[dataset_name] = dataset_results
 
         # Print quick summary
         c = dataset_results['coarse']
         f = dataset_results['refined']
-        print(f"  Coarse Dice: {c['dice']:.4f}, Refined Dice: {f['dice']:.4f} "
-              f"(improvement: {f['dice'] - c['dice']:+.4f})")
+        summary_str = f"  Coarse Dice: {c['dice']:.4f}, Refined Dice: {f['dice']:.4f} (improvement: {f['dice'] - c['dice']:+.4f})"
+
+        # Print stabilization stats if enabled
+        if 'stabilization' in dataset_results:
+            stab = dataset_results['stabilization']
+            summary_str += f"\n  Stabilization: rejected {stab['rejected_count']}/{dataset_results['n_samples']} ({stab['rejected_ratio']*100:.1f}%)"
+
+        print(summary_str)
 
     # Print final results table
     summary = print_results_table(results, args.datasets)
