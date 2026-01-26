@@ -1,131 +1,318 @@
-# UltraRefiner: End-to-End Differentiable Segmentation Refinement
+# UltraRefiner: End-to-End Differentiable Segmentation Refinement with Gradient-Coupled Foundation Models
 
 ## Abstract
 
-Medical image segmentation, particularly for breast lesions in ultrasound, remains challenging due to low contrast, speckle noise, and ambiguous boundaries. While deep learning methods like TransUNet achieve reasonable performance, they often produce masks with imprecise boundaries, topological errors, or complete failures on difficult cases. The Segment Anything Model (SAM) offers powerful refinement capabilities but requires carefully designed prompts and cannot be trained end-to-end with upstream segmentation networks.
+Medical image segmentation remains a fundamental challenge in computer-aided diagnosis, particularly for breast lesion segmentation in ultrasound imaging where low contrast, speckle noise, ill-defined boundaries, and heterogeneous tumor morphology create significant obstacles. While deep learning architectures such as TransUNet (combining CNN locality with Vision Transformer global attention) achieve reasonable segmentation performance, they frequently produce masks with imprecise boundaries, topological errors (holes, bridges, fragmentation), and catastrophic failures on ambiguous cases. The Segment Anything Model (SAM), trained on over 1 billion masks, offers powerful zero-shot segmentation and refinement capabilities through its prompt-based architecture. However, SAM cannot be naively integrated into a segmentation pipeline because: (1) it requires carefully designed prompts (points, boxes, masks) that must be extracted from upstream predictions, and (2) standard prompt extraction methods (argmax, thresholding) are non-differentiable, preventing end-to-end optimization.
 
-**UltraRefiner** addresses these limitations by introducing a **fully differentiable pipeline** that connects a coarse segmentation network (TransUNet) with SAM for mask refinement. The key innovation is that **gradients flow from SAM's output back through the prompt generation to TransUNet**, enabling joint optimization of both networks. This is achieved through three differentiable prompt extraction mechanisms:
+**UltraRefiner** addresses these fundamental limitations by introducing a **fully differentiable two-stage segmentation refinement framework** that enables gradient flow from the final refined output through SAM's prompt encoding back to the coarse segmentation network. This end-to-end differentiability allows joint optimization of both networks, where TransUNet learns to produce outputs that are optimally suited for SAM refinement, while SAM learns to correct the specific failure modes of the upstream network.
 
-1. **Point Prompts via Soft-Argmax**: The foreground centroid is computed as a probability-weighted average of coordinates, and a background point is extracted from the inverse mask within the bounding box region.
+### Core Technical Contributions
 
-2. **Box Prompts via Weighted Statistics**: Bounding boxes are computed using the mask-weighted mean and standard deviation of coordinates (center ± 2.5σ), ensuring the box tightly covers the predicted region.
+#### 1. Differentiable Prompt Extraction from Soft Probability Masks
 
-3. **Mask Prompts via Direct/Gaussian Conversion**: The soft probability mask is converted to logit space and optionally smoothed with Gaussian blur to match SAM's expected input distribution.
+The key innovation enabling end-to-end training is a suite of **fully differentiable prompt extraction mechanisms** that operate on soft probability masks (continuous values in [0,1]) rather than binary predictions:
+
+**Point Prompts via Soft-Argmax**: The foreground centroid is computed as a probability-weighted spatial expectation:
+```
+x_fg = Σ(P(i,j) × x_j) / Σ(P(i,j))
+y_fg = Σ(P(i,j) × y_i) / Σ(P(i,j))
+```
+where P(i,j) is the soft mask probability at location (i,j). The background point is extracted from the inverse mask within the predicted bounding box region, ensuring it lies in a contextually relevant area. Gradients flow through these weighted averages: ∂center/∂mask = (coord - center) / mask_sum.
+
+**Box Prompts via Weighted Statistics**: Bounding boxes are computed using mask-weighted coordinate statistics rather than hard thresholding:
+```
+center = Σ(P × coord) / Σ(P)
+std = √(Σ(P × (coord - center)²) / Σ(P))
+box = [center - 2.5×std, center + 2.5×std]
+```
+The 2.5σ coverage ensures ~99% of the predicted region is enclosed. This weighted approach correctly restricts computation to high-probability regions, unlike soft-min/max methods that can be dominated by low-probability background pixels.
+
+**Mask Prompts via Adaptive Conversion**: Soft probability masks are converted to SAM's expected logit format through two strategies:
+- **Direct style** (for Phase 2-finetuned SAM): `logits = (P × 2 - 1) × 10`, mapping [0,1] → [-10,+10]
+- **Gaussian style** (for unfinetuned SAM): Apply adaptive Gaussian blur before conversion to create softer boundaries that match SAM's training distribution
+
+#### 2. Three-Phase Curriculum Training Strategy
+
+UltraRefiner employs a carefully designed **three-phase training curriculum** that progressively builds the joint system:
+
+**Phase 1 - Coarse Network Training**: TransUNet is trained independently using standard segmentation losses (Cross-Entropy + Dice) with K-fold cross-validation. This establishes a strong baseline and produces the characteristic failure modes that Phase 2 must address.
+
+**Phase 2 - SAM Distribution Alignment**: This critical phase bridges the distribution gap between TransUNet's soft probability outputs and SAM's training distribution (binary masks with sharp boundaries). A novel **mask augmentation system** with **12 primary error types** simulates realistic TransUNet failure patterns:
+
+| Error Type | Description | Purpose |
+|------------|-------------|---------|
+| Over-segmentation (1.2x-20x) | Morphological dilation | Teach boundary contraction |
+| Under-segmentation (0.4x-0.9x) | Morphological erosion | Teach boundary expansion |
+| Missing chunks (5-30%) | Wedge/blob cutouts | Teach region completion |
+| Internal holes (2-20% each) | Random interior voids | Teach hole filling |
+| Bridge/adhesion artifacts | Thin connecting bands | Teach artifact removal |
+| False positive islands | Scattered spurious blobs | Teach false positive suppression |
+| Fragmentation | Cuts through mask | Teach fragment merging |
+| Spatial shift (5-30%) | Translation errors | Teach location correction |
+| Empty/noise predictions | Complete failures | Teach recovery from catastrophic errors |
+
+Each augmented mask undergoes **soft mask conversion** using signed distance transform with random temperature sampling:
+```
+signed_dist = distance_inside - distance_outside
+P(x) = sigmoid(signed_dist(x) / temperature)
+```
+where temperature ∈ [2.0, 8.0] controls boundary sharpness, matching TransUNet's output characteristics.
+
+**Phase 2 Quality-Aware Loss**: A novel loss function prevents SAM from "correcting" regions that the coarse mask already got right:
+```
+L = L_BCE + L_Dice + λ × L_change_penalty
+L_change_penalty = ||SAM_output - coarse||² × I(coarse == GT)
+```
+where I(·) indicates correct prediction regions. This teaches SAM to preserve high-quality inputs while aggressively refining erroneous regions.
+
+**Phase 3 - End-to-End Joint Optimization**: Both networks are trained jointly with gradients flowing from the refined loss through differentiable prompts to TransUNet. Critical protection mechanisms prevent TransUNet degradation:
+- **Gradient scaling**: Scale gradients to TransUNet by factor α ∈ [0.01, 0.1]
+- **Weight regularization**: L2 penalty anchoring weights to Phase 1: `L_reg = β||W - W_phase1||²`
+- **Two-stage unfreezing**: Optionally freeze TransUNet for initial epochs while SAM adapts
+- **Dual loss supervision**: `L = λ_coarse × L(TransUNet) + λ_refined × L(SAM)` with λ_coarse > λ_refined
+
+#### 3. Differentiable ROI Cropping for Resolution Enhancement
+
+A **fully differentiable ROI cropping module** focuses SAM computation on the lesion region at maximum resolution:
+
+1. **Soft box extraction**: Compute weighted bounding box from coarse mask (center ± 2.5σ)
+2. **Context expansion**: Expand box by configurable ratio (default 20%) for surrounding context
+3. **Differentiable crop**: Use `F.grid_sample` with bilinear interpolation (preserves gradients)
+4. **Resolution upscaling**: Resize cropped ROI to 1024×1024 (SAM's native resolution)
+5. **SAM refinement**: Process at full resolution for maximum boundary detail
+6. **Differentiable paste-back**: Inverse `grid_sample` to restore refined mask to original coordinates
+
+This pipeline is fully differentiable, allowing gradients to flow through crop coordinates back to the coarse mask. The key benefit is that lesions (often small relative to the full image) are processed at 4-16× effective resolution compared to whole-image processing.
+
+#### 4. Gated Residual Refinement (Alternative Architecture)
+
+For scenarios where Phase 2 finetuning is impractical, UltraRefiner offers a **gated residual refinement** architecture that constrains SAM to act as a controlled error corrector:
+
+```
+final = coarse + gate × (SAM - coarse)
+      = (1 - gate) × coarse + gate × SAM
+```
+
+The gate is computed from **coarse mask uncertainty**:
+```
+confidence = |2 × coarse - 1|  ∈ [0, 1]
+uncertainty = 1 - confidence^γ
+gate = gate_min + (gate_max - gate_min) × uncertainty
+```
+
+When coarse ≈ 0.5 (uncertain), gate → gate_max, trusting SAM's correction. When coarse ≈ 0 or 1 (confident), gate → gate_min, preserving the original prediction. This architecture prevents unfinetuned SAM from degrading accurate predictions while still allowing targeted corrections in ambiguous regions.
+
+Three gate variants are supported:
+- **Uncertainty gate**: No learnable parameters, based purely on coarse confidence
+- **Learned gate**: Small CNN (3 conv layers, ~3K params) predicts correction regions
+- **Hybrid gate**: Product of uncertainty and learned gates
+
+#### 5. Model Architecture Details
+
+**TransUNet Backbone** (Coarse Segmentation):
+- **Encoder**: ResNet50 (pretrained) → 12-layer ViT-B/16 transformer
+- **Decoder**: Progressive upsampling with skip connections from ResNet stages
+- **Input**: 224×224 grayscale/RGB images
+- **Output**: 2-channel logits (background, foreground) → softmax → soft probability mask
+
+**SAM Refiner** (Fine Segmentation):
+- **Image Encoder**: ViT-B/16 or ViT-H (typically frozen to preserve pretrained representations)
+- **Prompt Encoder**: Learnable embeddings for points, boxes, masks (trainable in Phases 2-3)
+- **Mask Decoder**: Transformer-based decoder with IoU prediction head (trainable)
+- **Multi-mask output**: 3 candidate masks with IoU scores, combined via soft IoU-weighted selection:
+  ```
+  weights = softmax(IoU_predictions / τ)
+  refined = Σ(mask_i × weight_i)
+  ```
+
+**End-to-End Pipeline**:
+```
+Image (224×224)
+  → TransUNet → Coarse Mask (soft, 224×224)
+  → Upscale to 1024×1024
+  → [Optional: ROI Crop]
+  → Extract Points, Box, Mask (differentiable)
+  → SAM Prompt Encoder
+  → SAM Image Encoder (may be cached)
+  → SAM Mask Decoder
+  → Multi-mask selection (soft IoU-weighted)
+  → [Optional: ROI Paste-back]
+  → Refined Mask (1024×1024 or 224×224)
+```
+
+#### 6. Loss Functions
+
+**Phase 1** (TransUNet only):
+```
+L = 0.5 × CrossEntropy(logits, GT) + 0.5 × Dice(softmax(logits), GT)
+```
+
+**Phase 2** (SAM finetuning with quality-aware loss):
+```
+L = BCE(σ(SAM), GT) + Dice(σ(SAM), GT) + λ × ChangePenalty
+ChangePenalty = mean(|σ(SAM) - coarse| × I(coarse_binary == GT))
+```
+
+**Phase 3** (End-to-end):
+```
+L = λ_c × L_coarse(TransUNet, GT) + λ_r × L_refined(SAM, GT) + λ_w × ||W - W_phase1||²
+```
+Default: λ_c = 0.5-0.8, λ_r = 0.2-0.5, λ_w = 0.01-0.1
+
+#### 7. Data Pipeline Optimizations
+
+**Offline Augmentation** (Recommended): Pre-generate augmented masks to eliminate CPU bottleneck:
+- 5× data multiplier per original sample
+- Metadata.json for O(1) sample indexing (no directory scanning)
+- File copying (not symlinks) for fast I/O on network filesystems
+- Mixed precision (AMP) for 2-4× training speedup
+
+**Hybrid Training**: Combine real TransUNet predictions with augmented GT:
+- Out-of-fold prediction strategy (each fold's model predicts on its validation set)
+- Configurable mixing ratio (e.g., 70% real, 30% augmented)
+- Captures actual failure modes while maintaining diversity
+
+### Summary
+
+UltraRefiner represents a principled approach to integrating foundation models (SAM) with task-specific networks (TransUNet) in a fully differentiable manner. The key innovations are:
+
+1. **Differentiable prompt extraction** enabling gradient flow through soft-argmax points, weighted-statistics boxes, and direct/Gaussian mask conversion
+2. **Three-phase curriculum** progressively building from independent training to distribution alignment to joint optimization
+3. **12-type mask augmentation** comprehensively simulating coarse network failure modes with soft mask conversion
+4. **Quality-aware loss** teaching SAM to selectively refine while preserving accurate predictions
+5. **Differentiable ROI cropping** for resolution-enhanced lesion processing
+6. **Gated residual refinement** constraining corrections to uncertain regions
+7. **TransUNet protection mechanisms** preventing performance degradation during end-to-end training
+
+The framework is designed for medical image segmentation but generalizes to any domain requiring refinement of coarse segmentation predictions.
+
+---
 
 ## Architecture
 
 ```
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                    UltraRefiner Pipeline (with ROI Cropping)                   │
-├───────────────────────────────────────────────────────────────────────────────┤
-│                                                                                │
-│   Input Image (224×224)                                                        │
-│         │                                                                      │
-│         ▼                                                                      │
-│   ┌─────────────────────────────────────────────────────────────────────┐     │
-│   │                         TransUNet                                    │     │
-│   │     ResNet50 ──► ViT-B/16 Transformer ──► CNN Decoder + Skip        │     │
-│   └─────────────────────────────┬───────────────────────────────────────┘     │
-│                                 │                                              │
-│                                 ▼                                              │
-│                    Coarse Mask (Soft Probability)                              │
-│                          P(lesion) ∈ [0, 1]                                    │
-│                                 │                                              │
-│              ┌──────────────────┼──────────────────┐                          │
-│              │                  │                  │                           │
-│              ▼                  ▼                  ▼                           │
-│        ┌──────────┐      ┌───────────┐      ┌──────────┐                      │
-│        │  Points  │      │    Box    │      │   Mask   │                      │
-│        │ soft-    │      │ weighted  │      │  direct  │                      │
-│        │ argmax   │      │ mean±std  │      │ (logits) │                      │
-│        └────┬─────┘      └─────┬─────┘      └────┬─────┘                      │
-│             │                  │                  │                            │
-│             └──────────────────┼──────────────────┘                           │
-│                                │                                               │
-│   ┌────────────────────────────┼────────────────────────────────────────┐     │
-│   │              Differentiable ROI Cropper (Default)                    │     │
-│   ├──────────────────────────────────────────────────────────────────────┤     │
-│   │                                                                      │     │
-│   │   1. Compute soft bounding box from mask (center ± 2.5σ)            │     │
-│   │   2. Expand box by 20% (roi_expand_ratio=0.2)                       │     │
-│   │   3. Crop image & mask via grid_sample (differentiable)             │     │
-│   │   4. Resize ROI to 1024×1024 (full SAM resolution)                  │     │
-│   │                                                                      │     │
-│   │         ┌─────────────────────────────────────┐                     │     │
-│   │         │   ROI Region at 1024×1024           │                     │     │
-│   │         │   ┌───────────────────────────┐     │                     │     │
-│   │         │   │  Lesion at full resolution │     │                     │     │
-│   │         │   │  (higher detail for SAM)   │     │                     │     │
-│   │         │   └───────────────────────────┘     │                     │     │
-│   │         └─────────────────────────────────────┘                     │     │
-│   │                                                                      │     │
-│   └──────────────────────────────┬───────────────────────────────────────┘     │
-│                                  │                                             │
-│                                  ▼                                             │
-│   ┌─────────────────────────────────────────────────────────────────────┐     │
-│   │                        SAM Refiner                                   │     │
-│   │     Image Encoder ──► Prompt Encoder ──► Mask Decoder               │     │
-│   │       (frozen)         (trainable)        (trainable)               │     │
-│   └─────────────────────────────┬───────────────────────────────────────┘     │
-│                                 │                                              │
-│                                 ▼                                              │
-│                     Refined Mask (ROI space)                                   │
-│                                 │                                              │
-│   ┌─────────────────────────────┼───────────────────────────────────────┐     │
-│   │              Differentiable Paste Back                               │     │
-│   │   grid_sample inverse: ROI mask → Original image space              │     │
-│   └─────────────────────────────┬───────────────────────────────────────┘     │
-│                                 │                                              │
-│                                 ▼                                              │
-│                         Final Refined Mask                                     │
-│                                                                                │
-│   ◄─── Gradient Flow: L_refined → Paste → SAM → Crop → Prompts → TransUNet    │
-│                                                                                │
-└───────────────────────────────────────────────────────────────────────────────┘
++-----------------------------------------------------------------------------+
+|                    UltraRefiner Pipeline (with ROI Cropping)                 |
++-----------------------------------------------------------------------------+
+|                                                                              |
+|   Input Image (224x224)                                                      |
+|         |                                                                    |
+|         v                                                                    |
+|   +-------------------------------------------------------------------+     |
+|   |                         TransUNet                                  |     |
+|   |     ResNet50 --> ViT-B/16 Transformer --> CNN Decoder + Skip       |     |
+|   +-----------------------------+-----------------------------------------+  |
+|                                 |                                            |
+|                                 v                                            |
+|                    Coarse Mask (Soft Probability)                            |
+|                          P(lesion) in [0, 1]                                 |
+|                                 |                                            |
+|              +------------------+------------------+                         |
+|              |                  |                  |                         |
+|              v                  v                  v                         |
+|        +----------+      +-----------+      +----------+                    |
+|        |  Points  |      |    Box    |      |   Mask   |                    |
+|        | soft-    |      | weighted  |      |  direct  |                    |
+|        | argmax   |      | mean+std  |      | (logits) |                    |
+|        +----+-----+      +-----+-----+      +----+-----+                    |
+|             |                  |                  |                          |
+|             +------------------+------------------+                          |
+|                                |                                             |
+|   +----------------------------+----------------------------+               |
+|   |              Differentiable ROI Cropper (Default)       |               |
+|   +----------------------------+----------------------------+               |
+|   |                                                         |               |
+|   |   1. Compute soft bounding box from mask (center + 2.5s)|               |
+|   |   2. Expand box by 20% (roi_expand_ratio=0.2)           |               |
+|   |   3. Crop image & mask via grid_sample (differentiable) |               |
+|   |   4. Resize ROI to 1024x1024 (full SAM resolution)      |               |
+|   |                                                         |               |
+|   +----------------------------+----------------------------+               |
+|                                |                                             |
+|                                v                                             |
+|   +-------------------------------------------------------------------+     |
+|   |                        SAM Refiner                                 |     |
+|   |     Image Encoder --> Prompt Encoder --> Mask Decoder              |     |
+|   |       (frozen)         (trainable)        (trainable)              |     |
+|   +-----------------------------+-------------------------------------+     |
+|                                 |                                            |
+|                                 v                                            |
+|                     Refined Mask (ROI space)                                 |
+|                                 |                                            |
+|   +----------------------------+----------------------------+               |
+|   |              Differentiable Paste Back                  |               |
+|   |   grid_sample inverse: ROI mask -> Original image space |               |
+|   +----------------------------+----------------------------+               |
+|                                 |                                            |
+|                                 v                                            |
+|                         Final Refined Mask                                   |
+|                                                                              |
+|   <--- Gradient Flow: L_refined -> Paste -> SAM -> Crop -> Prompts -> TU    |
+|                                                                              |
++-----------------------------------------------------------------------------+
 ```
 
-### Why ROI Cropping is Default
+### Gated Residual Refinement Architecture
 
-ROI cropping provides several advantages:
-1. **Higher effective resolution**: The lesion region is processed at full 1024×1024 SAM resolution
-2. **Better boundary refinement**: SAM sees more detail in the lesion area
-3. **Fully differentiable**: Both crop and paste-back use `grid_sample` for gradient flow
-4. **Consistent training**: Both Phase 2 and Phase 3 use the same ROI pipeline
+```
++---------------------------------------------------------------------+
+|                      Gated Residual Refinement                       |
++---------------------------------------------------------------------+
+|                                                                      |
+|   coarse_mask (from TransUNet)                                       |
+|        |                                                             |
+|        +-------------------+                                         |
+|        |                   |                                         |
+|        v                   v                                         |
+|   +---------+       +--------------+                                |
+|   |   SAM   |       | Uncertainty  |                                |
+|   | Refiner |       |    Gate      |                                |
+|   +----+----+       | 1-|2p-1|^g   |                                |
+|        |            +------+-------+                                |
+|        v                   |                                         |
+|   sam_output               |                                         |
+|        |                   |                                         |
+|        +----------+--------+                                         |
+|                   |                                                  |
+|                   v                                                  |
+|   +-------------------------------------------------------+         |
+|   |  final = coarse + gate x (sam_output - coarse)        |         |
+|   |                                                        |         |
+|   |  gate ~ 0 (confident): final ~ coarse (preserve)       |         |
+|   |  gate ~ 1 (uncertain): final ~ sam    (correct)        |         |
+|   +-------------------------------------------------------+         |
+|                                                                      |
++---------------------------------------------------------------------+
+```
+
+---
 
 ## Training Pipeline
 
-The training follows a **three-phase strategy**:
-
 ### Phase 1: TransUNet Training
 
-Train coarse segmentation independently on each dataset with 5-fold cross-validation.
+Train coarse segmentation independently with 5-fold cross-validation.
 
 ```bash
 python scripts/train_transunet.py \
     --data_root ./dataset/processed \
-    --dataset BUSI \
+    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
     --fold 0 \
     --vit_pretrained ./pretrained/R50+ViT-B_16.npz \
+    --img_size 224 \
+    --batch_size 24 \
     --max_epochs 150
 ```
 
 ---
 
-### Phase 2: SAM Finetuning (Critical for Phase 3 Alignment)
+### Phase 2: SAM Finetuning (Distribution Alignment)
 
-Phase 2 prepares SAM to work with TransUNet's output distribution. **The key is ensuring Phase 2 sees the SAME input distribution as Phase 3.**
+Phase 2 is **critical** for aligning SAM with TransUNet's output distribution.
 
-#### Why Phase 2 Matters
+#### Option A: Offline Augmentation (RECOMMENDED)
 
-In Phase 3, TransUNet produces **soft probability masks** (values in [0,1] with smooth boundaries). If SAM was only trained on binary masks, it will struggle with soft inputs. Phase 2 bridges this gap by:
-
-1. **Generating soft masks** that mimic TransUNet's output distribution
-2. **Simulating the resolution path** (224→1024) that occurs in Phase 3
-3. **Teaching SAM when to refine and when to preserve** via quality-aware loss
-
-#### Option A: Offline Augmentation (RECOMMENDED - Fast Training)
-
-Pre-generate augmented masks for fast training without CPU bottleneck:
+Pre-generate augmented masks for fast, reproducible training:
 
 **Step 1: Generate Augmented Masks**
 ```bash
@@ -135,99 +322,128 @@ python scripts/generate_augmented_masks.py \
     --output_dir ./dataset/augmented_masks \
     --num_augmentations 5 \
     --augmentor_preset default \
-    --use_fast_soft_mask \
     --num_workers 16
 ```
 
-This creates 5 augmented versions per sample, applying the 12 error types with soft mask conversion.
-
-**Step 2: Train SAM with Offline Data**
+**Step 2: Train SAM**
 ```bash
 python scripts/finetune_sam_offline.py \
     --data_root ./dataset/augmented_masks \
     --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
     --sam_checkpoint ./pretrained/sam_vit_b_01ec64.pth \
     --output_dir ./checkpoints/sam_finetuned \
-    --mask_prompt_style direct --transunet_img_size 224 \
-    --use_roi_crop --roi_expand_ratio 0.3 \
-    --use_amp --batch_size 4 \
+    --mask_prompt_style direct \
+    --transunet_img_size 224 \
+    --use_roi_crop \
+    --roi_expand_ratio 0.3 \
+    --use_amp \
+    --batch_size 4 \
     --epochs 100
 ```
 
-**Optional: Mix with Real TransUNet Predictions**
+#### Option B: Hybrid Training (Real + Augmented)
+
+Mix real TransUNet predictions with augmented GT:
+
 ```bash
-# First generate TransUNet predictions (see Option B below)
-# Then train with both real and augmented data
+# Step 1: Generate out-of-fold predictions
+python scripts/generate_transunet_predictions.py \
+    --data_root ./dataset/processed \
+    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
+    --checkpoint_dir ./checkpoints/transunet \
+    --output_dir ./dataset/transunet_preds
+
+# Step 2: Train with hybrid data
 python scripts/finetune_sam_offline.py \
     --data_root ./dataset/augmented_masks \
     --pred_data_root ./dataset/transunet_preds \
-    --real_ratio 0.3 \
+    --real_ratio 0.7 \
     --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
     --sam_checkpoint ./pretrained/sam_vit_b_01ec64.pth \
-    --output_dir ./checkpoints/sam_finetuned \
-    --mask_prompt_style direct --transunet_img_size 224 \
-    --use_roi_crop --roi_expand_ratio 0.3 \
-    --use_amp --batch_size 4 \
+    --output_dir ./checkpoints/sam_finetuned_hybrid \
+    --mask_prompt_style direct \
+    --transunet_img_size 224 \
+    --use_roi_crop \
+    --roi_expand_ratio 0.3 \
+    --use_amp \
+    --batch_size 4 \
     --epochs 100
 ```
 
 | `--real_ratio` | Meaning |
 |----------------|---------|
-| `0.0` | 100% offline augmented (default) |
-| `0.3` | 30% real TransUNet predictions, 70% augmented |
+| `0.0` | 100% augmented (default) |
+| `0.7` | 70% real TransUNet predictions, 30% augmented |
 | `0.5` | 50% each |
-
-**Benefits of offline augmentation:**
-- No CPU bottleneck during training (augmentation already done)
-- GPU stays 100% utilized
-- Reproducible (same augmentations each run)
-- 5x data multiplier with `--num_augmentations 5`
 
 ---
 
-#### Option B: Online Augmentation (Slower but No Pre-generation)
+### Phase 3: End-to-End Training
 
-The **online augmentation system** applies mask augmentation on-the-fly during training:
+Joint optimization with gradient flow through differentiable prompts.
 
 ```bash
-python scripts/finetune_sam_online.py \
+python scripts/train_e2e.py \
     --data_root ./dataset/processed \
     --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
-    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
-    --output_dir ./checkpoints/sam_finetuned \
-    --augmentor_preset default \
+    --transunet_checkpoint ./checkpoints/transunet/combined/fold_0/best.pth \
+    --sam_checkpoint ./checkpoints/sam_finetuned/best_sam.pth \
+    --fold 0 \
+    --n_splits 5 \
     --mask_prompt_style direct \
-    --transunet_img_size 224 \
     --use_roi_crop \
-    --roi_expand_ratio 0.2 \
-    --epochs 50 \
-    --batch_size 4
+    --roi_expand_ratio 0.3 \
+    --batch_size 4 \
+    --max_epochs 100 \
+    --transunet_lr 1e-5 \
+    --sam_lr 1e-5 \
+    --coarse_loss_weight 0.5 \
+    --refined_loss_weight 0.5 \
+    --transunet_grad_scale 0.1 \
+    --transunet_weight_reg 0.01 \
+    --output_dir ./checkpoints/ultra_refiner
 ```
 
-**Benefits of online augmentation:**
-- No disk storage required for augmented masks
-- New augmentation every epoch (unlimited diversity)
-- 12 primary error types simulating TransUNet failures
-- Soft mask conversion matching TransUNet output distribution
+#### Critical Phase 2 -> Phase 3 Consistency
 
-**12 Primary Error Types:**
+| Setting | Phase 2 | Phase 3 | Reason |
+|---------|---------|---------|--------|
+| `mask_prompt_style` | `direct` | `direct` | Same mask preprocessing |
+| `transunet_img_size` | `224` | `224` | Same resolution path |
+| `use_roi_crop` | `True` | `True` | Same cropping behavior |
+| `roi_expand_ratio` | `0.3` | `0.3` | Same crop boundaries |
 
-| # | Error Type | Prob | Description |
-|---|------------|------|-------------|
-| 1 | Identity/Near-Perfect | 15% | Preserve good predictions |
+#### TransUNet Protection Options
+
+| Flag | Recommended | Purpose |
+|------|-------------|---------|
+| `--transunet_grad_scale` | `0.1` | Scale gradients from SAM (10%) |
+| `--transunet_weight_reg` | `0.01` | L2 penalty to anchor weights |
+| `--freeze_transunet_epochs` | `5` | Let SAM adapt first |
+| `--coarse_loss_weight` | `0.5-0.8` | Maintain TransUNet quality |
+
+---
+
+## Mask Augmentation System
+
+### 12 Primary Error Types
+
+| # | Error Type | Probability | Description |
+|---|------------|-------------|-------------|
+| 1 | Identity | 15% | Preserve good predictions (0-3px change) |
 | 2 | Over-Segmentation | 17% | 1.2x-3x area expansion |
 | 3 | Giant Over-Segmentation | 10% | 3x-20x area expansion |
 | 4 | Under-Segmentation | 17% | 0.4x-0.9x area shrinkage |
 | 5 | Missing Chunk | 12% | 5-30% wedge/blob cutout |
 | 6 | Internal Holes | 10% | 1-3 holes (2-20% each) |
-| 7 | Bridge/Adhesion | 10% | Thin band + FP blob |
+| 7 | Bridge/Adhesion | 10% | Thin band artifact + FP blob |
 | 8 | False Positive Islands | 17% | 1-30 scattered blobs |
 | 9 | Fragmentation | 10% | 1-5 cuts through mask |
-| 10 | Shift/Wrong Location | 10% | 5-30% translation |
+| 10 | Shift/Location | 10% | 5-30% translation |
 | 11 | Empty Prediction | 4% | Complete miss |
-| 12 | Noise-Only Scatter | 3% | Pure FP noise |
+| 12 | Noise Scatter | 3% | Pure false positive noise |
 
-**Augmentor Presets:**
+### Augmentor Presets
 
 | Preset | Description |
 |--------|-------------|
@@ -237,653 +453,30 @@ python scripts/finetune_sam_online.py \
 | `boundary_focus` | 50% over/under-segmentation |
 | `structural` | 40% holes + missing + fragmentation |
 
-#### Option B: Hybrid Training (Real Predictions + Augmented GT)
-
-This option combines **real TransUNet predictions** with **augmented GT masks** for the best of both worlds:
-- Real predictions capture actual TransUNet failure modes
-- Augmented GT provides additional diversity and edge cases
-
-**Step 1: Generate TransUNet Predictions**
-```bash
-# Generate predictions on all training data
-python scripts/generate_transunet_predictions.py \
-    --data_root ./dataset/processed \
-    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
-    --checkpoint_dir ./checkpoints/transunet \
-    --output_dir ./dataset/transunet_preds \
-    --use_all_folds  # Ensemble all 5 folds for better predictions
-```
-
-This creates:
-```
-./dataset/transunet_preds/
-└── {dataset}/
-    └── train/
-        ├── images/       (symlinks to original)
-        ├── masks/        (symlinks to GT)
-        └── coarse_masks/ (TransUNet soft predictions as .npy)
-```
-
-**Step 2: Train with Hybrid Data**
-```bash
-python scripts/finetune_sam_hybrid.py \
-    --gt_data_root ./dataset/processed \
-    --pred_data_root ./dataset/transunet_preds \
-    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
-    --real_ratio 0.5 \
-    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
-    --output_dir ./checkpoints/sam_finetuned_hybrid \
-    --augmentor_preset default \
-    --mask_prompt_style direct --transunet_img_size 224 \
-    --use_roi_crop --roi_expand_ratio 0.5 \
-    --use_amp --fast_soft_mask \
-    --epochs 300 --batch_size 8
-```
-
-**Key parameter: `--real_ratio`**
-| Value | Meaning |
-|-------|---------|
-| `0.5` | 50% real predictions, 50% augmented GT (balanced) |
-| `0.7` | 70% real, 30% augmented (favor real failures) |
-| `0.3` | 30% real, 70% augmented (favor diversity) |
-
-#### Option C: Pre-generated Augmented Data
-
-Generate synthetic "coarse masks" with controlled failure patterns:
-
-```bash
-python scripts/generate_augmented_data.py \
-    --data_root ./dataset/processed \
-    --output_dir ./dataset/augmented_soft \
-    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
-    --target_samples 100000 \
-    --soft_masks \
-    --use_sdf
-```
-
-**Key flags explained:**
-
-| Flag | Purpose |
-|------|---------|
-| `--soft_masks` | **CRITICAL**: Generates soft probability maps (NPY float) instead of binary masks. These have Gaussian-blurred boundaries matching TransUNet's output distribution. |
-| `--use_sdf` | Uses SDF-based augmentation for smoother, more anatomically plausible deformations |
-| `--target_samples 100000` | Creates 100K augmented samples from your original data |
-
-**Generated data distribution (NO Dice=1.0 perfect masks):**
-- 25% with Dice 0.9-0.99 (minor artifacts, should be preserved)
-- 40% with Dice 0.8-0.9 (moderate errors, needs refinement)
-- 35% with Dice 0.6-0.8 (severe failures, needs strong correction)
-
-#### Step 2.2: Finetune SAM
-
-```bash
-python scripts/finetune_sam_augmented.py \
-    --data_root ./dataset/augmented_soft \
-    --dataset COMBINED \
-    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
-    --output_dir ./checkpoints/sam_finetuned \
-    --mask_prompt_style direct \
-    --transunet_img_size 224 \
-    --use_roi_crop \
-    --roi_expand_ratio 0.2 \
-    --epochs 50 \
-    --batch_size 4 \
-    --lr 1e-4
-```
-
-**Key flags for Phase 3 alignment:**
-
-| Flag | Value | Purpose |
-|------|-------|---------|
-| `--mask_prompt_style` | `direct` | Since soft masks already have smooth boundaries, no extra blur needed. **Must match Phase 3 setting.** |
-| `--transunet_img_size` | `224` | **CRITICAL**: Simulates Phase 3 resolution path. Coarse masks are first resized to 224×224, then upscaled to 1024×1024. This bilinear interpolation creates additional smoothing that Phase 3 naturally has. |
-| `--use_roi_crop` | flag | **DEFAULT**: Enables ROI cropping mode. Crops lesion region and processes at full 1024×1024 resolution. |
-| `--roi_expand_ratio` | `0.2` | Expands bounding box by 20% to include context around lesion. |
-
-**What SAM learns in Phase 2:**
-1. Refine boundaries from soft probability inputs
-2. Fix common segmentation failures (erosion, dilation, holes, bridges)
-3. **Preserve good inputs** - quality-aware loss penalizes changes to high-quality masks
-
-#### Phase 2 Output
-
-Two checkpoints are saved:
-- `best.pth` - Full DifferentiableSAMRefiner state (for resume)
-- `best_sam.pth` - SAM-compatible checkpoint (for Phase 3)
-
 ---
 
-### Phase 3: End-to-End Training
+## Gated Residual Refinement
 
-Joint optimization with gradients flowing through differentiable prompts.
-
-#### Recommended Command (with ROI + TransUNet Protection)
-
-During E2E training with ROI mode, gradients from SAM create stronger coupling and can destabilize TransUNet. Use these protection mechanisms:
-
-```bash
-# RECOMMENDED: Full E2E training with ROI + TransUNet protection
-python scripts/train_e2e.py \
-    --data_root ./dataset/processed \
-    --datasets BUSI \
-    --fold 0 \
-    --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
-    --sam_checkpoint ./checkpoints/sam_finetuned/COMBINED/best_sam.pth \
-    --mask_prompt_style direct \
-    --use_roi_crop \
-    --roi_expand_ratio 0.2 \
-    --max_epochs 100 \
-    --transunet_lr 1e-6 \
-    --sam_lr 1e-5 \
-    --coarse_loss_weight 0.8 \
-    --refined_loss_weight 0.2 \
-    --transunet_grad_scale 0.01 \
-    --transunet_weight_reg 0.1 \
-    --grad_clip 1.0
-```
-
-#### TransUNet Protection Options (Stronger for ROI Mode)
-
-ROI mode creates stronger gradient coupling because the crop coordinates depend on the mask. Use these stronger protection values:
-
-| Flag | ROI Mode | Non-ROI Mode | Purpose |
-|------|----------|--------------|---------|
-| `--transunet_lr` | `1e-6` | `1e-6` | Lower learning rate prevents large weight updates |
-| `--coarse_loss_weight` | `0.8` | `0.7` | Higher weight maintains TransUNet quality |
-| `--refined_loss_weight` | `0.2` | `0.3` | Lower SAM influence on total loss |
-| `--transunet_grad_scale` | `0.01` | `0.1` | Scales gradients from SAM (1% for ROI, 10% for non-ROI) |
-| `--transunet_weight_reg` | `0.1` | `0.01` | L2 penalty anchors weights to Phase 1 checkpoint |
-| `--freeze_transunet_epochs` | `5-10` | `0` | Optional: let SAM adapt first before joint training |
-
-The script automatically:
-1. **Evaluates TransUNet baseline** before training starts
-2. **Compares performance** at each epoch (warns if TransUNet degrades)
-3. **Logs to TensorBoard** for monitoring
-
-#### Basic Command (ROI without protection - NOT recommended)
+For scenarios where Phase 2 is impractical, use gated refinement:
 
 ```bash
 python scripts/train_e2e.py \
     --data_root ./dataset/processed \
-    --datasets BUSI \
-    --fold 0 \
-    --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
-    --sam_checkpoint ./checkpoints/sam_finetuned/COMBINED/best_sam.pth \
-    --mask_prompt_style direct \
-    --use_roi_crop \
-    --roi_expand_ratio 0.2 \
-    --max_epochs 100
-```
-
-**Phase 2 → Phase 3 Consistency Requirements:**
-
-| Setting | Phase 2 | Phase 3 | Why |
-|---------|---------|---------|-----|
-| `mask_prompt_style` | `direct` | `direct` | Same mask preprocessing |
-| Resolution path | 224→1024 | 224→1024 | Same interpolation smoothing |
-| `use_roi_crop` | `True` | `True` | **DEFAULT**: Same cropping behavior |
-| `roi_expand_ratio` | `0.2` | `0.2` | Same crop boundaries |
-
-#### Alternative: Skip Phase 2 (Use Unfinetuned SAM)
-
-If you skip Phase 2, use gaussian style to soften TransUNet's outputs:
-
-```bash
-python scripts/train_e2e.py \
-    --data_root ./dataset/processed \
-    --datasets BUSI \
-    --fold 0 \
-    --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
+    --transunet_checkpoint ./checkpoints/transunet/best.pth \
     --sam_checkpoint ./pretrained/medsam_vit_b.pth \
-    --mask_prompt_style gaussian \
-    --use_roi_crop \
-    --roi_expand_ratio 0.2 \
-    --transunet_grad_scale 0.01 \
-    --transunet_weight_reg 0.1 \
-    --max_epochs 100
-```
-
-This approach matches the SAMRefiner paper configuration (unfinetuned SAM + gaussian + points + box).
-
----
-
-## Gated Residual Refinement (Alternative to Phase 2)
-
-If you want to skip Phase 2 but still get meaningful improvements, use **Gated Residual Refinement**. This constrains SAM to act as a controlled error corrector instead of directly replacing the coarse prediction.
-
-### How It Works
-
-```
-Standard:  final = SAM(coarse)                    # Direct replacement
-Gated:     final = coarse + gate × (SAM - coarse) # Controlled correction
-```
-
-The gate is computed from **coarse mask uncertainty**:
-- When coarse ≈ 0.5 (uncertain): gate ≈ 1 → trust SAM's correction
-- When coarse ≈ 0 or 1 (confident): gate ≈ 0 → preserve coarse prediction
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                      Gated Residual Refinement                       │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│   coarse_mask (from TransUNet)                                       │
-│        │                                                             │
-│        ├───────────────────────┐                                     │
-│        │                       │                                     │
-│        ▼                       ▼                                     │
-│   ┌─────────┐           ┌──────────────┐                            │
-│   │   SAM   │           │ Uncertainty  │                            │
-│   │ Refiner │           │    Gate      │                            │
-│   └────┬────┘           │ 1-|2p-1|^γ   │                            │
-│        │                └──────┬───────┘                            │
-│        ▼                       │                                     │
-│   sam_output                   │                                     │
-│        │                       │                                     │
-│        └───────────┬───────────┘                                     │
-│                    │                                                 │
-│                    ▼                                                 │
-│   ┌─────────────────────────────────────────────────────────────┐   │
-│   │  final = coarse + gate × (sam_output - coarse)              │   │
-│   │                                                              │   │
-│   │  gate ≈ 0 (confident): final ≈ coarse (preserve)            │   │
-│   │  gate ≈ 1 (uncertain): final ≈ sam    (correct)             │   │
-│   └─────────────────────────────────────────────────────────────┘   │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### Command-Line Usage
-
-Enable gated refinement by adding `--use_gated_refinement` flag:
-
-```bash
-# Skip Phase 2 with gated refinement (RECOMMENDED for unfinetuned SAM)
-python scripts/train_e2e.py \
-    --data_root ./dataset/processed \
-    --datasets BUSI \
-    --fold 0 \
-    --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
-    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
-    --mask_prompt_style gaussian \
-    --use_roi_crop \
-    --roi_expand_ratio 0.2 \
     --use_gated_refinement \
     --gate_type uncertainty \
     --gate_gamma 1.0 \
     --gate_max 0.5 \
-    --max_epochs 100 \
-    --coarse_loss_weight 0.8 \
-    --refined_loss_weight 0.2
-```
-
-### Command-Line Arguments for Gated Refinement
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--use_gated_refinement` | `False` | Enable gated residual refinement |
-| `--gate_type` | `uncertainty` | Gate type: `uncertainty`, `learned`, `hybrid` |
-| `--gate_gamma` | `1.0` | Uncertainty curve shape (higher = more aggressive) |
-| `--gate_min` | `0.0` | Minimum gate value (0 = fully preserve confident) |
-| `--gate_max` | `0.8` | Maximum gate value (caps correction strength) |
-
-### Python API Usage
-
-```python
-from models.ultra_refiner import build_gated_ultra_refiner
-
-model = build_gated_ultra_refiner(
-    vit_name='R50-ViT-B_16',
-    img_size=224,
-    num_classes=2,
-    sam_model_type='vit_b',
-    transunet_checkpoint='./checkpoints/transunet/BUSI/fold_0/best.pth',
-    sam_checkpoint='./pretrained/medsam_vit_b.pth',
-    gate_type='uncertainty',
-    gate_gamma=1.0,
-    gate_min=0.0,
-    gate_max=0.5,
-    mask_prompt_style='gaussian',
-    use_roi_crop=True,
-    roi_expand_ratio=0.2,
-)
-```
-
-### Gate Types
-
-| Type | Description | Parameters |
-|------|-------------|------------|
-| `uncertainty` | Based on coarse mask confidence: `gate = 1 - |2*coarse - 1|^γ` | No learnable params |
-| `learned` | CNN that predicts where corrections should be applied | ~3K learnable params |
-| `hybrid` | `uncertainty × learned` - combines both approaches | ~3K learnable params |
-
-### Gate Parameters
-
-| Parameter | Default | Effect |
-|-----------|---------|--------|
-| `gate_gamma` | `1.0` | Higher = more aggressive (only very uncertain regions) |
-| `gate_min` | `0.0` | Minimum correction (0 = fully preserve confident regions) |
-| `gate_max` | `0.8` | Maximum correction (0.8 = cap at 80%) |
-
-### When to Use Gated Refinement
-
-| Scenario | Recommendation |
-|----------|----------------|
-| Skip Phase 2 completely | Use gated with `gate_max=0.5` (conservative) |
-| Unfinetuned SAM makes wild guesses | Use gated with `gate_max=0.3-0.5` |
-| Phase 2-finetuned SAM | Standard refinement (no gating needed) |
-| TransUNet already very good | Use gated with `gate_max=0.3` to preserve |
-
-### Output Format
-
-```python
-output = model(image)
-
-# Standard outputs
-coarse_mask = output['coarse_mask']      # TransUNet prediction (B, H, W)
-refined_mask = output['refined_mask']    # Final gated output (B, H, W) ← use this
-
-# Gated refinement outputs
-gate = output['gate']                    # Where corrections applied (B, H, W)
-residual = output['residual']            # SAM's proposed changes (B, H, W)
-sam_mask = output['sam_mask']            # Raw SAM output before gating (B, H, W)
-```
-
----
-
-## Differentiable Prompt Generation
-
-The core innovation enabling end-to-end training is **fully differentiable prompt extraction** from soft probability masks.
-
-### Point Prompts (Soft-Argmax)
-
-**Positive Point** - Foreground centroid via probability-weighted average:
-```
-x_center = Σ(P(i,j) × x_j) / Σ(P(i,j))
-y_center = Σ(P(i,j) × y_i) / Σ(P(i,j))
-```
-
-**Negative Point** - Background centroid within the bounding box:
-```
-inv_mask = (1 - P) × soft_box_mask
-x_neg = Σ(inv_mask × x) / Σ(inv_mask)
-y_neg = Σ(inv_mask × y) / Σ(inv_mask)
-```
-
-### Box Prompts (Weighted Statistics)
-
-Bounding boxes are computed from mask-weighted coordinate statistics:
-```
-center_x = Σ(P × x) / Σ(P)           # Weighted centroid
-center_y = Σ(P × y) / Σ(P)
-
-std_x = √(Σ(P × (x - center_x)²) / Σ(P))   # Weighted std
-std_y = √(Σ(P × (y - center_y)²) / Σ(P))
-
-x1, x2 = center_x ∓ 2.5 × std_x     # Box bounds (covers ~99%)
-y1, y2 = center_y ∓ 2.5 × std_y
-```
-
-This approach correctly restricts computation to the mask region, unlike soft-min/max which can be dominated by background pixels.
-
-### Mask Prompts
-
-The soft probability mask is converted to SAM's expected logit format:
-```
-mask_logits = (P × 2 - 1) × 10      # Maps [0,1] → [-10, +10]
-```
-
-**Gaussian style**: Applies Gaussian blur before conversion (for unfinetuned SAM)
-**Direct style**: No blur, preserves TransUNet's output (for Phase 2-finetuned SAM)
-
----
-
-## ROI Cropping Mode (Default)
-
-ROI cropping is the **default and recommended** mode. It focuses SAM computation on the lesion region at full 1024×1024 resolution.
-
-### How ROI Cropping Works
-
-1. **Compute soft bounding box** from the coarse mask using weighted statistics (center ± 2.5σ)
-2. **Expand box by 20%** (`roi_expand_ratio=0.2`) to include surrounding context
-3. **Crop image and mask** via `grid_sample` (fully differentiable)
-4. **Resize ROI to 1024×1024** for SAM processing at full resolution
-5. **SAM refines** the cropped mask
-6. **Paste back** the refined mask to original image space via inverse `grid_sample`
-
-### ROI Flags
-
-| Flag | Default | Purpose |
-|------|---------|---------|
-| `--use_roi_crop` | **Recommended** | Enable ROI cropping mode |
-| `--roi_expand_ratio` | `0.2` | Expand bounding box by this ratio (20% = include context) |
-
-### Disabling ROI (Not Recommended)
-
-If you want to disable ROI and use full-image processing:
-
-```bash
-# Phase 2 without ROI
-python scripts/finetune_sam_augmented.py \
-    --data_root ./dataset/augmented_soft \
-    --dataset COMBINED \
-    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
-    --mask_prompt_style direct --transunet_img_size 224
-    # Note: no --use_roi_crop flag
-
-# Phase 3 without ROI (must match Phase 2)
-python scripts/train_e2e.py \
-    --data_root ./dataset/processed \
-    --datasets BUSI --fold 0 \
-    --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
-    --sam_checkpoint ./checkpoints/sam_finetuned/COMBINED/best_sam.pth \
-    --mask_prompt_style direct \
-    --transunet_lr 1e-6 --sam_lr 1e-5 \
-    --coarse_loss_weight 0.7 --refined_loss_weight 0.3 \
-    --transunet_grad_scale 0.1 --transunet_weight_reg 0.01
-```
-
----
-
-## Quick Start Commands
-
-```bash
-# 1. Phase 1: Train TransUNet
-python scripts/train_transunet.py \
-    --data_root ./dataset/processed \
-    --dataset BUSI --fold 0 \
-    --vit_pretrained ./pretrained/R50+ViT-B_16.npz
-
-# 2. Phase 2: Finetune SAM (CHOOSE ONE OPTION)
-
-# Option A: Offline Augmentation (RECOMMENDED - fast training)
-python scripts/generate_augmented_masks.py \
-    --data_root ./dataset/processed \
-    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
-    --output_dir ./dataset/augmented_masks \
-    --num_augmentations 5 --use_fast_soft_mask
-
-python scripts/finetune_sam_offline.py \
-    --data_root ./dataset/augmented_masks \
-    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
-    --sam_checkpoint ./pretrained/sam_vit_b_01ec64.pth \
-    --output_dir ./checkpoints/sam_finetuned \
-    --mask_prompt_style direct --transunet_img_size 224 \
-    --use_roi_crop --roi_expand_ratio 0.3 \
-    --use_amp --batch_size 4 --epochs 100
-
-# Option B: Offline + Real Predictions (best of both worlds)
-# First generate TransUNet out-of-fold predictions
-python scripts/generate_transunet_predictions.py \
-    --data_root ./dataset/processed \
-    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
-    --checkpoint_dir ./checkpoints/transunet \
-    --output_dir ./dataset/transunet_preds
-
-# Then train with mix of real predictions + augmented data
-python scripts/finetune_sam_offline.py \
-    --data_root ./dataset/augmented_masks \
-    --pred_data_root ./dataset/transunet_preds \
-    --real_ratio 0.3 \
-    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
-    --sam_checkpoint ./pretrained/sam_vit_b_01ec64.pth \
-    --output_dir ./checkpoints/sam_finetuned \
-    --mask_prompt_style direct --transunet_img_size 224 \
-    --use_roi_crop --roi_expand_ratio 0.3 \
-    --use_amp --batch_size 4 --epochs 100
-
-# Option C: Pre-generated Data (requires generate_augmented_data.py first)
-python scripts/generate_augmented_data.py \
-    --data_root ./dataset/processed \
-    --output_dir ./dataset/augmented_soft \
-    --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM \
-    --target_samples 100000 --soft_masks --use_sdf
-
-python scripts/finetune_sam_augmented.py \
-    --data_root ./dataset/augmented_soft \
-    --dataset COMBINED \
-    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
-    --mask_prompt_style direct --transunet_img_size 224 \
-    --use_roi_crop --roi_expand_ratio 0.2
-
-# 3. Phase 3: End-to-end training (with ROI + protection - RECOMMENDED)
-python scripts/train_e2e.py \
-    --data_root ./dataset/processed \
-    --datasets BUSI --fold 0 \
-    --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
-    --sam_checkpoint ./checkpoints/sam_finetuned/COMBINED/best_sam.pth \
-    --mask_prompt_style direct \
-    --use_roi_crop --roi_expand_ratio 0.2 \
-    --transunet_lr 1e-6 --sam_lr 1e-5 \
-    --coarse_loss_weight 0.8 --refined_loss_weight 0.2 \
-    --transunet_grad_scale 0.01 --transunet_weight_reg 0.1
-
-# Alternative: Skip Phase 2 with Gated Refinement
-python scripts/train_e2e.py \
-    --data_root ./dataset/processed \
-    --datasets BUSI --fold 0 \
-    --transunet_checkpoint ./checkpoints/transunet/BUSI/fold_0/best.pth \
-    --sam_checkpoint ./pretrained/medsam_vit_b.pth \
     --mask_prompt_style gaussian \
-    --use_roi_crop --roi_expand_ratio 0.2 \
-    --use_gated_refinement \
-    --gate_type uncertainty --gate_max 0.5 \
-    --coarse_loss_weight 0.8 --refined_loss_weight 0.2 \
-    --freeze_transunet_epochs 10
+    --use_roi_crop
 ```
 
----
-
-## Mask Augmentation Module
-
-The mask augmentation module (`data/mask_augmentation.py`) provides comprehensive simulation of TransUNet failure modes for Phase 2 training.
-
-### Python API
-
-```python
-from data import MaskAugmentor, create_augmentor, AUGMENTOR_PRESETS
-
-# Create augmentor with preset
-augmentor = create_augmentor(
-    preset='default',           # 'default', 'mild', 'severe', 'boundary_focus', 'structural'
-    soft_mask_prob=0.8,         # Probability of soft mask conversion
-    soft_mask_temperature=(2.0, 8.0),  # Temperature range for soft masks
-    secondary_prob=0.5,         # Probability of secondary perturbations
-)
-
-# Apply augmentation to GT mask
-gt_mask = np.array(Image.open('mask.png').convert('L')) / 255.0
-coarse_mask, aug_info = augmentor(gt_mask)
-
-# aug_info contains:
-print(aug_info['error_type'])    # e.g., 'over_segmentation'
-print(aug_info['secondary'])     # e.g., ['boundary_jitter']
-print(aug_info['soft'])          # True if soft mask applied
-print(aug_info['dice'])          # Dice score between coarse and GT
-
-# Force specific error type for testing
-coarse_mask, _ = augmentor(gt_mask, force_error_type='internal_holes')
-```
-
-### Online Augmented Dataset
-
-```python
-from data import OnlineAugmentedDataset, get_online_augmented_dataloaders
-
-# Single dataset
-dataset = OnlineAugmentedDataset(
-    data_root='./dataset/processed',
-    dataset_name='BUSI',
-    img_size=1024,              # SAM input size
-    transunet_img_size=224,     # Resolution path matching
-    augmentor_preset='default',
-    soft_mask_prob=0.8,
-    split_ratio=0.9,            # Train/val split
-    is_train=True,
-)
-
-# Combined dataloaders (multiple datasets)
-train_loader, val_loader = get_online_augmented_dataloaders(
-    data_root='./dataset/processed',
-    dataset_names=['BUSI', 'BUSBRA', 'BUS'],
-    batch_size=4,
-    img_size=1024,
-    transunet_img_size=224,
-    augmentor_preset='default',
-    num_workers=4,
-)
-
-# Each batch:
-for batch in train_loader:
-    image = batch['image']          # (B, 3, 1024, 1024) - SAM normalized
-    label = batch['label']          # (B, 1024, 1024) - GT mask
-    coarse = batch['coarse_mask']   # (B, 1024, 1024) - Augmented mask
-    dice = batch['dice']            # Dice(coarse, GT)
-    error_type = batch['error_type'] # Primary error applied
-```
-
-### Hybrid Dataset API
-
-```python
-from data import HybridDataset, get_hybrid_dataloaders
-
-# Create hybrid dataloaders
-train_loader, val_loader = get_hybrid_dataloaders(
-    gt_data_root='./dataset/processed',
-    pred_data_root='./dataset/transunet_preds',
-    dataset_names=['BUSI', 'BUSBRA', 'BUS'],
-    batch_size=4,
-    img_size=1024,
-    transunet_img_size=224,
-    real_ratio=0.5,          # 50% real predictions, 50% augmented
-    augmentor_preset='default',
-    use_fast_soft_mask=True,
-    num_workers=8,
-)
-
-# Each batch:
-for batch in train_loader:
-    image = batch['image']          # (B, 3, 1024, 1024)
-    label = batch['label']          # (B, 1024, 1024)
-    coarse = batch['coarse_mask']   # (B, 1024, 1024)
-    source = batch['source']        # 'real' or 'augmented'
-    dice = batch['dice']            # Dice(coarse, GT)
-    error_type = batch['error_type']
-```
-
-### Soft Mask Conversion
-
-The soft mask conversion uses signed distance transform to create realistic probability maps:
-
-```
-signed_dist = distance_inside - distance_outside
-P(x) = sigmoid(signed_dist(x) / temperature)
-```
-
-- **Low temperature (2.0)**: Sharp boundaries, high confidence
-- **High temperature (8.0)**: Fuzzy boundaries, gradual transitions
-
-This matches TransUNet's soft probability output distribution.
+| Gate Type | Description | Params |
+|-----------|-------------|--------|
+| `uncertainty` | Based on coarse confidence: `1-|2p-1|^γ` | None |
+| `learned` | CNN predicts correction regions | ~3K |
+| `hybrid` | Product of both | ~3K |
 
 ---
 
@@ -891,27 +484,32 @@ This matches TransUNet's soft probability output distribution.
 
 ```
 UltraRefiner/
-├── models/
-│   ├── sam_refiner.py        # Differentiable SAM Refiner + ROI Cropper
-│   ├── ultra_refiner.py      # End-to-end model
-│   └── transunet/            # TransUNet backbone
-├── scripts/
-│   ├── train_transunet.py    # Phase 1
-│   ├── generate_augmented_masks.py # Generate offline augmented masks [RECOMMENDED]
-│   ├── generate_transunet_predictions.py  # Generate TransUNet out-of-fold predictions
-│   ├── finetune_sam_offline.py     # Phase 2 with offline augmentation [RECOMMENDED]
-│   ├── finetune_sam_online.py      # Phase 2 with online augmentation (slower)
-│   ├── finetune_sam_hybrid.py      # Phase 2 hybrid (deprecated, use offline)
-│   └── train_e2e.py          # Phase 3
-├── data/
-│   ├── dataset.py            # K-fold data loaders
-│   ├── mask_augmentation.py  # Mask augmentor with 12 error types
-│   ├── offline_augmented_dataset.py  # Offline augmentation dataset [RECOMMENDED]
-│   ├── online_augmented_dataset.py   # Online augmentation dataset (slower)
-│   └── hybrid_dataset.py     # Hybrid dataset (real + augmented)
-└── utils/
-    └── losses.py             # Dice, BCE, quality-aware losses
++-- models/
+|   +-- ultra_refiner.py          # UltraRefiner & GatedUltraRefiner
+|   +-- sam_refiner.py            # DifferentiableSAMRefiner + ROI Cropper
+|   +-- transunet/                # Vision Transformer backbone
+|   +-- lora.py                   # Low-rank adaptation
++-- data/
+|   +-- dataset.py                # K-fold data loaders
+|   +-- mask_augmentation.py      # 12 error types + soft mask conversion
+|   +-- offline_augmented_dataset.py   # Offline augmentation (recommended)
+|   +-- offline_hybrid_dataset.py      # Hybrid (real + augmented)
+|   +-- online_augmented_dataset.py    # Online augmentation (slower)
++-- scripts/
+|   +-- train_transunet.py        # Phase 1
+|   +-- generate_augmented_masks.py    # Generate offline data
+|   +-- generate_transunet_predictions.py  # Out-of-fold predictions
+|   +-- finetune_sam_offline.py   # Phase 2 (recommended)
+|   +-- train_e2e.py              # Phase 3
+|   +-- inference.py              # Inference pipeline
++-- utils/
+|   +-- losses.py                 # Dice, BCE, quality-aware losses
+|   +-- metrics.py                # Evaluation metrics & logging
++-- configs/
+    +-- config.py                 # Project configuration
 ```
+
+---
 
 ## Requirements
 
@@ -924,14 +522,17 @@ pip install -r requirements.txt
 
 # Download pretrained weights
 wget https://storage.googleapis.com/vit_models/imagenet21k/R50+ViT-B_16.npz -P ./pretrained/
+# Download SAM from https://github.com/facebookresearch/segment-anything
 # Download MedSAM from https://github.com/bowang-lab/MedSAM
 ```
+
+---
 
 ## Citation
 
 ```bibtex
 @article{ultrarefiner2024,
-  title={UltraRefiner: End-to-End Differentiable Segmentation Refinement},
+  title={UltraRefiner: End-to-End Differentiable Segmentation Refinement with Gradient-Coupled Foundation Models},
   author={},
   year={2024}
 }
@@ -939,6 +540,6 @@ wget https://storage.googleapis.com/vit_models/imagenet21k/R50+ViT-B_16.npz -P .
 
 ## References
 
-- [TransUNet](https://arxiv.org/abs/2102.04306)
-- [MedSAM](https://github.com/bowang-lab/MedSAM)
-- [SAM](https://segment-anything.com/)
+- [TransUNet: Transformers Make Strong Encoders for Medical Image Segmentation](https://arxiv.org/abs/2102.04306)
+- [Segment Anything](https://segment-anything.com/)
+- [MedSAM: Segment Anything in Medical Images](https://github.com/bowang-lab/MedSAM)
