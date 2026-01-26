@@ -31,6 +31,13 @@ Usage:
         --data_root ./dataset/processed \
         --datasets BUSI \
         --visualize --visualize_best_worst --num_visualize 20
+
+    # Visualize ALL samples
+    python scripts/evaluate_test.py \
+        --checkpoint ./checkpoints/ultra_refiner/fold_0/best.pth \
+        --data_root ./dataset/processed \
+        --datasets BUSI \
+        --visualize --num_visualize -1
 """
 
 import argparse
@@ -105,7 +112,7 @@ def get_args():
     parser.add_argument('--visualize', action='store_true',
                         help='Generate visualization images')
     parser.add_argument('--num_visualize', type=int, default=10,
-                        help='Number of samples to visualize per dataset')
+                        help='Number of samples to visualize per dataset (-1 or 0 for all)')
     parser.add_argument('--visualize_best_worst', action='store_true',
                         help='Visualize best and worst cases based on improvement')
 
@@ -458,20 +465,27 @@ def evaluate_dataset(model, dataloader, device, refined_eval_size=224, use_gated
     if visualize and output_dir and dataset_name:
         print(f"  Generating visualizations...")
 
-        if visualize_best_worst:
+        # num_visualize <= 0 means visualize all
+        visualize_all = num_visualize <= 0
+        n_vis = len(vis_data) if visualize_all else num_visualize
+
+        if visualize_best_worst and not visualize_all:
             # Sort by improvement and visualize best/worst
             vis_data_sorted = sorted(vis_data, key=lambda x: x['improvement'])
 
             # Worst cases (refinement hurt most)
-            worst_cases = vis_data_sorted[:num_visualize // 2]
+            worst_cases = vis_data_sorted[:n_vis // 2]
             # Best cases (refinement helped most)
-            best_cases = vis_data_sorted[-(num_visualize // 2):]
+            best_cases = vis_data_sorted[-(n_vis // 2):]
 
             samples_to_vis = worst_cases + best_cases
+        elif visualize_all:
+            # Visualize all samples
+            samples_to_vis = vis_data
         else:
             # Visualize evenly spaced samples
-            step = max(1, len(vis_data) // num_visualize)
-            samples_to_vis = vis_data[::step][:num_visualize]
+            step = max(1, len(vis_data) // n_vis)
+            samples_to_vis = vis_data[::step][:n_vis]
 
         for sample in tqdm(samples_to_vis, desc='Visualizing', leave=False):
             visualize_sample(
