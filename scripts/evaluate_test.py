@@ -79,6 +79,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from scipy import ndimage
 from scipy.ndimage import binary_dilation, binary_erosion, label as ndimage_label
+from scipy.ndimage import distance_transform_edt
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -175,6 +176,52 @@ def get_args():
     return parser.parse_args()
 
 
+def compute_hd95(pred_binary_np, target_binary_np):
+    """Compute the 95th percentile Hausdorff Distance (HD95).
+
+    Args:
+        pred_binary_np: Predicted binary mask (H, W) as numpy array
+        target_binary_np: Ground truth binary mask (H, W) as numpy array
+
+    Returns:
+        HD95 value (float), or np.inf if either mask is empty
+    """
+    # Handle empty masks
+    if pred_binary_np.sum() == 0 and target_binary_np.sum() == 0:
+        return 0.0
+    if pred_binary_np.sum() == 0 or target_binary_np.sum() == 0:
+        return np.inf
+
+    # Compute surface (boundary) points
+    # Boundary = mask XOR eroded_mask
+    pred_boundary = pred_binary_np ^ binary_erosion(pred_binary_np, iterations=1)
+    target_boundary = target_binary_np ^ binary_erosion(target_binary_np, iterations=1)
+
+    # Handle case where erosion removes all pixels (very small masks)
+    if pred_boundary.sum() == 0:
+        pred_boundary = pred_binary_np
+    if target_boundary.sum() == 0:
+        target_boundary = target_binary_np
+
+    # Compute distance transforms
+    # Distance from each pixel to the nearest boundary pixel of the other mask
+    dt_pred = distance_transform_edt(~pred_boundary)
+    dt_target = distance_transform_edt(~target_boundary)
+
+    # Directed Hausdorff: distances from target boundary to pred
+    dist_target_to_pred = dt_pred[target_boundary]
+    # Directed Hausdorff: distances from pred boundary to target
+    dist_pred_to_target = dt_target[pred_boundary]
+
+    # Combine both directions
+    all_distances = np.concatenate([dist_target_to_pred, dist_pred_to_target])
+
+    # 95th percentile
+    hd95 = np.percentile(all_distances, 95)
+
+    return float(hd95)
+
+
 def compute_metrics(pred, target, threshold=0.5):
     """Compute segmentation metrics.
 
@@ -220,6 +267,11 @@ def compute_metrics(pred, target, threshold=0.5):
     # Specificity
     specificity = (tn + eps) / (tn + fp + eps)
 
+    # HD95 (computed per-sample on numpy)
+    pred_np = pred_binary.squeeze().cpu().numpy().astype(bool)
+    target_np = target_binary.squeeze().cpu().numpy().astype(bool)
+    hd95 = compute_hd95(pred_np, target_np)
+
     return {
         'dice': dice.item(),
         'iou': iou.item(),
@@ -227,6 +279,7 @@ def compute_metrics(pred, target, threshold=0.5):
         'recall': recall.item(),
         'accuracy': accuracy.item(),
         'specificity': specificity.item(),
+        'hd95': hd95,
     }
 
 
@@ -816,19 +869,31 @@ def evaluate_dataset(model, dataloader, device, refined_eval_size=224, use_gated
 def print_results_table(results, datasets):
     """Print results in a formatted table."""
 
-    print("\n" + "=" * 100)
-    print("                           TEST SET EVALUATION RESULTS")
-    print("=" * 100)
+    print("\n" + "=" * 120)
+    print("                              TEST SET EVALUATION RESULTS")
+    print("=" * 120)
 
     # Header
-    print(f"\n{'Dataset':<15} {'Samples':>8} {'':^3} {'Coarse (TransUNet)':^30} {'':^3} {'Refined (SAM)':^30}")
-    print(f"{'':<15} {'':>8} {'':^3} {'Dice':>10} {'IoU':>10} {'Prec':>10} {'':^3} {'Dice':>10} {'IoU':>10} {'Prec':>10}")
-    print("-" * 100)
+    print(f"\n{'Dataset':<15} {'Samples':>8} {'':^3} "
+          f"{'Coarse (TransUNet)':^35} {'':^3} "
+          f"{'Refined (SAM)':^35}")
+    print(f"{'':<15} {'':>8} {'':^3} "
+          f"{'Dice':>10} {'IoU':>10} {'HD95':>10} {'':^3} "
+          f"{'Dice':>10} {'IoU':>10} {'HD95':>10} {'':^5}")
+    print("-" * 120)
 
     # Per-dataset results
     total_coarse_dice = []
     total_refined_dice = []
+    total_coarse_hd95 = []
+    total_refined_hd95 = []
     total_samples = 0
+
+    def fmt_hd95(val):
+        """Format HD95 value, handling inf."""
+        if np.isinf(val):
+            return f"{'inf':>10}"
+        return f"{val:>10.2f}"
 
     for ds in datasets:
         if ds not in results:
@@ -840,34 +905,42 @@ def print_results_table(results, datasets):
 
         # Calculate improvement
         dice_improvement = f['dice'] - c['dice']
+        hd95_improvement = c['hd95'] - f['hd95']  # Lower is better, so c - f
 
         print(f"{ds:<15} {n:>8} {'':^3} "
-              f"{c['dice']:>10.4f} {c['iou']:>10.4f} {c['precision']:>10.4f} {'':^3} "
-              f"{f['dice']:>10.4f} {f['iou']:>10.4f} {f['precision']:>10.4f} "
-              f"({dice_improvement:+.4f})")
+              f"{c['dice']:>10.4f} {c['iou']:>10.4f} {fmt_hd95(c['hd95'])} {'':^3} "
+              f"{f['dice']:>10.4f} {f['iou']:>10.4f} {fmt_hd95(f['hd95'])} "
+              f"(Dice {dice_improvement:+.4f}, HD95 {hd95_improvement:+.2f})")
 
         total_coarse_dice.append(c['dice'])
         total_refined_dice.append(f['dice'])
+        # Filter inf values for averaging
+        if not np.isinf(c['hd95']):
+            total_coarse_hd95.append(c['hd95'])
+        if not np.isinf(f['hd95']):
+            total_refined_hd95.append(f['hd95'])
         total_samples += n
 
-    print("-" * 100)
+    print("-" * 120)
 
     # Average across datasets
     avg_coarse_dice = np.mean(total_coarse_dice)
     avg_refined_dice = np.mean(total_refined_dice)
     avg_improvement = avg_refined_dice - avg_coarse_dice
+    avg_coarse_hd95 = np.mean(total_coarse_hd95) if total_coarse_hd95 else float('inf')
+    avg_refined_hd95 = np.mean(total_refined_hd95) if total_refined_hd95 else float('inf')
 
     print(f"{'AVERAGE':<15} {total_samples:>8} {'':^3} "
-          f"{avg_coarse_dice:>10.4f} {'':>10} {'':>10} {'':^3} "
-          f"{avg_refined_dice:>10.4f} {'':>10} {'':>10} "
-          f"({avg_improvement:+.4f})")
+          f"{avg_coarse_dice:>10.4f} {'':>10} {fmt_hd95(avg_coarse_hd95)} {'':^3} "
+          f"{avg_refined_dice:>10.4f} {'':>10} {fmt_hd95(avg_refined_hd95)} "
+          f"(Dice {avg_improvement:+.4f}, HD95 {avg_coarse_hd95 - avg_refined_hd95:+.2f})")
 
-    print("=" * 100)
+    print("=" * 120)
 
     # Detailed metrics for each dataset
-    print("\n" + "=" * 100)
-    print("                           DETAILED METRICS")
-    print("=" * 100)
+    print("\n" + "=" * 120)
+    print("                              DETAILED METRICS")
+    print("=" * 120)
 
     for ds in datasets:
         if ds not in results:
@@ -880,19 +953,23 @@ def print_results_table(results, datasets):
         print(f"  Coarse (TransUNet):")
         print(f"    Dice: {c['dice']:.4f}, IoU: {c['iou']:.4f}, "
               f"Precision: {c['precision']:.4f}, Recall: {c['recall']:.4f}, "
-              f"Accuracy: {c['accuracy']:.4f}")
+              f"Accuracy: {c['accuracy']:.4f}, HD95: {c['hd95']:.2f}")
         print(f"  Refined (SAM):")
         print(f"    Dice: {f['dice']:.4f}, IoU: {f['iou']:.4f}, "
               f"Precision: {f['precision']:.4f}, Recall: {f['recall']:.4f}, "
-              f"Accuracy: {f['accuracy']:.4f}")
-        print(f"  Improvement: Dice {f['dice'] - c['dice']:+.4f}, IoU {f['iou'] - c['iou']:+.4f}")
+              f"Accuracy: {f['accuracy']:.4f}, HD95: {f['hd95']:.2f}")
+        print(f"  Improvement: Dice {f['dice'] - c['dice']:+.4f}, "
+              f"IoU {f['iou'] - c['iou']:+.4f}, "
+              f"HD95 {c['hd95'] - f['hd95']:+.2f} (lower is better)")
 
-    print("\n" + "=" * 100)
+    print("\n" + "=" * 120)
 
     return {
         'avg_coarse_dice': avg_coarse_dice,
         'avg_refined_dice': avg_refined_dice,
         'avg_improvement': avg_improvement,
+        'avg_coarse_hd95': avg_coarse_hd95,
+        'avg_refined_hd95': avg_refined_hd95,
     }
 
 
