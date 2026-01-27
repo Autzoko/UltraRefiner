@@ -179,6 +179,10 @@ def get_args():
     parser.add_argument('--freeze_transunet_epochs', type=int, default=0,
                         help='Number of epochs to freeze TransUNet at the start. '
                              'Allows SAM to adapt first before joint training.')
+    parser.add_argument('--transunet_unfreeze_decoder_layers', type=int, default=-1,
+                        help='Number of decoder layers to unfreeze from the end (-1 = all layers trainable). '
+                             'E.g., 2 = only last 2 decoder blocks + segmentation head are trainable. '
+                             'Useful for fine-grained control over TransUNet adaptation.')
 
     # Gated residual refinement options (alternative to Phase 2)
     parser.add_argument('--use_gated_refinement', action='store_true',
@@ -209,6 +213,70 @@ def set_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
+
+
+def freeze_transunet_except_decoder_layers(model, num_unfreeze_layers):
+    """Freeze TransUNet except the last N decoder layers and segmentation head.
+
+    Args:
+        model: UltraRefiner model
+        num_unfreeze_layers: Number of decoder blocks to unfreeze from the end.
+                            -1 = all layers trainable (no freezing)
+                             0 = only segmentation head trainable
+                             1 = last decoder block + segmentation head
+                             2 = last 2 decoder blocks + segmentation head
+                             etc.
+    Returns:
+        List of trainable parameter names
+    """
+    if num_unfreeze_layers < 0:
+        # All layers trainable
+        for param in model.transunet.parameters():
+            param.requires_grad = True
+        return [name for name, _ in model.transunet.named_parameters()]
+
+    # First freeze everything
+    for param in model.transunet.parameters():
+        param.requires_grad = False
+
+    trainable_names = []
+
+    # Always unfreeze segmentation head
+    for name, param in model.transunet.named_parameters():
+        if 'segmentation_head' in name:
+            param.requires_grad = True
+            trainable_names.append(name)
+
+    # Unfreeze last N decoder blocks
+    if num_unfreeze_layers > 0:
+        # Get total number of decoder blocks
+        num_decoder_blocks = len(model.transunet.decoder.blocks)
+
+        # Calculate which blocks to unfreeze (from the end)
+        start_unfreeze_idx = max(0, num_decoder_blocks - num_unfreeze_layers)
+
+        for name, param in model.transunet.named_parameters():
+            # Match decoder.blocks.{idx}
+            if 'decoder.blocks' in name:
+                # Extract block index
+                parts = name.split('.')
+                for i, part in enumerate(parts):
+                    if part == 'blocks' and i + 1 < len(parts):
+                        try:
+                            block_idx = int(parts[i + 1])
+                            if block_idx >= start_unfreeze_idx:
+                                param.requires_grad = True
+                                trainable_names.append(name)
+                        except ValueError:
+                            pass
+                        break
+
+    return trainable_names
+
+
+def get_transunet_trainable_params(model):
+    """Get trainable parameters from TransUNet."""
+    return [p for p in model.transunet.parameters() if p.requires_grad]
 
 
 class BCEDiceLossProb(nn.Module):
@@ -810,11 +878,26 @@ def main():
 
     # Freeze TransUNet for initial epochs if specified
     transunet_frozen = False
+    transunet_partial_freeze = False  # True if only some decoder layers are trainable
+
     if args.freeze_transunet_epochs > 0:
+        # Fully freeze TransUNet for initial epochs
         for param in model.transunet.parameters():
             param.requires_grad = False
         transunet_frozen = True
         logging.info(f'TransUNet frozen for first {args.freeze_transunet_epochs} epochs')
+    elif args.transunet_unfreeze_decoder_layers >= 0:
+        # Partial freeze: only unfreeze last N decoder layers + segmentation head
+        trainable_names = freeze_transunet_except_decoder_layers(
+            model, args.transunet_unfreeze_decoder_layers
+        )
+        transunet_partial_freeze = True
+        logging.info(f'TransUNet partial freeze: only {len(trainable_names)} params trainable '
+                     f'(last {args.transunet_unfreeze_decoder_layers} decoder layers + segmentation head)')
+        for name in trainable_names[:5]:  # Show first 5 trainable layer names
+            logging.info(f'  Trainable: {name}')
+        if len(trainable_names) > 5:
+            logging.info(f'  ... and {len(trainable_names) - 5} more')
 
     # Loss function
     criterion = EndToEndLoss(
@@ -827,7 +910,11 @@ def main():
     # Optimizer with different learning rates
     # Only include params that are not frozen initially
     # Frozen params will be added when unfreezing
-    transunet_params = list(model.get_transunet_params())
+    if transunet_partial_freeze:
+        # Use only trainable params when partially frozen
+        transunet_params = get_transunet_trainable_params(model)
+    else:
+        transunet_params = list(model.get_transunet_params())
     sam_params = list(model.get_sam_params())
 
     # Check if SAM is initially frozen
@@ -881,8 +968,22 @@ def main():
         # Unfreeze TransUNet after specified epochs
         if transunet_frozen and epoch >= args.freeze_transunet_epochs:
             logging.info(f'Epoch {epoch}: Unfreezing TransUNet for joint training')
-            for param in model.transunet.parameters():
-                param.requires_grad = True
+
+            # Check if we should apply partial freeze after unfreezing
+            if args.transunet_unfreeze_decoder_layers >= 0:
+                # Partial unfreeze: only last N decoder layers + segmentation head
+                trainable_names = freeze_transunet_except_decoder_layers(
+                    model, args.transunet_unfreeze_decoder_layers
+                )
+                logging.info(f'Partial unfreeze: {len(trainable_names)} params trainable '
+                             f'(last {args.transunet_unfreeze_decoder_layers} decoder layers + segmentation head)')
+                transunet_params = get_transunet_trainable_params(model)
+            else:
+                # Full unfreeze
+                for param in model.transunet.parameters():
+                    param.requires_grad = True
+                transunet_params = list(model.get_transunet_params())
+
             transunet_frozen = False
 
             # Re-initialize gradient scaler with hooks
@@ -890,7 +991,6 @@ def main():
                 gradient_scaler = GradientScaler(model, scale=args.transunet_grad_scale)
 
             # Update optimizer to include TransUNet params
-            transunet_params = list(model.get_transunet_params())
             optimizer.add_param_group({'params': transunet_params, 'lr': args.transunet_lr})
             logging.info(f'Added {len(transunet_params)} TransUNet parameters to optimizer')
 
