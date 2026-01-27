@@ -1,6 +1,6 @@
 """
 Unified dataset module for breast ultrasound segmentation.
-Supports: BUSI, BUSBRA, BUS, BUS_UC, BUS_UCLM datasets.
+Supports: BUSI, BUSBRA, BUS, BUS_UC, BUS_UCLM, UDIAT datasets.
 
 Uses preprocessed data from dataset/processed/ with fixed train/test splits.
 Supports K-fold cross-validation within the training set.
@@ -19,7 +19,14 @@ from typing import List, Tuple, Optional, Dict
 
 
 # Supported datasets
+# Training datasets (used for train/test splits)
 SUPPORTED_DATASETS = ['BUSI', 'BUSBRA', 'BUS', 'BUS_UC', 'BUS_UCLM']
+
+# Unseen test-only datasets (for cross-dataset generalization evaluation)
+UNSEEN_DATASETS = ['UDIAT']
+
+# All datasets
+ALL_DATASETS = SUPPORTED_DATASETS + UNSEEN_DATASETS
 
 
 class RandomGenerator:

@@ -65,6 +65,19 @@ Usage:
         --use_rejection_rules \
         --use_boundary_fusion \
         --boundary_band_width 20
+
+    # Cross-dataset generalization: evaluate on unseen UDIAT dataset
+    # (model trained on BUSI, tested on UDIAT)
+    python scripts/evaluate_test.py \
+        --checkpoint ./checkpoints/ultra_refiner/fold_0/best.pth \
+        --data_root ./dataset/processed \
+        --datasets UDIAT
+
+    # Evaluate on all datasets including unseen ones
+    python scripts/evaluate_test.py \
+        --checkpoint ./checkpoints/ultra_refiner/fold_0/best.pth \
+        --data_root ./dataset/processed \
+        --include_unseen
 """
 
 import argparse
@@ -85,7 +98,7 @@ from scipy.ndimage import distance_transform_edt
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models import build_ultra_refiner, build_gated_ultra_refiner, CONFIGS
-from data import get_test_dataloader, SUPPORTED_DATASETS
+from data import get_test_dataloader, SUPPORTED_DATASETS, UNSEEN_DATASETS, ALL_DATASETS
 
 
 def get_args():
@@ -107,7 +120,9 @@ def get_args():
     parser.add_argument('--data_root', type=str, default='./dataset/processed',
                         help='Root directory containing processed datasets')
     parser.add_argument('--datasets', type=str, nargs='+', default=None,
-                        help='Dataset names to evaluate (default: all)')
+                        help='Dataset names to evaluate (default: all training datasets)')
+    parser.add_argument('--include_unseen', action='store_true',
+                        help='Include unseen test-only datasets (e.g., UDIAT) in evaluation')
     parser.add_argument('--batch_size', type=int, default=4,
                         help='Batch size')
     parser.add_argument('--num_workers', type=int, default=4,
@@ -982,7 +997,10 @@ def main():
 
     # Default datasets
     if args.datasets is None:
-        args.datasets = SUPPORTED_DATASETS
+        if args.include_unseen:
+            args.datasets = ALL_DATASETS
+        else:
+            args.datasets = SUPPORTED_DATASETS
 
     print(f"\nEvaluating on datasets: {args.datasets}")
     print(f"Refined evaluation size: {args.refined_eval_size}")

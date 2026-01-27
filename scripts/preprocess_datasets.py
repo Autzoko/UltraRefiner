@@ -15,6 +15,7 @@ Datasets:
 - BUS: Breast Ultrasound Dataset B
 - BUS_UC: Breast Ultrasound from UC
 - BUS_UCLM: Breast Ultrasound from UCLM
+- UDIAT: Unseen test-only dataset for cross-dataset generalization evaluation
 
 Usage:
     python scripts/preprocess_datasets.py --raw_dir ./dataset/raw --output_dir ./dataset/processed
@@ -573,6 +574,82 @@ def process_bus_uclm(raw_dir: str, output_dir: str, test_ratio: float = 0.2, see
     return split_info
 
 
+def process_udiat(raw_dir: str, output_dir: str):
+    """
+    Process UDIAT dataset (unseen test-only dataset for cross-dataset evaluation).
+
+    Structure:
+        raw/UDIAT/original/000001.png
+        raw/UDIAT/GT/000001.png
+
+    Note: ALL samples go to test split (no train split) since this is an unseen dataset.
+    Samples with blank masks (no lesions) are excluded.
+    """
+    print("\n" + "="*60)
+    print("Processing UDIAT dataset (unseen test-only)...")
+    print("="*60)
+
+    dataset_name = "UDIAT"
+
+    # Only create test directories (no train split for unseen dataset)
+    for subdir in ['images', 'masks']:
+        path = os.path.join(output_dir, dataset_name, 'test', subdir)
+        os.makedirs(path, exist_ok=True)
+
+    udiat_dir = os.path.join(raw_dir, "UDIAT")
+    images_dir = os.path.join(udiat_dir, "original")
+    masks_dir = os.path.join(udiat_dir, "GT")
+
+    # Collect all image-mask pairs
+    pairs = []
+    excluded_blank = 0
+
+    for f in os.listdir(images_dir):
+        if f.endswith('.png'):
+            image_path = os.path.join(images_dir, f)
+            mask_path = os.path.join(masks_dir, f)
+
+            if os.path.exists(mask_path):
+                # Check if mask is blank (no lesion)
+                if is_mask_blank(mask_path):
+                    excluded_blank += 1
+                    continue
+
+                pairs.append({
+                    'image': image_path,
+                    'mask': mask_path,
+                    'name': f"udiat_{f.replace('.png', '')}"
+                })
+
+    print(f"Found {len(pairs)} valid image-mask pairs (excluded {excluded_blank} blank masks)")
+    print(f"All samples assigned to TEST split (unseen dataset)")
+
+    # Process and save - all go to test
+    split_info = {'train': [], 'test': [], 'excluded_blank': excluded_blank, 'unseen': True}
+
+    for pair in tqdm(pairs, desc="Processing test"):
+        output_name = f"{pair['name']}.png"
+
+        img_output = os.path.join(output_dir, dataset_name, 'test', 'images', output_name)
+        mask_output = os.path.join(output_dir, dataset_name, 'test', 'masks', output_name)
+
+        process_image(pair['image'], img_output)
+        process_mask(pair['mask'], mask_output)
+
+        split_info['test'].append({
+            'name': pair['name'],
+            'original_image': pair['image']
+        })
+
+    # Save split info
+    with open(os.path.join(output_dir, dataset_name, 'split_info.json'), 'w') as f:
+        json.dump(split_info, f, indent=2)
+
+    print(f"UDIAT processing complete. Test: {len(split_info['test'])} (unseen, no train split)")
+    print(f"  Excluded {excluded_blank} samples with blank masks (no lesions)")
+    return split_info
+
+
 def create_combined_split_info(output_dir: str, all_splits: Dict):
     """Create combined split info for all datasets."""
     combined = {
@@ -643,6 +720,9 @@ def main():
                         help='Ratio of test set (default: 0.2 = 20%)')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for reproducible splits')
+    parser.add_argument('--datasets', type=str, nargs='+', default=None,
+                        help='Only process specific datasets (e.g., --datasets UDIAT). '
+                             'Default: process all found datasets.')
     args = parser.parse_args()
 
     # Convert to absolute paths
@@ -664,36 +744,28 @@ def main():
 
     # Process each dataset
     all_splits = {}
+    selected = set(args.datasets) if args.datasets else None
 
-    # BUSI
-    if os.path.exists(os.path.join(raw_dir, "BUSI")):
-        all_splits['BUSI'] = process_busi(raw_dir, output_dir, args.test_ratio, args.seed)
-    else:
-        print("BUSI dataset not found, skipping...")
+    if selected:
+        print(f"\nOnly processing selected datasets: {args.datasets}")
 
-    # BUSBRA
-    if os.path.exists(os.path.join(raw_dir, "BUSBRA")):
-        all_splits['BUSBRA'] = process_busbra(raw_dir, output_dir, args.test_ratio, args.seed)
-    else:
-        print("BUSBRA dataset not found, skipping...")
+    # Dataset processing registry
+    dataset_processors = {
+        'BUSI': lambda: process_busi(raw_dir, output_dir, args.test_ratio, args.seed),
+        'BUSBRA': lambda: process_busbra(raw_dir, output_dir, args.test_ratio, args.seed),
+        'BUS': lambda: process_bus(raw_dir, output_dir, args.test_ratio, args.seed),
+        'BUS_UC': lambda: process_bus_uc(raw_dir, output_dir, args.test_ratio, args.seed),
+        'BUS_UCLM': lambda: process_bus_uclm(raw_dir, output_dir, args.test_ratio, args.seed),
+        'UDIAT': lambda: process_udiat(raw_dir, output_dir),
+    }
 
-    # BUS
-    if os.path.exists(os.path.join(raw_dir, "BUS")):
-        all_splits['BUS'] = process_bus(raw_dir, output_dir, args.test_ratio, args.seed)
-    else:
-        print("BUS dataset not found, skipping...")
-
-    # BUS_UC
-    if os.path.exists(os.path.join(raw_dir, "BUS_UC")):
-        all_splits['BUS_UC'] = process_bus_uc(raw_dir, output_dir, args.test_ratio, args.seed)
-    else:
-        print("BUS_UC dataset not found, skipping...")
-
-    # BUS_UCLM
-    if os.path.exists(os.path.join(raw_dir, "BUS_UCLM")):
-        all_splits['BUS_UCLM'] = process_bus_uclm(raw_dir, output_dir, args.test_ratio, args.seed)
-    else:
-        print("BUS_UCLM dataset not found, skipping...")
+    for ds_name, processor in dataset_processors.items():
+        if selected and ds_name not in selected:
+            continue
+        if os.path.exists(os.path.join(raw_dir, ds_name)):
+            all_splits[ds_name] = processor()
+        else:
+            print(f"{ds_name} dataset not found, skipping...")
 
     # Create combined split info
     combined = create_combined_split_info(output_dir, all_splits)
