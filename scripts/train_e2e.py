@@ -130,6 +130,15 @@ def get_args():
                         help='Freeze entire SAM (only train TransUNet)')
     parser.add_argument('--unfreeze_sam_epoch', type=int, default=0,
                         help='Epoch to unfreeze SAM (0=never freeze, >0=two-stage training)')
+    parser.add_argument('--freeze_sam_epochs', type=int, default=0,
+                        help='Number of epochs to freeze entire SAM at the start. '
+                             'After this, SAM decoder is partially unfrozen based on '
+                             '--sam_unfreeze_decoder_layers. (0=no initial freeze)')
+    parser.add_argument('--sam_unfreeze_decoder_layers', type=int, default=-1,
+                        help='Number of mask decoder transformer layers to unfreeze after '
+                             '--freeze_sam_epochs. -1 = entire mask_decoder, '
+                             '0 = output heads only (upscaling, hypernetworks, iou_head), '
+                             '1 = last transformer layer + output heads, etc.')
 
     # Coarse mask processing (to match Phase 2 training distribution)
     parser.add_argument('--sharpen_coarse_mask', action='store_true', default=False,
@@ -277,6 +286,85 @@ def freeze_transunet_except_decoder_layers(model, num_unfreeze_layers):
 def get_transunet_trainable_params(model):
     """Get trainable parameters from TransUNet."""
     return [p for p in model.transunet.parameters() if p.requires_grad]
+
+
+def freeze_sam_except_decoder_layers(model, num_unfreeze_layers):
+    """Freeze SAM except specified parts of the mask decoder.
+
+    The SAM mask decoder structure:
+        mask_decoder.transformer.layers.{0,1,...}  (TwoWayAttentionBlocks)
+        mask_decoder.transformer.final_attn_token_to_image
+        mask_decoder.transformer.norm_final_attn
+        mask_decoder.output_upscaling  (ConvTranspose2d layers)
+        mask_decoder.output_hypernetworks_mlps  (per-mask MLPs)
+        mask_decoder.iou_prediction_head  (IoU quality MLP)
+        mask_decoder.iou_token, mask_tokens  (embeddings)
+
+    Args:
+        model: UltraRefiner model (has model.sam)
+        num_unfreeze_layers: Controls what to unfreeze in mask_decoder.
+            -1 = unfreeze entire mask_decoder (all transformer layers + output heads)
+             0 = unfreeze only output heads (output_upscaling, hypernetworks, iou_head,
+                 tokens, final_attn) but NOT transformer layers
+             N = unfreeze last N transformer layers + output heads
+    Returns:
+        List of unfrozen parameter names
+    """
+    sam = model.sam if hasattr(model, 'sam') else model.sam_refiner.sam
+
+    # First freeze everything in SAM
+    for param in sam.parameters():
+        param.requires_grad = False
+
+    trainable_names = []
+
+    if num_unfreeze_layers < 0:
+        # Unfreeze entire mask_decoder
+        for name, param in sam.mask_decoder.named_parameters():
+            param.requires_grad = True
+            trainable_names.append(f'mask_decoder.{name}')
+        return trainable_names
+
+    # Always unfreeze output heads (output_upscaling, hypernetworks, iou_head, tokens, final_attn)
+    output_prefixes = (
+        'output_upscaling', 'output_hypernetworks_mlps',
+        'iou_prediction_head', 'iou_token', 'mask_tokens',
+    )
+    # Also unfreeze the final attention and norm in the transformer (after all layers)
+    final_prefixes = (
+        'transformer.final_attn_token_to_image',
+        'transformer.norm_final_attn',
+    )
+
+    for name, param in sam.mask_decoder.named_parameters():
+        if name.startswith(output_prefixes) or name.startswith(final_prefixes):
+            param.requires_grad = True
+            trainable_names.append(f'mask_decoder.{name}')
+
+    # Unfreeze last N transformer layers
+    if num_unfreeze_layers > 0:
+        num_transformer_layers = len(sam.mask_decoder.transformer.layers)
+        start_unfreeze_idx = max(0, num_transformer_layers - num_unfreeze_layers)
+
+        for name, param in sam.mask_decoder.named_parameters():
+            if name.startswith('transformer.layers.'):
+                # Extract layer index
+                parts = name.split('.')
+                try:
+                    layer_idx = int(parts[2])
+                    if layer_idx >= start_unfreeze_idx:
+                        param.requires_grad = True
+                        trainable_names.append(f'mask_decoder.{name}')
+                except (ValueError, IndexError):
+                    pass
+
+    return trainable_names
+
+
+def get_sam_trainable_params(model):
+    """Get trainable parameters from SAM."""
+    sam = model.sam if hasattr(model, 'sam') else model.sam_refiner.sam
+    return [p for p in sam.parameters() if p.requires_grad]
 
 
 class BCEDiceLossProb(nn.Module):
@@ -839,11 +927,20 @@ def main():
         logging.info(f'ROI cropping enabled: expand_ratio={args.roi_expand_ratio}')
 
     # Additional SAM freezing options
+    sam_initially_frozen = False  # Track if SAM was frozen at start for later unfreezing
+
     if args.freeze_sam_all:
         # Freeze entire SAM (only train TransUNet)
         for param in model.sam.parameters():
             param.requires_grad = False
         logging.info('Frozen entire SAM - only training TransUNet')
+    elif args.freeze_sam_epochs > 0:
+        # Freeze entire SAM for first N epochs, then partially unfreeze
+        for param in model.sam.parameters():
+            param.requires_grad = False
+        sam_initially_frozen = True
+        logging.info(f'SAM frozen for first {args.freeze_sam_epochs} epochs')
+        logging.info(f'Will unfreeze decoder layers={args.sam_unfreeze_decoder_layers} after epoch {args.freeze_sam_epochs}')
     elif args.freeze_sam_mask_decoder:
         # Freeze mask decoder specifically
         for param in model.sam.mask_decoder.parameters():
@@ -918,7 +1015,7 @@ def main():
     sam_params = list(model.get_sam_params())
 
     # Check if SAM is initially frozen
-    sam_frozen = args.freeze_sam_all or args.freeze_sam_mask_decoder
+    sam_frozen = args.freeze_sam_all or args.freeze_sam_mask_decoder or sam_initially_frozen
 
     # Build optimizer param groups based on what's trainable
     param_groups = []
@@ -962,7 +1059,7 @@ def main():
 
     # Training loop
     best_epoch = 0
-    sam_unfrozen = not (args.freeze_sam_all or args.freeze_sam_mask_decoder)
+    sam_unfrozen = not (args.freeze_sam_all or args.freeze_sam_mask_decoder or sam_initially_frozen)
 
     for epoch in range(start_epoch, args.max_epochs):
         # Unfreeze TransUNet after specified epochs
@@ -994,7 +1091,7 @@ def main():
             optimizer.add_param_group({'params': transunet_params, 'lr': args.transunet_lr})
             logging.info(f'Added {len(transunet_params)} TransUNet parameters to optimizer')
 
-        # Two-stage training: unfreeze SAM at specified epoch
+        # Two-stage training: unfreeze SAM at specified epoch (legacy option)
         if args.unfreeze_sam_epoch > 0 and epoch == args.unfreeze_sam_epoch and not sam_unfrozen:
             logging.info(f'Epoch {epoch}: Unfreezing SAM for joint training')
             for param in model.sam.mask_decoder.parameters():
@@ -1006,6 +1103,34 @@ def main():
 
             # Update optimizer to include SAM params
             sam_params = list(model.get_sam_params())
+            optimizer.add_param_group({'params': sam_params, 'lr': args.sam_lr})
+            logging.info(f'Added {len(sam_params)} SAM parameters to optimizer')
+
+        # Unfreeze SAM decoder (partially) after freeze_sam_epochs
+        if sam_initially_frozen and epoch == args.freeze_sam_epochs and not sam_unfrozen:
+            logging.info(f'Epoch {epoch}: Unfreezing SAM decoder '
+                         f'(layers={args.sam_unfreeze_decoder_layers})')
+
+            # Partially unfreeze SAM mask decoder
+            unfrozen_names = freeze_sam_except_decoder_layers(
+                model, args.sam_unfreeze_decoder_layers
+            )
+            logging.info(f'Unfrozen {len(unfrozen_names)} SAM parameters')
+            for name in unfrozen_names[:5]:
+                logging.info(f'  Unfrozen: {name}')
+            if len(unfrozen_names) > 5:
+                logging.info(f'  ... and {len(unfrozen_names) - 5} more')
+
+            # Optionally unfreeze prompt encoder too
+            if not args.freeze_sam_prompt_encoder:
+                for name, param in model.sam.prompt_encoder.named_parameters():
+                    param.requires_grad = True
+                logging.info('Also unfrozen SAM prompt encoder')
+
+            sam_unfrozen = True
+
+            # Add unfrozen SAM params to optimizer
+            sam_params = get_sam_trainable_params(model)
             optimizer.add_param_group({'params': sam_params, 'lr': args.sam_lr})
             logging.info(f'Added {len(sam_params)} SAM parameters to optimizer')
 
