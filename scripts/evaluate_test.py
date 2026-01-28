@@ -522,11 +522,14 @@ def apply_stabilization(coarse_mask, refined_mask,
 def visualize_sample(image, label, coarse_pred, refined_pred,
                      coarse_metrics, refined_metrics, sample_idx,
                      output_dir, dataset_name):
-    """Visualize a single sample: Image, GT, Coarse, Refined, Overlay, and metrics.
+    """Visualize a single sample with semi-transparent mask overlays and metrics sidebar.
 
-    Layout: 1 row x 5 columns
-      [Image] [GT] [Coarse] [Refined] [Overlay (GT+Coarse+Refined contours)]
-    Metrics panel printed as text on the right side.
+    Layout: 1 row x 4 panels
+      [Image] [GT + Coarse overlay] [GT + Refined overlay] [Metrics sidebar]
+
+    Overlays use semi-transparent colored masks:
+      - GT: green (alpha=0.3)
+      - Coarse/Refined: red (alpha=0.3)
 
     Args:
         image: Input image (H, W) or (H, W, 3)
@@ -553,61 +556,57 @@ def visualize_sample(image, label, coarse_pred, refined_pred,
     if image.max() > 1:
         image = image / 255.0
 
-    # Binarize predictions
-    coarse_binary = (coarse_pred > 0.5).astype(np.float32)
-    refined_binary = (refined_pred > 0.5).astype(np.float32)
-    label_binary = (label > 0.5).astype(np.float32)
+    # Binarize
+    coarse_binary = (coarse_pred > 0.5).astype(bool)
+    refined_binary = (refined_pred > 0.5).astype(bool)
+    label_binary = (label > 0.5).astype(bool)
 
-    # Create figure: 5 image panels + 1 text panel for metrics
-    fig = plt.figure(figsize=(22, 4))
+    # Convert grayscale to RGB for overlay
+    if image.ndim == 2:
+        image_rgb = np.stack([image, image, image], axis=-1)
+    else:
+        image_rgb = image
 
-    # Use GridSpec: 5 equal image columns + 1 narrower text column
-    gs = fig.add_gridspec(1, 6, width_ratios=[1, 1, 1, 1, 1, 0.8], wspace=0.05)
+    def overlay_masks(base_img, gt_mask, pred_mask):
+        """Create overlay with GT in green and prediction in red, semi-transparent."""
+        overlay = base_img.copy()
+        alpha = 0.35
+        # GT region: green
+        overlay[gt_mask] = overlay[gt_mask] * (1 - alpha) + np.array([0, 0.8, 0]) * alpha
+        # Prediction region: red
+        overlay[pred_mask] = overlay[pred_mask] * (1 - alpha) + np.array([0.9, 0.15, 0.15]) * alpha
+        # Overlap region (both GT and pred): blend to yellow-ish
+        overlap = gt_mask & pred_mask
+        overlay[overlap] = base_img[overlap] * (1 - alpha) + np.array([0.8, 0.7, 0]) * alpha
+        return np.clip(overlay, 0, 1)
+
+    # Create figure: 3 image panels + 1 metrics sidebar
+    fig = plt.figure(figsize=(15, 4.5))
+    gs = fig.add_gridspec(1, 4, width_ratios=[1, 1, 1, 0.7], wspace=0.08)
 
     # Panel 1: Input Image
     ax0 = fig.add_subplot(gs[0, 0])
-    ax0.imshow(image, cmap='gray')
-    ax0.set_ylabel('Image', fontsize=11, fontweight='bold', rotation=0, labelpad=50, va='center')
-    ax0.set_xticks([])
-    ax0.set_yticks([])
+    ax0.imshow(image_rgb)
+    ax0.set_title('Input Image', fontsize=11, fontweight='bold', pad=8)
+    ax0.axis('off')
 
-    # Panel 2: Ground Truth
+    # Panel 2: GT (green) + Coarse (red) overlay
     ax1 = fig.add_subplot(gs[0, 1])
-    ax1.imshow(label_binary, cmap='gray')
-    ax1.set_ylabel('GT', fontsize=11, fontweight='bold', rotation=0, labelpad=30, va='center')
-    ax1.set_xticks([])
-    ax1.set_yticks([])
+    overlay_coarse = overlay_masks(image_rgb, label_binary, coarse_binary)
+    ax1.imshow(overlay_coarse)
+    ax1.set_title('GT / Coarse', fontsize=11, fontweight='bold', pad=8)
+    ax1.axis('off')
 
-    # Panel 3: Coarse (TransUNet)
+    # Panel 3: GT (green) + Refined (red) overlay
     ax2 = fig.add_subplot(gs[0, 2])
-    ax2.imshow(coarse_binary, cmap='gray')
-    ax2.set_ylabel('Coarse', fontsize=11, fontweight='bold', rotation=0, labelpad=45, va='center')
-    ax2.set_xticks([])
-    ax2.set_yticks([])
+    overlay_refined = overlay_masks(image_rgb, label_binary, refined_binary)
+    ax2.imshow(overlay_refined)
+    ax2.set_title('GT / Refined', fontsize=11, fontweight='bold', pad=8)
+    ax2.axis('off')
 
-    # Panel 4: Refined (SAM)
+    # Panel 4: Metrics sidebar
     ax3 = fig.add_subplot(gs[0, 3])
-    ax3.imshow(refined_binary, cmap='gray')
-    ax3.set_ylabel('Refined', fontsize=11, fontweight='bold', rotation=0, labelpad=50, va='center')
-    ax3.set_xticks([])
-    ax3.set_yticks([])
-
-    # Panel 5: Overlay (GT=green, Coarse=red, Refined=blue contours on image)
-    ax4 = fig.add_subplot(gs[0, 4])
-    ax4.imshow(image, cmap='gray')
-    if label_binary.max() > 0:
-        ax4.contour(label_binary, levels=[0.5], colors='#00FF00', linewidths=1.5)
-    if coarse_binary.max() > 0:
-        ax4.contour(coarse_binary, levels=[0.5], colors='#FF4444', linewidths=1.5)
-    if refined_binary.max() > 0:
-        ax4.contour(refined_binary, levels=[0.5], colors='#4488FF', linewidths=1.5)
-    ax4.set_ylabel('Overlay', fontsize=11, fontweight='bold', rotation=0, labelpad=48, va='center')
-    ax4.set_xticks([])
-    ax4.set_yticks([])
-
-    # Panel 6: Metrics text
-    ax5 = fig.add_subplot(gs[0, 5])
-    ax5.axis('off')
+    ax3.axis('off')
 
     # Format HD95
     def fmt_hd(val):
@@ -625,46 +624,42 @@ def visualize_sample(image, label, coarse_pred, refined_pred,
     dice_imp = r_dice - c_dice
     iou_imp = r_iou - c_iou
 
-    # Build metrics text block
+    # HD95 delta
+    if c_hd95 is not None and r_hd95 is not None and np.isfinite(c_hd95) and np.isfinite(r_hd95):
+        hd95_delta = f'{c_hd95 - r_hd95:+.2f}'
+    else:
+        hd95_delta = 'N/A'
+
     lines = [
         f'Sample #{sample_idx}',
         '',
-        '--- Coarse ---',
-        f'Dice:  {c_dice:.4f}',
-        f'IoU:   {c_iou:.4f}',
-        f'HD95:  {fmt_hd(c_hd95)}',
+        '---- Coarse ----',
+        f'  Dice:  {c_dice:.4f}',
+        f'  IoU:   {c_iou:.4f}',
+        f'  HD95:  {fmt_hd(c_hd95)}',
         '',
-        '--- Refined ---',
-        f'Dice:  {r_dice:.4f}',
-        f'IoU:   {r_iou:.4f}',
-        f'HD95:  {fmt_hd(r_hd95)}',
+        '---- Refined ----',
+        f'  Dice:  {r_dice:.4f}',
+        f'  IoU:   {r_iou:.4f}',
+        f'  HD95:  {fmt_hd(r_hd95)}',
         '',
-        '--- Delta ---',
-        f'Dice:  {dice_imp:+.4f}',
-        f'IoU:   {iou_imp:+.4f}',
-    ]
-
-    # HD95 delta (lower is better, so coarse - refined)
-    if c_hd95 is not None and r_hd95 is not None and np.isfinite(c_hd95) and np.isfinite(r_hd95):
-        lines.append(f'HD95:  {c_hd95 - r_hd95:+.2f}')
-    else:
-        lines.append(f'HD95:  N/A')
-
-    # Legend
-    lines += [
+        '---- Delta ----',
+        f'  Dice:  {dice_imp:+.4f}',
+        f'  IoU:   {iou_imp:+.4f}',
+        f'  HD95:  {hd95_delta}',
         '',
-        '--- Legend ---',
-        'Green:  GT',
-        'Red:    Coarse',
-        'Blue:   Refined',
+        '---- Legend ----',
+        '  Green:   GT',
+        '  Red:     Prediction',
+        '  Yellow:  Overlap',
     ]
 
     text = '\n'.join(lines)
-    ax5.text(0.05, 0.95, text, transform=ax5.transAxes,
-             fontsize=8, fontfamily='monospace', verticalalignment='top',
-             bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', alpha=0.8))
+    ax3.text(0.05, 0.95, text, transform=ax3.transAxes,
+             fontsize=9, fontfamily='monospace', verticalalignment='top',
+             bbox=dict(boxstyle='round,pad=0.4', facecolor='lightyellow', alpha=0.9))
 
-    # Save figure to dataset's own directory
+    # Save
     vis_dir = os.path.join(output_dir, dataset_name, 'visualizations')
     os.makedirs(vis_dir, exist_ok=True)
 
