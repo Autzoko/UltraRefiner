@@ -199,13 +199,13 @@ def compute_hd95(pred_binary_np, target_binary_np):
         target_binary_np: Ground truth binary mask (H, W) as numpy array
 
     Returns:
-        HD95 value (float), or np.inf if either mask is empty
+        HD95 value (float), or None if either mask is empty (skipped)
     """
     # Handle empty masks
     if pred_binary_np.sum() == 0 and target_binary_np.sum() == 0:
         return 0.0
     if pred_binary_np.sum() == 0 or target_binary_np.sum() == 0:
-        return np.inf
+        return None  # Skip this sample for HD95 (empty prediction or GT)
 
     # Compute surface (boundary) points
     # Boundary = mask XOR eroded_mask
@@ -815,9 +815,13 @@ def evaluate_dataset(model, dataloader, device, refined_eval_size=224, use_gated
 
                 sample_idx += 1
 
-    # Average metrics
-    avg_coarse = {k: np.mean(v) for k, v in coarse_metrics.items()}
-    avg_refined = {k: np.mean(v) for k, v in refined_metrics.items()}
+    # Average metrics (filter None values for HD95)
+    def safe_mean(values):
+        valid = [v for v in values if v is not None]
+        return np.mean(valid) if valid else float('nan')
+
+    avg_coarse = {k: safe_mean(v) if k == 'hd95' else np.mean(v) for k, v in coarse_metrics.items()}
+    avg_refined = {k: safe_mean(v) if k == 'hd95' else np.mean(v) for k, v in refined_metrics.items()}
 
     # Generate visualizations
     if visualize and output_dir and dataset_name:
@@ -905,9 +909,9 @@ def print_results_table(results, datasets):
     total_samples = 0
 
     def fmt_hd95(val):
-        """Format HD95 value, handling inf."""
-        if np.isinf(val):
-            return f"{'inf':>10}"
+        """Format HD95 value, handling inf/nan."""
+        if val is None or np.isnan(val) or np.isinf(val):
+            return f"{'N/A':>10}"
         return f"{val:>10.2f}"
 
     for ds in datasets:
@@ -920,19 +924,21 @@ def print_results_table(results, datasets):
 
         # Calculate improvement
         dice_improvement = f['dice'] - c['dice']
-        hd95_improvement = c['hd95'] - f['hd95']  # Lower is better, so c - f
+        c_hd = c['hd95'] if c['hd95'] is not None and np.isfinite(c['hd95']) else None
+        f_hd = f['hd95'] if f['hd95'] is not None and np.isfinite(f['hd95']) else None
+        hd95_impr_str = f"HD95 {c_hd - f_hd:+.2f}" if c_hd is not None and f_hd is not None else "HD95 N/A"
 
         print(f"{ds:<15} {n:>8} {'':^3} "
               f"{c['dice']:>10.4f} {c['iou']:>10.4f} {fmt_hd95(c['hd95'])} {'':^3} "
               f"{f['dice']:>10.4f} {f['iou']:>10.4f} {fmt_hd95(f['hd95'])} "
-              f"(Dice {dice_improvement:+.4f}, HD95 {hd95_improvement:+.2f})")
+              f"(Dice {dice_improvement:+.4f}, {hd95_impr_str})")
 
         total_coarse_dice.append(c['dice'])
         total_refined_dice.append(f['dice'])
-        # Filter inf values for averaging
-        if not np.isinf(c['hd95']):
+        # Filter invalid values (nan/inf) for averaging
+        if c['hd95'] is not None and np.isfinite(c['hd95']):
             total_coarse_hd95.append(c['hd95'])
-        if not np.isinf(f['hd95']):
+        if f['hd95'] is not None and np.isfinite(f['hd95']):
             total_refined_hd95.append(f['hd95'])
         total_samples += n
 
@@ -942,13 +948,15 @@ def print_results_table(results, datasets):
     avg_coarse_dice = np.mean(total_coarse_dice)
     avg_refined_dice = np.mean(total_refined_dice)
     avg_improvement = avg_refined_dice - avg_coarse_dice
-    avg_coarse_hd95 = np.mean(total_coarse_hd95) if total_coarse_hd95 else float('inf')
-    avg_refined_hd95 = np.mean(total_refined_hd95) if total_refined_hd95 else float('inf')
+    avg_coarse_hd95 = np.mean(total_coarse_hd95) if total_coarse_hd95 else float('nan')
+    avg_refined_hd95 = np.mean(total_refined_hd95) if total_refined_hd95 else float('nan')
+    avg_hd95_str = (f"HD95 {avg_coarse_hd95 - avg_refined_hd95:+.2f}"
+                    if np.isfinite(avg_coarse_hd95) and np.isfinite(avg_refined_hd95) else "HD95 N/A")
 
     print(f"{'AVERAGE':<15} {total_samples:>8} {'':^3} "
           f"{avg_coarse_dice:>10.4f} {'':>10} {fmt_hd95(avg_coarse_hd95)} {'':^3} "
           f"{avg_refined_dice:>10.4f} {'':>10} {fmt_hd95(avg_refined_hd95)} "
-          f"(Dice {avg_improvement:+.4f}, HD95 {avg_coarse_hd95 - avg_refined_hd95:+.2f})")
+          f"(Dice {avg_improvement:+.4f}, {avg_hd95_str})")
 
     print("=" * 120)
 
@@ -968,14 +976,17 @@ def print_results_table(results, datasets):
         print(f"  Coarse (TransUNet):")
         print(f"    Dice: {c['dice']:.4f}, IoU: {c['iou']:.4f}, "
               f"Precision: {c['precision']:.4f}, Recall: {c['recall']:.4f}, "
-              f"Accuracy: {c['accuracy']:.4f}, HD95: {c['hd95']:.2f}")
+              f"Accuracy: {c['accuracy']:.4f}, HD95: {fmt_hd95(c['hd95'])}")
         print(f"  Refined (SAM):")
         print(f"    Dice: {f['dice']:.4f}, IoU: {f['iou']:.4f}, "
               f"Precision: {f['precision']:.4f}, Recall: {f['recall']:.4f}, "
-              f"Accuracy: {f['accuracy']:.4f}, HD95: {f['hd95']:.2f}")
+              f"Accuracy: {f['accuracy']:.4f}, HD95: {fmt_hd95(f['hd95'])}")
+        c_hd95 = c['hd95'] if c['hd95'] is not None and np.isfinite(c['hd95']) else None
+        f_hd95 = f['hd95'] if f['hd95'] is not None and np.isfinite(f['hd95']) else None
+        hd95_str = f"HD95 {c_hd95 - f_hd95:+.2f} (lower is better)" if c_hd95 is not None and f_hd95 is not None else "HD95 N/A"
         print(f"  Improvement: Dice {f['dice'] - c['dice']:+.4f}, "
               f"IoU {f['iou'] - c['iou']:+.4f}, "
-              f"HD95 {c['hd95'] - f['hd95']:+.2f} (lower is better)")
+              f"{hd95_str}")
 
     print("\n" + "=" * 120)
 
