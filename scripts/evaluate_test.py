@@ -89,7 +89,6 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from collections import defaultdict
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 from scipy import ndimage
 from scipy.ndimage import binary_dilation, binary_erosion, label as ndimage_label
 from scipy.ndimage import distance_transform_edt
@@ -521,23 +520,25 @@ def apply_stabilization(coarse_mask, refined_mask,
 # ============================================================================
 
 def visualize_sample(image, label, coarse_pred, refined_pred,
-                     coarse_dice, refined_dice, sample_idx,
+                     coarse_metrics, refined_metrics, sample_idx,
                      output_dir, dataset_name):
-    """Visualize a single sample with all predictions.
+    """Visualize a single sample: Image, GT, Coarse, Refined, Overlay, and metrics.
+
+    Layout: 1 row x 5 columns
+      [Image] [GT] [Coarse] [Refined] [Overlay (GT+Coarse+Refined contours)]
+    Metrics panel printed as text on the right side.
 
     Args:
         image: Input image (H, W) or (H, W, 3)
         label: Ground truth mask (H, W)
         coarse_pred: Coarse prediction (H, W) in [0, 1]
         refined_pred: Refined prediction (H, W) in [0, 1]
-        coarse_dice: Dice score for coarse prediction
-        refined_dice: Dice score for refined prediction
+        coarse_metrics: Dict with 'dice', 'iou', 'hd95'
+        refined_metrics: Dict with 'dice', 'iou', 'hd95'
         sample_idx: Sample index for filename
         output_dir: Output directory
         dataset_name: Dataset name for subdirectory
     """
-    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
-
     # Convert to numpy if tensor
     if torch.is_tensor(image):
         image = image.cpu().numpy()
@@ -552,90 +553,122 @@ def visualize_sample(image, label, coarse_pred, refined_pred,
     if image.max() > 1:
         image = image / 255.0
 
-    # Binarize predictions for overlay
+    # Binarize predictions
     coarse_binary = (coarse_pred > 0.5).astype(np.float32)
     refined_binary = (refined_pred > 0.5).astype(np.float32)
     label_binary = (label > 0.5).astype(np.float32)
 
-    # Row 1: Individual masks
-    # Image
-    axes[0, 0].imshow(image, cmap='gray')
-    axes[0, 0].set_title('Input Image')
-    axes[0, 0].axis('off')
+    # Create figure: 5 image panels + 1 text panel for metrics
+    fig = plt.figure(figsize=(22, 4))
 
-    # Ground Truth
-    axes[0, 1].imshow(label_binary, cmap='gray')
-    axes[0, 1].set_title('Ground Truth')
-    axes[0, 1].axis('off')
+    # Use GridSpec: 5 equal image columns + 1 narrower text column
+    gs = fig.add_gridspec(1, 6, width_ratios=[1, 1, 1, 1, 1, 0.8], wspace=0.05)
 
-    # Coarse (TransUNet)
-    axes[0, 2].imshow(coarse_binary, cmap='gray')
-    axes[0, 2].set_title(f'Coarse (Dice: {coarse_dice:.4f})')
-    axes[0, 2].axis('off')
+    # Panel 1: Input Image
+    ax0 = fig.add_subplot(gs[0, 0])
+    ax0.imshow(image, cmap='gray')
+    ax0.set_ylabel('Image', fontsize=11, fontweight='bold', rotation=0, labelpad=50, va='center')
+    ax0.set_xticks([])
+    ax0.set_yticks([])
 
-    # Refined (SAM)
-    axes[0, 3].imshow(refined_binary, cmap='gray')
-    axes[0, 3].set_title(f'Refined (Dice: {refined_dice:.4f})')
-    axes[0, 3].axis('off')
+    # Panel 2: Ground Truth
+    ax1 = fig.add_subplot(gs[0, 1])
+    ax1.imshow(label_binary, cmap='gray')
+    ax1.set_ylabel('GT', fontsize=11, fontweight='bold', rotation=0, labelpad=30, va='center')
+    ax1.set_xticks([])
+    ax1.set_yticks([])
 
-    # Row 2: Overlays and comparisons
-    # Image with GT overlay
-    axes[1, 0].imshow(image, cmap='gray')
-    axes[1, 0].contour(label_binary, colors='green', linewidths=2)
-    axes[1, 0].set_title('GT Contour')
-    axes[1, 0].axis('off')
+    # Panel 3: Coarse (TransUNet)
+    ax2 = fig.add_subplot(gs[0, 2])
+    ax2.imshow(coarse_binary, cmap='gray')
+    ax2.set_ylabel('Coarse', fontsize=11, fontweight='bold', rotation=0, labelpad=45, va='center')
+    ax2.set_xticks([])
+    ax2.set_yticks([])
 
-    # Coarse overlay on image
-    axes[1, 1].imshow(image, cmap='gray')
-    axes[1, 1].contour(label_binary, colors='green', linewidths=2)
-    axes[1, 1].contour(coarse_binary, colors='red', linewidths=2)
-    axes[1, 1].set_title('Coarse vs GT')
-    axes[1, 1].axis('off')
+    # Panel 4: Refined (SAM)
+    ax3 = fig.add_subplot(gs[0, 3])
+    ax3.imshow(refined_binary, cmap='gray')
+    ax3.set_ylabel('Refined', fontsize=11, fontweight='bold', rotation=0, labelpad=50, va='center')
+    ax3.set_xticks([])
+    ax3.set_yticks([])
 
-    # Refined overlay on image
-    axes[1, 2].imshow(image, cmap='gray')
-    axes[1, 2].contour(label_binary, colors='green', linewidths=2)
-    axes[1, 2].contour(refined_binary, colors='blue', linewidths=2)
-    axes[1, 2].set_title('Refined vs GT')
-    axes[1, 2].axis('off')
+    # Panel 5: Overlay (GT=green, Coarse=red, Refined=blue contours on image)
+    ax4 = fig.add_subplot(gs[0, 4])
+    ax4.imshow(image, cmap='gray')
+    if label_binary.max() > 0:
+        ax4.contour(label_binary, levels=[0.5], colors='#00FF00', linewidths=1.5)
+    if coarse_binary.max() > 0:
+        ax4.contour(coarse_binary, levels=[0.5], colors='#FF4444', linewidths=1.5)
+    if refined_binary.max() > 0:
+        ax4.contour(refined_binary, levels=[0.5], colors='#4488FF', linewidths=1.5)
+    ax4.set_ylabel('Overlay', fontsize=11, fontweight='bold', rotation=0, labelpad=48, va='center')
+    ax4.set_xticks([])
+    ax4.set_yticks([])
 
-    # Difference map: show where refined differs from coarse
-    # Green: refined correct, coarse wrong
-    # Red: refined wrong, coarse correct
-    # Yellow: both wrong
-    diff_map = np.zeros((*label_binary.shape, 3))
+    # Panel 6: Metrics text
+    ax5 = fig.add_subplot(gs[0, 5])
+    ax5.axis('off')
 
-    # Refined correct, coarse wrong (green)
-    refined_correct = (refined_binary == label_binary)
-    coarse_wrong = (coarse_binary != label_binary)
-    diff_map[refined_correct & coarse_wrong] = [0, 1, 0]
+    # Format HD95
+    def fmt_hd(val):
+        if val is None or (isinstance(val, float) and (np.isnan(val) or np.isinf(val))):
+            return 'N/A'
+        return f'{val:.2f}'
 
-    # Refined wrong, coarse correct (red)
-    refined_wrong = (refined_binary != label_binary)
-    coarse_correct = (coarse_binary == label_binary)
-    diff_map[refined_wrong & coarse_correct] = [1, 0, 0]
+    c_dice = coarse_metrics['dice']
+    r_dice = refined_metrics['dice']
+    c_iou = coarse_metrics['iou']
+    r_iou = refined_metrics['iou']
+    c_hd95 = coarse_metrics['hd95']
+    r_hd95 = refined_metrics['hd95']
 
-    # Both wrong (yellow)
-    diff_map[refined_wrong & coarse_wrong] = [1, 1, 0]
+    dice_imp = r_dice - c_dice
+    iou_imp = r_iou - c_iou
 
-    axes[1, 3].imshow(diff_map)
-    axes[1, 3].set_title(f'Improvement: {refined_dice - coarse_dice:+.4f}')
-    axes[1, 3].axis('off')
+    # Build metrics text block
+    lines = [
+        f'Sample #{sample_idx}',
+        '',
+        '--- Coarse ---',
+        f'Dice:  {c_dice:.4f}',
+        f'IoU:   {c_iou:.4f}',
+        f'HD95:  {fmt_hd(c_hd95)}',
+        '',
+        '--- Refined ---',
+        f'Dice:  {r_dice:.4f}',
+        f'IoU:   {r_iou:.4f}',
+        f'HD95:  {fmt_hd(r_hd95)}',
+        '',
+        '--- Delta ---',
+        f'Dice:  {dice_imp:+.4f}',
+        f'IoU:   {iou_imp:+.4f}',
+    ]
 
-    # Add legend
-    green_patch = mpatches.Patch(color='green', label='Refined fixed')
-    red_patch = mpatches.Patch(color='red', label='Refined broke')
-    yellow_patch = mpatches.Patch(color='yellow', label='Both wrong')
-    axes[1, 3].legend(handles=[green_patch, red_patch, yellow_patch],
-                      loc='lower right', fontsize=8)
+    # HD95 delta (lower is better, so coarse - refined)
+    if c_hd95 is not None and r_hd95 is not None and np.isfinite(c_hd95) and np.isfinite(r_hd95):
+        lines.append(f'HD95:  {c_hd95 - r_hd95:+.2f}')
+    else:
+        lines.append(f'HD95:  N/A')
 
-    plt.tight_layout()
+    # Legend
+    lines += [
+        '',
+        '--- Legend ---',
+        'Green:  GT',
+        'Red:    Coarse',
+        'Blue:   Refined',
+    ]
+
+    text = '\n'.join(lines)
+    ax5.text(0.05, 0.95, text, transform=ax5.transAxes,
+             fontsize=8, fontfamily='monospace', verticalalignment='top',
+             bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', alpha=0.8))
 
     # Save figure to dataset's own directory
     vis_dir = os.path.join(output_dir, dataset_name, 'visualizations')
     os.makedirs(vis_dir, exist_ok=True)
 
-    improvement = refined_dice - coarse_dice
+    improvement = r_dice - c_dice
     filename = f'sample_{sample_idx:04d}_imp{improvement:+.4f}.png'
     plt.savefig(os.path.join(vis_dir, filename), dpi=150, bbox_inches='tight')
     plt.close()
@@ -809,6 +842,10 @@ def evaluate_dataset(model, dataloader, device, refined_eval_size=224, use_gated
                         'refined': refined_for_vis.cpu(),
                         'coarse_dice': coarse_dice,
                         'refined_dice': refined_dice,
+                        'coarse_iou': sample_coarse_metrics['iou'],
+                        'refined_iou': sample_refined_metrics['iou'],
+                        'coarse_hd95': sample_coarse_metrics['hd95'],
+                        'refined_hd95': sample_refined_metrics['hd95'],
                         'improvement': refined_dice - coarse_dice,
                         'idx': sample_idx
                     })
@@ -855,8 +892,16 @@ def evaluate_dataset(model, dataloader, device, refined_eval_size=224, use_gated
                 label=sample['label'],
                 coarse_pred=sample['coarse'],
                 refined_pred=sample['refined'],
-                coarse_dice=sample['coarse_dice'],
-                refined_dice=sample['refined_dice'],
+                coarse_metrics={
+                    'dice': sample['coarse_dice'],
+                    'iou': sample['coarse_iou'],
+                    'hd95': sample['coarse_hd95'],
+                },
+                refined_metrics={
+                    'dice': sample['refined_dice'],
+                    'iou': sample['refined_iou'],
+                    'hd95': sample['refined_hd95'],
+                },
                 sample_idx=sample['idx'],
                 output_dir=output_dir,
                 dataset_name=dataset_name

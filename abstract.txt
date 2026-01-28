@@ -586,25 +586,35 @@ For each dataset D:
 
 Result: Every training sample has exactly one prediction (from when it was in validation set)
 
-Phase 2: SAM Fine-tuning
-========================
-We provide TWO approaches for Phase 2, each with different trade-offs:
+Phase 2: SAM Fine-tuning (Hybrid Approach)
+==========================================
+We adopt a HYBRID training strategy that combines the best of both worlds:
+50% real TransUNet predictions and 50% synthetically augmented GT masks.
 
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  OPTION A: Using GT with Synthetic Failure Simulation (RECOMMENDED)         │
-│  Script: finetune_sam_augmented.py                                          │
-│  Pros: Large-scale training data (~100K), diverse failure modes,            │
-│        teaches "when to modify" and "when to preserve"                      │
-│  Cons: Simulated errors may differ from actual model failures               │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  OPTION B: Using Actual TransUNet Predictions                               │
-│  Script: finetune_sam_with_preds.py                                         │
-│  Pros: Realistic coarse masks, matches E2E training distribution            │
-│  Cons: Limited training data (~3K), requires Phase 1 completion + inference │
+│  HYBRID APPROACH (USED IN PRACTICE)                                         │
+│  Script: finetune_sam_hybrid.py                                             │
+│                                                                             │
+│  Data Mix: 50% real TransUNet predictions + 50% augmented GT masks          │
+│  Pros: Combines realistic coarse masks with diverse failure modes,          │
+│        balances distribution coverage with training data volume             │
+│  Training: All 5 datasets combined (BUSI, BUSBRA, BUS, BUS_UC, BUS_UCLM)  │
+│  SAM Backbone: SAM ViT-B (sam_vit_b_01ec64.pth)                            │
+│  Mask Prompt: Direct style (no Gaussian blur)                               │
+│  ROI Cropping: Enabled (expand_ratio=0.5)                                  │
+│  Epochs: 300, Batch Size: 4, Mixed Precision (AMP)                         │
+│  Augmentor Preset: default (12 error types, balanced distribution)          │
 └─────────────────────────────────────────────────────────────────────────────┘
 
+The hybrid approach addresses the limitations of pure prediction-based or pure
+augmentation-based training:
+- Real predictions (50%): Ensure SAM learns the actual TransUNet error distribution
+- Augmented GT (50%): Provide diverse failure modes and teach "when to preserve"
+
+Two alternative approaches are also supported:
+
 ================================================================================
-Phase 2 Option A: SAM Fine-tuning with Online Mask Augmentation [RECOMMENDED]
+Phase 2 Alternative A: SAM Fine-tuning with Pure Online Mask Augmentation
 ================================================================================
 Objective: Train SAM to refine imperfect masks by simulating realistic segmentation
 failures directly on ground-truth masks using on-the-fly augmentation.
@@ -859,7 +869,7 @@ The quality weight increases with input quality:
 This ensures the refiner learns to make corrections proportional to input quality.
 
 ================================================================================
-Phase 2 Option B: SAM Fine-tuning (With Actual TransUNet Predictions)
+Phase 2 Alternative B: SAM Fine-tuning with Pure TransUNet Predictions
 ================================================================================
 Objective: Adapt SAM to refine TransUNet's actual outputs.
 
@@ -1102,16 +1112,47 @@ TensorBoard logging:
   - val_refined/dice, val_refined/iou, ...
   - val_delta/dice, val_delta/iou, ...
 
-Output: checkpoints/sam_finetuned/fold_{k}/best.pth
+Output: checkpoints/sam_finetuned_hybrid/best.pth (shared across all datasets and folds)
 
 Phase 3: End-to-End Joint Optimization
 --------------------------------------
 Objective: Jointly optimize TransUNet and SAM with full gradient flow.
 
 Model initialization:
-  transunet = load(checkpoints/transunet/{D}/fold_{k}/best.pth)
-  sam_refiner = load(checkpoints/sam_finetuned/fold_{k}/best.pth)
+  transunet = load(checkpoints/transunet/{D}/fold_{k}/best.pth)  # Per-dataset, per-fold
+  sam_refiner = load(checkpoints/sam_finetuned_hybrid/best.pth)  # Shared across datasets
   ultra_refiner = UltraRefiner(transunet, sam_refiner)
+
+Training is performed per-dataset with 5-fold cross-validation, matching Phase 1.
+
+Training Configuration (As Used in Practice):
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  Epochs: 50                                                             │
+  │  Batch Size: 2                                                          │
+  │  Mask Prompt Style: direct (matching Phase 2)                           │
+  │  ROI Cropping: Enabled, expand_ratio=0.5 (matching Phase 2)            │
+  │  Loss Weights: 0.1 × L_coarse + 0.9 × L_refined                       │
+  │  SAM Learning Rate: 1e-6 (very conservative)                           │
+  │  Refined Evaluation Size: 1024 (evaluate at SAM resolution)            │
+  │                                                                         │
+  │  Progressive Unfreezing Strategy:                                       │
+  │  ├── Epochs 0-9:  TransUNet FROZEN, SAM trainable                      │
+  │  │                (SAM adapts to TransUNet's fixed outputs)             │
+  │  └── Epochs 10-49: TransUNet last 2 decoder layers UNFROZEN            │
+  │                    (Joint optimization with partial TransUNet update)   │
+  │                                                                         │
+  │  TransUNet Freezing: Only last 2 decoder blocks + segmentation head    │
+  │  are trainable after unfreezing (encoder + early decoder stay frozen)   │
+  │  SAM Freezing: Image encoder always frozen; prompt encoder +           │
+  │  mask decoder trainable throughout                                      │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+Rationale for Progressive Unfreezing:
+  - Epochs 0-9: SAM learns to work with TransUNet's current output distribution
+    without TransUNet shifting underneath. This stabilizes early training.
+  - Epochs 10-49: TransUNet's last 2 decoder layers are gradually updated,
+    allowing it to produce coarse masks better suited for SAM refinement,
+    while keeping the encoder features (learned in Phase 1) stable.
 
 Forward pass with gradient flow:
   # TransUNet produces soft mask
@@ -1120,21 +1161,26 @@ Forward pass with gradient flow:
   # Differentiable prompt generation (gradients flow through)
   prompts = generate_prompts(p_coarse)               # points, boxes, masks
 
-  # SAM refinement
+  # SAM refinement (with ROI cropping)
   image_1024 = resize(image_224, 1024)
-  img_emb = sam.image_encoder(image_1024)
-  sparse_emb, dense_emb = sam.prompt_encoder(prompts)
+  roi = extract_roi(p_coarse, expand_ratio=0.5)
+  image_roi = crop(image_1024, roi)                  # (B, 3, 1024, 1024)
+  img_emb = sam.image_encoder(image_roi)
+  sparse_emb, dense_emb = sam.prompt_encoder(prompts_roi)
   p_refined = sam.mask_decoder(img_emb, sparse_emb, dense_emb)
+  p_refined_full = paste_back(p_refined, roi)        # Back to full image
 
-Combined loss:
+Combined loss (heavily weighted toward refinement):
   L_coarse = CE(p_coarse, gt) + Dice(p_coarse, gt)
   L_refined = BCE(p_refined, gt) + Dice(p_refined, gt)
-  L_total = 0.3 * L_coarse + 0.7 * L_refined
+  L_total = 0.1 * L_coarse + 0.9 * L_refined
 
 Gradient flow:
-  dL/d(transunet_params) = dL_coarse/d(params) + dL_refined/d(p_refined) * d(p_refined)/d(prompts) * d(prompts)/d(p_coarse) * d(p_coarse)/d(params)
+  dL/d(transunet_params) = 0.1 * dL_coarse/d(params)
+                         + 0.9 * dL_refined/d(p_refined) × d(p_refined)/d(prompts) × d(prompts)/d(p_coarse) × d(p_coarse)/d(params)
 
-This enables TransUNet to learn features that produce coarse masks optimized for SAM refinement.
+The 0.9 weight on L_refined ensures TransUNet learns to produce coarse masks
+optimized for SAM refinement, not just for standalone accuracy.
 
 ================================================================================
 4. DATASETS AND EVALUATION
@@ -1170,9 +1216,15 @@ Data Pipeline:
 - SAM input: 1024x1024 RGB, normalized with ImageNet stats
 
 Training Configuration:
-- TransUNet: SGD, lr=0.01, poly scheduler, 150 epochs
-- SAM fine-tune: AdamW, lr=1e-4, cosine scheduler, 100 epochs
-- End-to-end: AdamW, lr=1e-5, cosine scheduler, 100 epochs
+- Phase 1 (TransUNet): SGD, lr=0.01, poly scheduler, 150 epochs, per-dataset 5-fold CV
+- Phase 2 (SAM hybrid): AdamW, lr=1e-4, cosine scheduler, 300 epochs, batch_size=4,
+  all 5 datasets combined, 50% real predictions + 50% augmented GT,
+  direct mask prompt, ROI crop (expand=0.5), mixed precision (AMP)
+- Phase 3 (End-to-end): AdamW, SAM lr=1e-6, cosine scheduler, 50 epochs, batch_size=2,
+  per-dataset 5-fold CV, loss weights 0.1 coarse + 0.9 refined,
+  direct mask prompt, ROI crop (expand=0.5),
+  freeze TransUNet for 10 epochs then unfreeze last 2 decoder layers,
+  refined evaluation at 1024 resolution
 
 Logging:
 - TensorBoard support for loss, metrics, learning rate
