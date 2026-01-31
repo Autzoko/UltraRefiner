@@ -1,16 +1,38 @@
 #!/usr/bin/env python3
 """
-Evaluate UltraRefiner on test sets of each dataset.
+Evaluate UltraRefiner on test, train, or validation sets of each dataset.
 
 Shows scores for:
 1. Without refinement (TransUNet coarse output)
 2. With refinement (SAM refined output)
 
 Usage:
+    # Evaluate on test set (default)
     python scripts/evaluate_test.py \
         --checkpoint ./checkpoints/ultra_refiner/fold_0/best.pth \
         --data_root ./dataset/processed \
         --datasets BUSI BUSBRA BUS BUS_UC BUS_UCLM
+
+    # Evaluate on TRAIN set (all training data, no augmentation)
+    python scripts/evaluate_test.py \
+        --checkpoint ./checkpoints/ultra_refiner/fold_0/best.pth \
+        --data_root ./dataset/processed \
+        --datasets BUSI \
+        --split train
+
+    # Evaluate on K-fold VALIDATION set (requires --fold)
+    python scripts/evaluate_test.py \
+        --checkpoint ./checkpoints/ultra_refiner/fold_0/best.pth \
+        --data_root ./dataset/processed \
+        --datasets BUSI \
+        --split val --fold 0 --n_splits 5
+
+    # Evaluate on K-fold TRAIN split (train subset of K-fold)
+    python scripts/evaluate_test.py \
+        --checkpoint ./checkpoints/ultra_refiner/fold_0/best.pth \
+        --data_root ./dataset/processed \
+        --datasets BUSI \
+        --split kfold_train --fold 0 --n_splits 5
 
     # Evaluate at SAM's native resolution (1024x1024)
     python scripts/evaluate_test.py \
@@ -97,7 +119,16 @@ from scipy.ndimage import distance_transform_edt
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models import build_ultra_refiner, build_gated_ultra_refiner, CONFIGS
-from data import get_test_dataloader, SUPPORTED_DATASETS, UNSEEN_DATASETS, ALL_DATASETS
+from data import (
+    get_test_dataloader,
+    get_kfold_dataloaders,
+    get_combined_kfold_dataloaders,
+    BreastUltrasoundDataset,
+    RandomGenerator,
+    SUPPORTED_DATASETS,
+    UNSEEN_DATASETS,
+    ALL_DATASETS,
+)
 
 
 def get_args():
@@ -120,6 +151,17 @@ def get_args():
                         help='Root directory containing processed datasets')
     parser.add_argument('--datasets', type=str, nargs='+', default=None,
                         help='Dataset names to evaluate (default: all training datasets)')
+    parser.add_argument('--split', type=str, default='test',
+                        choices=['test', 'train', 'val', 'kfold_train'],
+                        help='Which data split to evaluate on. '
+                             'test = held-out test set (default), '
+                             'train = all training data (no augmentation), '
+                             'val = K-fold validation split (requires --fold), '
+                             'kfold_train = K-fold training split (requires --fold)')
+    parser.add_argument('--fold', type=int, default=0,
+                        help='Fold index for K-fold splits (used with --split val or kfold_train)')
+    parser.add_argument('--n_splits', type=int, default=5,
+                        help='Number of K-fold splits (used with --split val or kfold_train)')
     parser.add_argument('--include_unseen', action='store_true',
                         help='Include unseen test-only datasets (e.g., UDIAT) in evaluation')
     parser.add_argument('--batch_size', type=int, default=4,
@@ -184,8 +226,8 @@ def get_args():
                         help='GPU device ID')
     parser.add_argument('--save_predictions', action='store_true',
                         help='Save prediction masks')
-    parser.add_argument('--output_dir', type=str, default='./results/test_evaluation',
-                        help='Output directory for predictions')
+    parser.add_argument('--output_dir', type=str, default=None,
+                        help='Output directory for predictions (default: ./results/{split}_evaluation)')
 
     return parser.parse_args()
 
@@ -925,11 +967,11 @@ def evaluate_dataset(model, dataloader, device, refined_eval_size=224, use_gated
     return result
 
 
-def print_results_table(results, datasets):
+def print_results_table(results, datasets, split_name='test'):
     """Print results in a formatted table."""
 
     print("\n" + "=" * 120)
-    print("                              TEST SET EVALUATION RESULTS")
+    print(f"                              {split_name.upper()} SET EVALUATION RESULTS")
     print("=" * 120)
 
     # Header
@@ -1046,6 +1088,13 @@ def main():
     device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
 
+    # Default output directory based on split
+    if args.output_dir is None:
+        if args.split in ('val', 'kfold_train'):
+            args.output_dir = f'./results/{args.split}_fold{args.fold}_evaluation'
+        else:
+            args.output_dir = f'./results/{args.split}_evaluation'
+
     # Default datasets
     if args.datasets is None:
         if args.include_unseen:
@@ -1054,6 +1103,9 @@ def main():
             args.datasets = SUPPORTED_DATASETS
 
     print(f"\nEvaluating on datasets: {args.datasets}")
+    print(f"Split: {args.split}")
+    if args.split in ('val', 'kfold_train'):
+        print(f"  Fold: {args.fold}/{args.n_splits}")
     print(f"Refined evaluation size: {args.refined_eval_size}")
     print(f"Binarization threshold: {args.threshold}")
 
@@ -1124,26 +1176,73 @@ def main():
 
     for dataset_name in args.datasets:
         print(f"\n{'='*60}")
-        print(f"Evaluating on {dataset_name}...")
+        print(f"Evaluating on {dataset_name} ({args.split})...")
         print(f"{'='*60}")
 
-        # Check if test set exists
-        test_dir = os.path.join(args.data_root, dataset_name, 'test')
-        if not os.path.exists(test_dir):
-            print(f"  Warning: Test set not found at {test_dir}, skipping...")
-            continue
-
-        # Create dataloader
+        # Create dataloader based on split type
         try:
-            dataloader = get_test_dataloader(
-                data_root=args.data_root,
-                dataset_name=dataset_name,
-                batch_size=args.batch_size,
-                img_size=img_size,
-                num_workers=args.num_workers,
-                for_sam=False
-            )
-            print(f"  Loaded {len(dataloader.dataset)} test samples")
+            if args.split == 'test':
+                # Test set: load from {data_root}/{dataset}/test/
+                test_dir = os.path.join(args.data_root, dataset_name, 'test')
+                if not os.path.exists(test_dir):
+                    print(f"  Warning: Test set not found at {test_dir}, skipping...")
+                    continue
+                dataloader = get_test_dataloader(
+                    data_root=args.data_root,
+                    dataset_name=dataset_name,
+                    batch_size=args.batch_size,
+                    img_size=img_size,
+                    num_workers=args.num_workers,
+                    for_sam=False
+                )
+
+            elif args.split == 'train':
+                # Full training set: load all data from {data_root}/{dataset}/train/
+                train_dir = os.path.join(args.data_root, dataset_name, 'train')
+                if not os.path.exists(train_dir):
+                    print(f"  Warning: Train set not found at {train_dir}, skipping...")
+                    continue
+                transform = RandomGenerator(
+                    output_size=[img_size, img_size],
+                    random_rotate=False,
+                    random_flip=False
+                )
+                dataset = BreastUltrasoundDataset(
+                    data_root=args.data_root,
+                    dataset_name=dataset_name,
+                    split='train',
+                    transform=transform,
+                    img_size=img_size,
+                )
+                dataloader = torch.utils.data.DataLoader(
+                    dataset,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    num_workers=args.num_workers,
+                    pin_memory=True,
+                    drop_last=False,
+                )
+
+            elif args.split in ('val', 'kfold_train'):
+                # K-fold split: use K-fold cross-validator on training data
+                train_loader, val_loader = get_kfold_dataloaders(
+                    data_root=args.data_root,
+                    dataset_name=dataset_name,
+                    fold_idx=args.fold,
+                    n_splits=args.n_splits,
+                    batch_size=args.batch_size,
+                    img_size=img_size,
+                    num_workers=args.num_workers,
+                    for_sam=False,
+                    seed=42
+                )
+                dataloader = val_loader if args.split == 'val' else train_loader
+
+            else:
+                print(f"  Unknown split: {args.split}, skipping...")
+                continue
+
+            print(f"  Loaded {len(dataloader.dataset)} {args.split} samples")
         except Exception as e:
             print(f"  Error loading dataset: {e}, skipping...")
             continue
@@ -1208,17 +1307,24 @@ def main():
             dataset_dir = os.path.join(args.output_dir, dataset_name)
             os.makedirs(dataset_dir, exist_ok=True)
 
-            dataset_results_path = os.path.join(dataset_dir, 'test_result.json')
+            result_filename = f'{args.split}_result.json'
+            if args.split in ('val', 'kfold_train'):
+                result_filename = f'{args.split}_fold{args.fold}_result.json'
+            dataset_results_path = os.path.join(dataset_dir, result_filename)
             with open(dataset_results_path, 'w') as f:
                 json.dump(convert_to_serializable({
                     'dataset': dataset_name,
+                    'split': args.split,
                     'args': vars(args),
                     'results': dataset_results,
                 }), f, indent=2)
             print(f"  Results saved to: {dataset_results_path}")
 
     # Print final results table
-    summary = print_results_table(results, args.datasets)
+    split_label = args.split
+    if args.split in ('val', 'kfold_train'):
+        split_label = f'{args.split} (fold {args.fold}/{args.n_splits})'
+    summary = print_results_table(results, args.datasets, split_name=split_label)
 
     # Save combined summary
     if args.output_dir:
