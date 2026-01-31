@@ -41,12 +41,12 @@ def get_args():
     parser = argparse.ArgumentParser(description='Phase 2: SAM Finetuning with Offline Augmented Data')
 
     # Data paths
-    parser.add_argument('--data_root', type=str, required=True,
-                        help='Root directory containing augmented datasets')
+    parser.add_argument('--data_root', type=str, default=None,
+                        help='Root directory containing augmented datasets (required unless --real_ratio 1.0)')
     parser.add_argument('--pred_data_root', type=str, default=None,
-                        help='Root directory containing TransUNet predictions (optional)')
+                        help='Root directory containing TransUNet predictions')
     parser.add_argument('--real_ratio', type=float, default=0.0,
-                        help='Ratio of real predictions (0.0 = 100%% augmented, 0.5 = 50%% each)')
+                        help='Ratio of real predictions (0.0 = 100%% augmented, 0.5 = 50%% each, 1.0 = 100%% real)')
     parser.add_argument('--datasets', type=str, nargs='+', required=True,
                         help='Dataset names (e.g., BUSI BUSBRA)')
 
@@ -144,7 +144,7 @@ def compute_dice(pred, gt):
     return (2 * intersection + 1e-6) / (union + 1e-6)
 
 
-def train_epoch(model, train_loader, optimizer, scaler, device, use_amp, grad_accum_steps):
+def train_epoch(model, train_loader, optimizer, scaler, device, use_amp, grad_accum_steps, change_penalty_weight=0.5):
     """Train for one epoch."""
     model.train()
     total_loss = 0
@@ -164,7 +164,7 @@ def train_epoch(model, train_loader, optimizer, scaler, device, use_amp, grad_ac
             refined_masks = result['masks']
 
             loss, loss_components = quality_aware_loss(
-                refined_masks, gt_mask, coarse_mask, change_penalty_weight=0.5
+                refined_masks, gt_mask, coarse_mask, change_penalty_weight=change_penalty_weight
             )
             loss = loss / grad_accum_steps
 
@@ -254,8 +254,31 @@ def main():
     output_dir = os.path.join(args.output_dir, dataset_str)
     os.makedirs(output_dir, exist_ok=True)
 
+    # Validate arguments
+    real_only = args.pred_data_root and args.real_ratio >= 1.0
+    if not real_only and args.data_root is None:
+        print("Error: --data_root is required unless using --real_ratio 1.0 with --pred_data_root.")
+        sys.exit(1)
+    if args.pred_data_root and args.real_ratio > 0 and args.real_ratio < 1.0 and args.data_root is None:
+        print("Error: --data_root is required for hybrid mode (real_ratio < 1.0).")
+        sys.exit(1)
+
     # Create dataloaders
-    if args.pred_data_root and args.real_ratio > 0:
+    if real_only:
+        # Pure real prediction mode: use only TransUNet predictions, no augmented data
+        print(f"\nCreating real-only dataloaders (100% TransUNet predictions)...")
+        print(f"  Real predictions from: {args.pred_data_root}")
+        train_loader, val_loader = get_offline_augmented_dataloaders(
+            data_root=args.pred_data_root,
+            dataset_names=args.datasets,
+            batch_size=args.batch_size,
+            img_size=1024,
+            transunet_img_size=args.transunet_img_size,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+            persistent_workers=not args.no_persistent_workers,
+        )
+    elif args.pred_data_root and args.real_ratio > 0:
         # Offline hybrid mode: mix real predictions with offline augmented data
         print(f"\nCreating offline hybrid dataloaders (real_ratio={args.real_ratio})...")
         print(f"  Real predictions from: {args.pred_data_root}")
@@ -343,7 +366,7 @@ def main():
         # Train
         train_metrics = train_epoch(
             model, train_loader, optimizer, scaler, device,
-            args.use_amp, args.grad_accum_steps
+            args.use_amp, args.grad_accum_steps, args.change_penalty_weight
         )
 
         # Validate

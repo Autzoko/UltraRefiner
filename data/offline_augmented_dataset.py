@@ -136,15 +136,6 @@ class OfflineAugmentedDataset(Dataset):
         coarse_path = os.path.join(self.coarse_mask_dir, f"{name}.npy")
         coarse_mask = np.load(coarse_path)
 
-        # Resize coarse_mask to match gt_mask if needed
-        if coarse_mask.shape != gt_mask.shape:
-            import cv2
-            coarse_mask = cv2.resize(
-                coarse_mask,
-                (gt_mask.shape[1], gt_mask.shape[0]),
-                interpolation=cv2.INTER_LINEAR
-            )
-
         # Convert to tensors
         image = torch.from_numpy(image).float()
         gt_mask = torch.from_numpy(gt_mask).float()
@@ -160,13 +151,26 @@ class OfflineAugmentedDataset(Dataset):
 
         original_size = (image.shape[-2], image.shape[-1])
 
+        # Check if coarse mask is already at transunet resolution
+        coarse_h, coarse_w = coarse_mask.shape[-2:]
+        coarse_at_transunet_res = (
+            self.transunet_img_size > 0
+            and coarse_h == self.transunet_img_size
+            and coarse_w == self.transunet_img_size
+        )
+
         # Resolution path matching
         if self.transunet_img_size > 0 and self.transunet_img_size < self.img_size:
             image_small = TF.resize(image, [self.transunet_img_size, self.transunet_img_size])
-            coarse_mask_small = TF.resize(
-                coarse_mask.unsqueeze(0), [self.transunet_img_size, self.transunet_img_size],
-                interpolation=TF.InterpolationMode.BILINEAR
-            ).squeeze(0)
+
+            if coarse_at_transunet_res:
+                # Coarse mask is already at transunet resolution — resize directly to SAM size
+                coarse_mask_small = coarse_mask
+            else:
+                coarse_mask_small = TF.resize(
+                    coarse_mask.unsqueeze(0), [self.transunet_img_size, self.transunet_img_size],
+                    interpolation=TF.InterpolationMode.BILINEAR
+                ).squeeze(0)
 
             image = TF.resize(image_small, [self.img_size, self.img_size])
             coarse_mask = TF.resize(

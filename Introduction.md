@@ -665,58 +665,268 @@ This maintains differentiability while approximating the discrete selection beha
 
 ## 9. Loss Functions
 
-### 9.1 Segmentation Losses
+This section provides a comprehensive summary of all loss functions used across the three training phases, with emphasis on Phase 2 and Phase 3 where specialized loss designs are critical to the pipeline's success.
 
-#### 9.1.1 Binary Cross-Entropy Loss
+---
+
+### 9.1 Foundational Loss Components
+
+These basic building blocks are combined in various ways across phases.
+
+#### 9.1.1 Binary Cross-Entropy Loss (BCE)
+
 ```
-L_BCE = -Σᵢ [yᵢ log(pᵢ) + (1-yᵢ) log(1-pᵢ)]
+L_BCE = -1/N × Σᵢ [yᵢ × log(σ(zᵢ)) + (1 - yᵢ) × log(1 - σ(zᵢ))]
 ```
-Pixel-wise classification loss treating each pixel independently.
+
+where zᵢ is the predicted logit, σ(·) is the sigmoid function, and yᵢ ∈ {0, 1} is the ground truth label for pixel i. This is a pixel-wise classification loss that treats each pixel independently, providing per-pixel gradient signals.
+
+**Note**: When the input is already in probability space [0, 1] (e.g., gated refinement output), we use `binary_cross_entropy` directly instead of `binary_cross_entropy_with_logits`, with clamping to avoid log(0):
+```
+p_clamped = clamp(p, ε, 1 - ε)
+L_BCE_prob = -1/N × Σᵢ [yᵢ × log(p_clamped_i) + (1 - yᵢ) × log(1 - p_clamped_i)]
+```
 
 #### 9.1.2 Dice Loss
-```
-L_Dice = 1 - (2 × Σᵢ pᵢyᵢ + ε) / (Σᵢ pᵢ + Σᵢ yᵢ + ε)
-```
-Region-based loss directly optimizing the Dice coefficient. Less sensitive to class imbalance than BCE.
-
-#### 9.1.3 Combined Loss
-```
-L_seg = α × L_BCE + β × L_Dice
-```
-Combines pixel-wise accuracy (BCE) with region-level consistency (Dice).
-
-### 9.2 Quality-Aware Change Penalty
 
 ```
-L_change = mean(|refined - coarse|² × I(coarse_binary == GT))
+L_Dice = 1 - (2 × Σᵢ pᵢ × yᵢ + ε) / (Σᵢ pᵢ + Σᵢ yᵢ + ε)
 ```
 
-Penalizes changes in regions where coarse was already correct, teaching SAM to preserve accurate predictions.
+where pᵢ = σ(zᵢ) is the predicted probability. Dice loss directly optimizes the Dice similarity coefficient (equivalent to the F1 score), making it region-aware. It is less sensitive to class imbalance than BCE because it normalizes by the total predicted and ground truth areas, which is crucial for medical image segmentation where lesions often occupy a small fraction of the image.
 
-### 9.3 Weight Regularization
+**Multi-class variant** (used in Phase 1 for TransUNet with 2-class softmax output):
+```
+L_Dice_multi = 1/C × Σ_c [1 - (2 × Σᵢ p_ic × y_ic + ε) / (Σᵢ p_ic² + Σᵢ y_ic² + ε)]
+```
+where C is the number of classes and targets are one-hot encoded.
+
+#### 9.1.3 Focal Loss
 
 ```
-L_reg = ||θ - θ_init||²
-```
-
-Elastic constraint preventing excessive drift from pretrained/Phase 1 weights.
-
-### 9.4 Full Training Objectives
-
-**Phase 1**:
-```
-L = L_CE(TransUNet, GT) + L_Dice(TransUNet, GT)
+L_Focal = -α × (1 - p_t)^γ × log(p_t)
 ```
 
-**Phase 2**:
+where p_t = p if y=1, else 1-p. The modulating factor (1 - p_t)^γ down-weights easy examples and focuses training on hard, misclassified pixels.
+
+**Parameters**:
+- α = 0.25: Class balancing factor
+- γ = 2.0: Focusing parameter (higher γ → more focus on hard examples)
+
+Focal loss is particularly useful for boundary pixels where predictions are uncertain.
+
+#### 9.1.4 IoU Prediction Loss (MSE)
+
 ```
-L = L_BCE(SAM, GT) + L_Dice(SAM, GT) + λ × L_change(SAM, coarse, GT)
+L_IoU = MSE(IoU_predicted, IoU_actual) = 1/B × Σ_b (ĉ_b - c_b)²
 ```
 
-**Phase 3**:
+where ĉ_b is SAM's predicted IoU score for sample b, and c_b is the actual IoU between the predicted mask and ground truth. This loss trains SAM's mask quality head to accurately predict which of its candidate masks is best.
+
+---
+
+### 9.2 Phase 1: TransUNet Pre-Training Loss
+
+Phase 1 uses a standard segmentation loss combining cross-entropy with multi-class Dice:
+
 ```
-L = λ_c × L_seg(TransUNet, GT) + λ_r × L_seg(SAM, GT) + λ_w × L_reg(TransUNet)
+L_Phase1 = 0.5 × L_CE(logits, GT) + 0.5 × L_Dice_multi(softmax(logits), GT)
 ```
+
+where:
+- `logits` ∈ ℝ^{B×2×H×W} is TransUNet's raw 2-class output
+- `GT` ∈ {0, 1}^{B×H×W} is the ground truth label
+- L_CE is standard multi-class cross-entropy loss
+- L_Dice_multi is multi-class Dice loss with one-hot encoding
+
+Equal weighting (0.5/0.5) balances pixel-level accuracy (CE) with region-level consistency (Dice).
+
+---
+
+### 9.3 Phase 2: SAM Alignment Loss Functions
+
+Phase 2 uses specialized loss functions that teach SAM not only **what** to predict, but **when to correct** and **when to preserve**. Two variants are used depending on the training approach.
+
+#### 9.3.1 Quality-Aware Loss (Used in Hybrid Training — Primary Approach)
+
+This is the loss function used in the actual hybrid training (50% real predictions + 50% augmented GT):
+
+```
+L_Phase2 = L_BCE + L_Dice + λ_change × L_change_penalty
+```
+
+**Component 1: BCE Loss (Segmentation Accuracy)**
+```
+L_BCE = BCE_with_logits(z_refined, GT)
+```
+where z_refined is SAM's raw logit output and GT is the ground truth mask at 1024×1024.
+
+**Component 2: Dice Loss (Region Consistency)**
+```
+p_refined = σ(z_refined)
+intersection_b = Σ_{h,w} p_refined(b,h,w) × GT(b,h,w)     for each sample b
+union_b = Σ_{h,w} p_refined(b,h,w) + Σ_{h,w} GT(b,h,w)
+L_Dice = mean_b [1 - (2 × intersection_b + 1) / (union_b + 1)]
+```
+
+**Component 3: Change Penalty (Conservative Refinement)**
+
+This is the key innovation in Phase 2's loss. It penalizes SAM for modifying regions where the coarse mask was already correct:
+
+```
+coarse_binary = (coarse_mask > 0.5)             — Binarize coarse mask
+correct_regions = (coarse_binary == GT)          — Identify correctly predicted pixels
+changes = |σ(z_refined) - coarse_binary|         — Magnitude of SAM's modification
+L_change_penalty = mean(changes × correct_regions)
+```
+
+**Intuition**: If the coarse mask already correctly predicts a pixel (either foreground or background), then SAM should not change it. The penalty is zero for pixels where the coarse mask was wrong (SAM is free to correct those), and proportional to the modification magnitude for pixels where the coarse mask was right.
+
+**Default weight**: λ_change = 0.5
+
+**Total Phase 2 Loss**:
+```
+L_Phase2 = L_BCE + L_Dice + 0.5 × L_change_penalty
+```
+
+This teaches SAM to be a **conservative refiner**: aggressively correcting errors (no penalty) while preserving correct predictions (penalized for changes).
+
+#### 9.3.2 Advanced Quality-Aware Loss (Used in Online Augmented Training — Alternative)
+
+The augmented training variant includes additional components:
+
+```
+L_Phase2_advanced = L_BCE + L_Dice + 0.5 × L_Focal + λ_change × L_change_penalty_quality + 0.1 × L_IoU
+```
+
+**Component 3 (enhanced): Quality-Weighted Change Penalty**
+
+Instead of binary "correct/incorrect" regions, this variant computes a continuous quality weight based on the input mask's Dice score with GT:
+
+```
+input_quality_b = Dice(coarse_mask_b, GT_b)                    — Per-sample quality ∈ [0, 1]
+penalty_weight_b = clamp((input_quality_b - 0.6) / 0.4, 0, 1) — Maps [0.6, 1.0] → [0, 1]
+change_magnitude_b = mean_{h,w} |σ(z_refined) - coarse_mask|²  — L2 change per sample
+L_change_penalty_quality = mean_b (change_magnitude_b × penalty_weight_b)
+```
+
+**Behavior by input quality**:
+| Input Dice | penalty_weight | Effect |
+|------------|---------------|--------|
+| ≤ 0.60 (poor) | 0.0 | No penalty — allow SAM to make any changes |
+| 0.70 | 0.25 | Mild penalty — some preservation encouraged |
+| 0.80 | 0.50 | Moderate penalty |
+| 0.90 | 0.75 | Strong penalty — mostly preserve |
+| 1.00 (perfect) | 1.0 | Maximum penalty — do not change anything |
+
+This creates a smooth spectrum: poor inputs receive unrestricted correction, while high-quality inputs are strongly preserved.
+
+**Component 4: Focal Loss**
+
+Weighted at 0.5× to focus training on hard boundary pixels where predictions are uncertain:
+```
+p_t = GT × σ(z) + (1 - GT) × (1 - σ(z))   — Probability of correct class
+L_Focal = mean[(1 - p_t)² × BCE_per_pixel]
+```
+
+**Component 5: IoU Prediction Loss**
+
+Trains SAM's mask quality head:
+```
+actual_iou_b = intersection_b / (union_b - intersection_b + 1)
+L_IoU = MSE(IoU_predicted, actual_iou)
+```
+
+---
+
+### 9.4 Phase 3: End-to-End Joint Optimization Loss
+
+Phase 3's loss supervises both the coarse and refined outputs simultaneously, with asymmetric weighting that emphasizes refinement quality.
+
+#### 9.4.1 EndToEndLoss (Primary Loss Function)
+
+```
+L_Phase3 = λ_coarse × L_coarse + λ_refined × L_refined
+```
+
+**As used in practice**: λ_coarse = 0.1, λ_refined = 0.9
+
+**Coarse Loss (TransUNet supervision)**:
+```
+L_coarse = 0.5 × L_CE(logits, GT) + 0.5 × L_Dice_multi(softmax(logits), GT)
+```
+
+This is the same loss as Phase 1, maintaining TransUNet's standalone segmentation quality. The 0.1 weight ensures TransUNet doesn't degrade but allows it to adapt outputs for SAM.
+
+**Refined Loss (SAM supervision, standard mode)**:
+
+For standard (non-gated) UltraRefiner, SAM outputs logits:
+```
+L_refined = L_BCEDice(z_refined, GT_resized)
+           = 0.5 × BCE_with_logits(z_refined, GT_resized) + 0.5 × BinaryDiceLoss(σ(z_refined), GT_resized)
+```
+
+where GT_resized is the ground truth interpolated to match SAM's output resolution (1024×1024) using nearest-neighbor interpolation.
+
+**Refined Loss (SAM supervision, gated mode)**:
+
+For gated UltraRefiner, the output is already in probability space:
+```
+L_refined = L_BCEDice_prob(p_refined, GT_resized)
+           = 0.5 × BCE(clamp(p_refined, ε, 1-ε), GT_resized) + 0.5 × BinaryDiceLoss(p_refined, GT_resized)
+```
+
+#### 9.4.2 Total Phase 3 Loss with All Components
+
+The complete loss including optional protection mechanisms:
+
+```
+L_total = λ_coarse × L_coarse(TransUNet, GT)
+        + λ_refined × L_refined(SAM, GT_resized)
+        + λ_reg × L_weight_regularization(θ_TransUNet)
+```
+
+**Weight Regularization** (optional, elastic constraint):
+```
+L_reg = ||θ_TransUNet - θ_Phase1||²
+```
+Anchors TransUNet weights to Phase 1 values, preventing catastrophic forgetting during joint training.
+
+#### 9.4.3 Gradient Flow Through the Loss
+
+The total gradient for TransUNet parameters θ is:
+
+```
+∂L_total/∂θ = λ_coarse × ∂L_coarse/∂θ
+             + λ_refined × ∂L_refined/∂p_refined × ∂p_refined/∂prompts × ∂prompts/∂p_coarse × ∂p_coarse/∂θ
+             + λ_reg × 2(θ - θ_Phase1)
+```
+
+The first term provides direct supervision on TransUNet's output. The second term (the "refinement gradient") flows backwards through SAM → prompts → coarse mask → TransUNet, teaching TransUNet to produce outputs that are optimal for SAM refinement. The third term acts as a regularizer.
+
+With the actual weights (λ_coarse=0.1, λ_refined=0.9), the refinement gradient dominates, meaning TransUNet learns primarily to produce outputs that maximize SAM's refinement quality rather than standalone segmentation accuracy.
+
+---
+
+### 9.5 Summary: Loss Functions Across All Phases
+
+| Phase | Loss | Formula | Weight | Purpose |
+|-------|------|---------|--------|---------|
+| **Phase 1** | Cross-Entropy | L_CE(logits, GT) | 0.5 | Pixel-wise classification |
+| **Phase 1** | Multi-class Dice | L_Dice(softmax(logits), GT) | 0.5 | Region overlap |
+| **Phase 2** | BCE | BCE_with_logits(z, GT) | 1.0 | Pixel-wise refinement accuracy |
+| **Phase 2** | Dice | 1 - DiceCoeff(σ(z), GT) | 1.0 | Region overlap for refinement |
+| **Phase 2** | Change Penalty | \|σ(z) - coarse\| × I(coarse==GT) | 0.5 | Preserve correct regions |
+| **Phase 2** | Focal (optional) | (1-p_t)^γ × BCE | 0.5 | Hard boundary pixels |
+| **Phase 2** | IoU Pred (optional) | MSE(IoU_pred, IoU_actual) | 0.1 | Mask quality estimation |
+| **Phase 3** | Coarse CE+Dice | 0.5×CE + 0.5×Dice | 0.1 | Maintain TransUNet quality |
+| **Phase 3** | Refined BCE+Dice | 0.5×BCE + 0.5×Dice | 0.9 | Optimize refinement output |
+| **Phase 3** | Weight Reg (opt.) | \|\|θ - θ_init\|\|² | tunable | Prevent catastrophic forgetting |
+
+**Key Design Principles**:
+1. **Phase 2**: BCE + Dice teaches SAM to segment well; Change Penalty teaches SAM to be conservative — only correcting errors, not modifying correct regions
+2. **Phase 3**: Asymmetric weighting (0.1/0.9) prioritizes refinement quality, allowing TransUNet to adapt its outputs for SAM's benefit
+3. **Across phases**: Dice loss is always included to address the extreme class imbalance in medical segmentation (small lesion vs. large background)
 
 ---
 
