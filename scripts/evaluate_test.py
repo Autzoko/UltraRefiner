@@ -34,6 +34,24 @@ Usage:
         --datasets BUSI \
         --split kfold_train --fold 0 --n_splits 5
 
+    # ============================================================
+    # Evaluate Phase 1 + Phase 2 (WITHOUT running Phase 3)
+    # Load TransUNet and SAM checkpoints separately
+    # ============================================================
+    python scripts/evaluate_test.py \
+        --transunet_checkpoint ./checkpoints/transunet/combined/fold_0/best.pth \
+        --sam_checkpoint ./checkpoints/sam_finetuned_offline/best.pth \
+        --data_root ./dataset/processed \
+        --datasets BUSI \
+        --split train --mask_prompt_style direct --use_roi_crop
+
+    # Also works with best_sam.pth (SAM-only weights)
+    python scripts/evaluate_test.py \
+        --transunet_checkpoint ./checkpoints/transunet/combined/fold_0/best.pth \
+        --sam_checkpoint ./checkpoints/sam_finetuned_offline/best_sam.pth \
+        --data_root ./dataset/processed \
+        --datasets BUSI
+
     # Evaluate at SAM's native resolution (1024x1024)
     python scripts/evaluate_test.py \
         --checkpoint ./checkpoints/ultra_refiner/fold_0/best.pth \
@@ -134,9 +152,17 @@ from data import (
 def get_args():
     parser = argparse.ArgumentParser(description='Evaluate UltraRefiner on test sets')
 
-    # Model arguments
-    parser.add_argument('--checkpoint', type=str, required=True,
-                        help='Path to UltraRefiner checkpoint')
+    # Model arguments - two modes:
+    #   Mode 1 (Phase 3): --checkpoint <ultra_refiner.pth>
+    #   Mode 2 (Phase 1+2): --transunet_checkpoint <phase1.pth> --sam_checkpoint <phase2.pth>
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='Path to UltraRefiner (Phase 3) checkpoint. '
+                             'Mutually exclusive with --transunet_checkpoint + --sam_checkpoint.')
+    parser.add_argument('--transunet_checkpoint', type=str, default=None,
+                        help='Path to Phase 1 TransUNet checkpoint (use with --sam_checkpoint)')
+    parser.add_argument('--sam_checkpoint', type=str, default=None,
+                        help='Path to Phase 2 finetuned SAM checkpoint (use with --transunet_checkpoint). '
+                             'Accepts best.pth (full refiner) or best_sam.pth (SAM-only).')
     parser.add_argument('--vit_name', type=str, default='R50-ViT-B_16',
                         help='TransUNet ViT model variant')
     parser.add_argument('--sam_model_type', type=str, default='vit_b',
@@ -1120,56 +1146,140 @@ def main():
         print(f"\nBoundary-band fusion ENABLED:")
         print(f"  Band width: {args.boundary_band_width} pixels")
 
-    # Load checkpoint
-    print(f"\nLoading checkpoint: {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+    # =========================================================================
+    # Validate checkpoint arguments
+    # =========================================================================
+    separate_mode = args.transunet_checkpoint is not None or args.sam_checkpoint is not None
+    combined_mode = args.checkpoint is not None
 
-    # Get config from checkpoint if available
-    config = checkpoint.get('config', {})
-    vit_name = config.get('vit_name', args.vit_name)
-    sam_model_type = config.get('sam_model_type', args.sam_model_type)
-    img_size = config.get('img_size', args.img_size)
-    num_classes = config.get('num_classes', args.num_classes)
+    if separate_mode and combined_mode:
+        print("Error: Cannot use --checkpoint together with --transunet_checkpoint/--sam_checkpoint.")
+        print("  Use either --checkpoint (Phase 3) OR --transunet_checkpoint + --sam_checkpoint (Phase 1+2).")
+        sys.exit(1)
 
-    print(f"Model config: vit_name={vit_name}, sam_model_type={sam_model_type}, img_size={img_size}")
+    if not separate_mode and not combined_mode:
+        print("Error: Must provide either --checkpoint (Phase 3) or --transunet_checkpoint + --sam_checkpoint (Phase 1+2).")
+        sys.exit(1)
 
-    # Build model
-    print("\nBuilding model...")
-    if args.use_gated_refinement:
-        model = build_gated_ultra_refiner(
-            vit_name=vit_name,
-            img_size=img_size,
-            num_classes=num_classes,
-            sam_model_type=sam_model_type,
-            freeze_sam_image_encoder=True,
-            freeze_sam_prompt_encoder=True,  # Freeze for inference
-            mask_prompt_style=args.mask_prompt_style,
-            use_roi_crop=args.use_roi_crop,
-            roi_expand_ratio=args.roi_expand_ratio,
-            gate_type=args.gate_type,
-            gate_gamma=args.gate_gamma,
-            gate_min=args.gate_min,
-            gate_max=args.gate_max,
-        )
+    if separate_mode and (args.transunet_checkpoint is None or args.sam_checkpoint is None):
+        print("Error: Both --transunet_checkpoint and --sam_checkpoint are required for separate loading.")
+        sys.exit(1)
+
+    # =========================================================================
+    # Build and load model
+    # =========================================================================
+    vit_name = args.vit_name
+    sam_model_type = args.sam_model_type
+    img_size = args.img_size
+    num_classes = args.num_classes
+
+    if combined_mode:
+        # Mode 1: Load full UltraRefiner checkpoint (Phase 3)
+        print(f"\nLoading Phase 3 checkpoint: {args.checkpoint}")
+        checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+
+        # Get config from checkpoint if available
+        config = checkpoint.get('config', {})
+        vit_name = config.get('vit_name', vit_name)
+        sam_model_type = config.get('sam_model_type', sam_model_type)
+        img_size = config.get('img_size', img_size)
+        num_classes = config.get('num_classes', num_classes)
+
+        print(f"Model config: vit_name={vit_name}, sam_model_type={sam_model_type}, img_size={img_size}")
+
+        print("\nBuilding model...")
+        if args.use_gated_refinement:
+            model = build_gated_ultra_refiner(
+                vit_name=vit_name,
+                img_size=img_size,
+                num_classes=num_classes,
+                sam_model_type=sam_model_type,
+                freeze_sam_image_encoder=True,
+                freeze_sam_prompt_encoder=True,
+                mask_prompt_style=args.mask_prompt_style,
+                use_roi_crop=args.use_roi_crop,
+                roi_expand_ratio=args.roi_expand_ratio,
+                gate_type=args.gate_type,
+                gate_gamma=args.gate_gamma,
+                gate_min=args.gate_min,
+                gate_max=args.gate_max,
+            )
+        else:
+            model = build_ultra_refiner(
+                vit_name=vit_name,
+                img_size=img_size,
+                num_classes=num_classes,
+                sam_model_type=sam_model_type,
+                freeze_sam_image_encoder=True,
+                freeze_sam_prompt_encoder=True,
+                mask_prompt_style=args.mask_prompt_style,
+                use_roi_crop=args.use_roi_crop,
+                roi_expand_ratio=args.roi_expand_ratio,
+            )
+
+        # Load full state dict
+        model.load_state_dict(checkpoint['model'])
+        print(f"Loaded Phase 3 UltraRefiner checkpoint")
+
     else:
-        model = build_ultra_refiner(
-            vit_name=vit_name,
-            img_size=img_size,
-            num_classes=num_classes,
-            sam_model_type=sam_model_type,
-            freeze_sam_image_encoder=True,
-            freeze_sam_prompt_encoder=True,  # Freeze for inference
-            mask_prompt_style=args.mask_prompt_style,
-            use_roi_crop=args.use_roi_crop,
-            roi_expand_ratio=args.roi_expand_ratio,
-        )
+        # Mode 2: Load Phase 1 TransUNet + Phase 2 SAM separately
+        print(f"\nLoading separate checkpoints:")
+        print(f"  TransUNet (Phase 1): {args.transunet_checkpoint}")
+        print(f"  SAM (Phase 2):       {args.sam_checkpoint}")
 
-    # Load weights
-    model.load_state_dict(checkpoint['model'])
+        # Resolve SAM checkpoint path:
+        # Phase 2 saves two files:
+        #   best.pth     -> {'model': DifferentiableSAMRefiner state_dict, ...}
+        #   best_sam.pth -> raw state_dict with 'sam.' prefixed keys
+        # build_sam.py handles both formats (strips 'sam.' prefix, extracts 'model' key)
+        # so we can pass either file directly as sam_checkpoint.
+        sam_ckpt_path = args.sam_checkpoint
+
+        # Check if it's a Phase 2 best.pth (has 'model' key with refiner state)
+        # vs best_sam.pth (raw state_dict). build_sam handles both via its
+        # 'model' key extraction + 'sam.' prefix stripping logic.
+
+        print(f"\nModel config: vit_name={vit_name}, sam_model_type={sam_model_type}, img_size={img_size}")
+        print("\nBuilding model with separate checkpoints...")
+
+        if args.use_gated_refinement:
+            model = build_gated_ultra_refiner(
+                vit_name=vit_name,
+                img_size=img_size,
+                num_classes=num_classes,
+                sam_model_type=sam_model_type,
+                sam_checkpoint=sam_ckpt_path,
+                transunet_checkpoint=args.transunet_checkpoint,
+                freeze_sam_image_encoder=True,
+                freeze_sam_prompt_encoder=True,
+                mask_prompt_style=args.mask_prompt_style,
+                use_roi_crop=args.use_roi_crop,
+                roi_expand_ratio=args.roi_expand_ratio,
+                gate_type=args.gate_type,
+                gate_gamma=args.gate_gamma,
+                gate_min=args.gate_min,
+                gate_max=args.gate_max,
+            )
+        else:
+            model = build_ultra_refiner(
+                vit_name=vit_name,
+                img_size=img_size,
+                num_classes=num_classes,
+                sam_model_type=sam_model_type,
+                sam_checkpoint=sam_ckpt_path,
+                transunet_checkpoint=args.transunet_checkpoint,
+                freeze_sam_image_encoder=True,
+                freeze_sam_prompt_encoder=True,
+                mask_prompt_style=args.mask_prompt_style,
+                use_roi_crop=args.use_roi_crop,
+                roi_expand_ratio=args.roi_expand_ratio,
+            )
+
+        print(f"Assembled UltraRefiner from Phase 1 + Phase 2 checkpoints")
+
     model = model.to(device)
     model.eval()
-
-    print(f"Model loaded successfully")
+    print(f"Model ready for evaluation")
 
     # Evaluate on each dataset
     results = {}
