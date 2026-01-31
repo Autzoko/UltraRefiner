@@ -71,6 +71,20 @@ def get_args():
     parser.add_argument('--change_penalty_weight', type=float, default=0.5,
                         help='Weight for change penalty loss')
 
+    # Prompt selection
+    parser.add_argument('--use_point_prompt', action='store_true', default=True,
+                        help='Use point prompts (default: True)')
+    parser.add_argument('--no_point_prompt', action='store_true',
+                        help='Disable point prompts')
+    parser.add_argument('--use_box_prompt', action='store_true', default=True,
+                        help='Use box prompts (default: True)')
+    parser.add_argument('--no_box_prompt', action='store_true',
+                        help='Disable box prompts')
+    parser.add_argument('--use_mask_prompt', action='store_true', default=True,
+                        help='Use mask prompts (default: True)')
+    parser.add_argument('--no_mask_prompt', action='store_true',
+                        help='Disable mask prompts')
+
     # Phase 3 compatibility
     parser.add_argument('--transunet_img_size', type=int, default=224,
                         help='TransUNet resolution for resolution path matching')
@@ -318,13 +332,25 @@ def main():
     sam = sam_model_registry[args.sam_model_type](checkpoint=args.sam_checkpoint)
     sam = sam.to(device)
 
+    # Resolve prompt flags (--no_* overrides --use_*)
+    use_point = args.use_point_prompt and not args.no_point_prompt
+    use_box = args.use_box_prompt and not args.no_box_prompt
+    use_mask = args.use_mask_prompt and not args.no_mask_prompt
+
+    if not use_point and not use_box and not use_mask:
+        print("Error: At least one prompt type must be enabled.")
+        sys.exit(1)
+
     # Create SAM refiner
-    print("Creating DifferentiableSAMRefiner...")
+    prompts_str = ', '.join(
+        [name for name, enabled in [('point', use_point), ('box', use_box), ('mask', use_mask)] if enabled]
+    )
+    print(f"Creating DifferentiableSAMRefiner with prompts: [{prompts_str}]")
     model = DifferentiableSAMRefiner(
         sam_model=sam,
-        use_point_prompt=True,
-        use_box_prompt=True,
-        use_mask_prompt=True,
+        use_point_prompt=use_point,
+        use_box_prompt=use_box,
+        use_mask_prompt=use_mask,
         freeze_image_encoder=True,
         freeze_prompt_encoder=False,
         mask_prompt_style=args.mask_prompt_style,
