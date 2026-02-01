@@ -438,15 +438,14 @@ class DifferentiableSAMRefiner(nn.Module):
 
         return point_coords, point_labels
 
-    def extract_soft_negative_points(self, soft_mask: torch.Tensor, box: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def extract_soft_negative_points(self, soft_mask: torch.Tensor, box: torch.Tensor, positive_point: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Extract negative point prompts using the bounding box corner farthest
-        from the foreground centroid.
+        from the positive point, maximizing separation between the two prompts.
 
         The bounding box is computed as center ± 2.5σ + margin, so its corners
         are guaranteed to be at or beyond the mask boundary — safely in
-        background territory. Selecting the farthest corner from the foreground
-        centroid maximizes separation from the lesion.
+        background territory.
 
         The selected corner's coordinates are differentiable w.r.t. the soft
         mask (they flow through extract_soft_box), so gradients propagate
@@ -455,6 +454,8 @@ class DifferentiableSAMRefiner(nn.Module):
         Args:
             soft_mask: Soft probability mask (B, H, W)
             box: Bounding box (B, 4) as [x1, y1, x2, y2]
+            positive_point: Positive point coordinates (B, 1, 2) as [x, y].
+                           If None, falls back to foreground centroid.
 
         Returns:
             point_coords: (B, 1, 2) point coordinates
@@ -465,14 +466,19 @@ class DifferentiableSAMRefiner(nn.Module):
 
         x1, y1, x2, y2 = box[:, 0], box[:, 1], box[:, 2], box[:, 3]  # (B,) each
 
-        # Foreground centroid (for distance computation)
-        y_coords = torch.arange(H, device=device, dtype=torch.float32)
-        x_coords = torch.arange(W, device=device, dtype=torch.float32)
-        y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
+        # Reference point for distance computation
+        if positive_point is not None:
+            ref_point = positive_point.squeeze(1)  # (B, 2) as [x, y]
+        else:
+            # Fallback: foreground centroid
+            y_coords = torch.arange(H, device=device, dtype=torch.float32)
+            x_coords = torch.arange(W, device=device, dtype=torch.float32)
+            y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
 
-        mask_sum = soft_mask.sum(dim=(-2, -1), keepdim=True) + 1e-6
-        fg_y = (soft_mask * y_grid.unsqueeze(0)).sum(dim=(-2, -1)) / mask_sum.squeeze()  # (B,)
-        fg_x = (soft_mask * x_grid.unsqueeze(0)).sum(dim=(-2, -1)) / mask_sum.squeeze()  # (B,)
+            mask_sum = soft_mask.sum(dim=(-2, -1), keepdim=True) + 1e-6
+            fg_y = (soft_mask * y_grid.unsqueeze(0)).sum(dim=(-2, -1)) / mask_sum.squeeze()
+            fg_x = (soft_mask * x_grid.unsqueeze(0)).sum(dim=(-2, -1)) / mask_sum.squeeze()
+            ref_point = torch.stack([fg_x, fg_y], dim=-1)  # (B, 2)
 
         # Four bounding box corners: (B, 4, 2) as [x, y]
         corners = torch.stack([
@@ -482,11 +488,10 @@ class DifferentiableSAMRefiner(nn.Module):
             torch.stack([x2, y2], dim=-1),  # bottom-right
         ], dim=1)  # (B, 4, 2)
 
-        # Distance from each corner to foreground centroid
-        fg_center = torch.stack([fg_x, fg_y], dim=-1).unsqueeze(1)  # (B, 1, 2)
-        dists = torch.norm(corners - fg_center, dim=-1)  # (B, 4)
+        # Distance from each corner to the positive point
+        dists = torch.norm(corners - ref_point.unsqueeze(1), dim=-1)  # (B, 4)
 
-        # Select the farthest corner from the foreground centroid.
+        # Select the farthest corner from the positive point.
         # Hard selection (argmax) for which corner, but the selected corner's
         # coordinates are still differentiable w.r.t. the soft mask.
         farthest_idx = dists.argmax(dim=1)  # (B,)
@@ -785,7 +790,7 @@ class DifferentiableSAMRefiner(nn.Module):
             point_coords, point_labels = self.extract_soft_points(coarse_mask, self.num_points)
 
             if self.add_negative_point and self.use_box_prompt:
-                neg_coords, neg_labels = self.extract_soft_negative_points(coarse_mask, boxes)
+                neg_coords, neg_labels = self.extract_soft_negative_points(coarse_mask, boxes, positive_point=point_coords)
                 point_coords = torch.cat([point_coords, neg_coords], dim=1)
                 point_labels = torch.cat([point_labels, neg_labels], dim=1)
 
@@ -940,7 +945,7 @@ class DifferentiableSAMRefiner(nn.Module):
             point_coords, point_labels = self.extract_soft_points(mask_cropped, self.num_points)
 
             if self.add_negative_point and self.use_box_prompt:
-                neg_coords, neg_labels = self.extract_soft_negative_points(mask_cropped, boxes)
+                neg_coords, neg_labels = self.extract_soft_negative_points(mask_cropped, boxes, positive_point=point_coords)
                 point_coords = torch.cat([point_coords, neg_coords], dim=1)
                 point_labels = torch.cat([point_labels, neg_labels], dim=1)
 
