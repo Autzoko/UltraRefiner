@@ -394,11 +394,16 @@ class DifferentiableSAMRefiner(nn.Module):
 
     def extract_soft_points(self, soft_mask: torch.Tensor, num_points: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Extract point prompts from soft masks using differentiable soft-argmax.
+        Extract positive point prompts from soft masks using concentrated soft-argmax.
+
+        Uses squared mask (soft_mask²) to concentrate the centroid toward the
+        peak-probability region, ensuring the point lands inside the lesion
+        even for mildly non-convex shapes.
 
         Mathematical formulation:
-            x_center = Σ(p(i,j) · x_j) / Σ(p(i,j))
-            y_center = Σ(p(i,j) · y_i) / Σ(p(i,j))
+            w(i,j) = p(i,j)²                          (concentration)
+            x_center = Σ(w(i,j) · x_j) / Σ(w(i,j))
+            y_center = Σ(w(i,j) · y_i) / Σ(w(i,j))
 
         This is fully differentiable as it's a weighted average.
 
@@ -418,14 +423,15 @@ class DifferentiableSAMRefiner(nn.Module):
         x_coords = torch.arange(W, device=device, dtype=torch.float32)
         y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
 
-        # Soft-argmax: use probability-weighted average
-        # Add small epsilon to avoid division by zero
-        mask_sum = soft_mask.sum(dim=(-2, -1), keepdim=True) + 1e-6  # (B, 1, 1)
+        # Concentrate on high-probability regions by squaring the mask.
+        # This pulls the centroid toward the peak, ensuring it stays inside
+        # the foreground region even for mildly non-convex shapes.
+        concentrated = soft_mask ** 2
+        mask_sum = concentrated.sum(dim=(-2, -1), keepdim=True) + 1e-6  # (B, 1, 1)
 
         # Weighted centroid (positive point)
-        # ∂y_center/∂soft_mask = (y_grid - y_center) / mask_sum  [non-zero gradient!]
-        y_center = (soft_mask * y_grid.unsqueeze(0)).sum(dim=(-2, -1)) / mask_sum.squeeze()  # (B,)
-        x_center = (soft_mask * x_grid.unsqueeze(0)).sum(dim=(-2, -1)) / mask_sum.squeeze()  # (B,)
+        y_center = (concentrated * y_grid.unsqueeze(0)).sum(dim=(-2, -1)) / mask_sum.squeeze()  # (B,)
+        x_center = (concentrated * x_grid.unsqueeze(0)).sum(dim=(-2, -1)) / mask_sum.squeeze()  # (B,)
 
         point_coords = torch.stack([x_center, y_center], dim=-1).unsqueeze(1)  # (B, 1, 2)
         point_labels = torch.ones(B, 1, device=device)
@@ -434,9 +440,17 @@ class DifferentiableSAMRefiner(nn.Module):
 
     def extract_soft_negative_points(self, soft_mask: torch.Tensor, box: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Extract negative point prompts using differentiable soft box masking.
+        Extract negative point prompts using the bounding box corner farthest
+        from the foreground centroid.
 
-        Instead of hard box boundaries, we use a soft sigmoid transition.
+        The bounding box is computed as center ± 2.5σ + margin, so its corners
+        are guaranteed to be at or beyond the mask boundary — safely in
+        background territory. Selecting the farthest corner from the foreground
+        centroid maximizes separation from the lesion.
+
+        The selected corner's coordinates are differentiable w.r.t. the soft
+        mask (they flow through extract_soft_box), so gradients propagate
+        correctly during end-to-end training.
 
         Args:
             soft_mask: Soft probability mask (B, H, W)
@@ -449,39 +463,36 @@ class DifferentiableSAMRefiner(nn.Module):
         B, H, W = soft_mask.shape
         device = soft_mask.device
 
-        # Inverse mask (background probability)
-        inv_mask = 1.0 - soft_mask
+        x1, y1, x2, y2 = box[:, 0], box[:, 1], box[:, 2], box[:, 3]  # (B,) each
 
-        # Create coordinate grids
+        # Foreground centroid (for distance computation)
         y_coords = torch.arange(H, device=device, dtype=torch.float32)
         x_coords = torch.arange(W, device=device, dtype=torch.float32)
         y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
 
-        # Create SOFT box mask using sigmoid (differentiable!)
-        # This creates smooth transitions at box boundaries
-        sharpness = 1.0  # Controls transition sharpness
+        mask_sum = soft_mask.sum(dim=(-2, -1), keepdim=True) + 1e-6
+        fg_y = (soft_mask * y_grid.unsqueeze(0)).sum(dim=(-2, -1)) / mask_sum.squeeze()  # (B,)
+        fg_x = (soft_mask * x_grid.unsqueeze(0)).sum(dim=(-2, -1)) / mask_sum.squeeze()  # (B,)
 
-        x1, y1, x2, y2 = box[:, 0], box[:, 1], box[:, 2], box[:, 3]  # (B,) each
+        # Four bounding box corners: (B, 4, 2) as [x, y]
+        corners = torch.stack([
+            torch.stack([x1, y1], dim=-1),  # top-left
+            torch.stack([x2, y1], dim=-1),  # top-right
+            torch.stack([x1, y2], dim=-1),  # bottom-left
+            torch.stack([x2, y2], dim=-1),  # bottom-right
+        ], dim=1)  # (B, 4, 2)
 
-        # Soft box: sigmoid transitions at boundaries
-        # left_boundary:  σ(sharpness * (x - x1))
-        # right_boundary: σ(sharpness * (x2 - x))
-        left = torch.sigmoid(sharpness * (x_grid.unsqueeze(0) - x1.view(B, 1, 1)))
-        right = torch.sigmoid(sharpness * (x2.view(B, 1, 1) - x_grid.unsqueeze(0)))
-        top = torch.sigmoid(sharpness * (y_grid.unsqueeze(0) - y1.view(B, 1, 1)))
-        bottom = torch.sigmoid(sharpness * (y2.view(B, 1, 1) - y_grid.unsqueeze(0)))
+        # Distance from each corner to foreground centroid
+        fg_center = torch.stack([fg_x, fg_y], dim=-1).unsqueeze(1)  # (B, 1, 2)
+        dists = torch.norm(corners - fg_center, dim=-1)  # (B, 4)
 
-        soft_box_mask = left * right * top * bottom  # (B, H, W)
+        # Select the farthest corner from the foreground centroid.
+        # Hard selection (argmax) for which corner, but the selected corner's
+        # coordinates are still differentiable w.r.t. the soft mask.
+        farthest_idx = dists.argmax(dim=1)  # (B,)
+        neg_point = corners[torch.arange(B, device=device), farthest_idx]  # (B, 2)
 
-        # Masked inverse
-        inv_mask_boxed = inv_mask * soft_box_mask
-
-        # Soft-argmax on inverse mask
-        mask_sum = inv_mask_boxed.sum(dim=(-2, -1), keepdim=True) + 1e-6
-        y_center = (inv_mask_boxed * y_grid.unsqueeze(0)).sum(dim=(-2, -1)) / mask_sum.squeeze()
-        x_center = (inv_mask_boxed * x_grid.unsqueeze(0)).sum(dim=(-2, -1)) / mask_sum.squeeze()
-
-        point_coords = torch.stack([x_center, y_center], dim=-1).unsqueeze(1)  # (B, 1, 2)
+        point_coords = neg_point.unsqueeze(1)  # (B, 1, 2)
         point_labels = torch.zeros(B, 1, device=device)
 
         return point_coords, point_labels
